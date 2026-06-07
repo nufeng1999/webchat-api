@@ -98,6 +98,7 @@ async def chat_completions(request: ChatCompletionRequest):
         )
     else:
         result = await non_stream_chat_completion(request)
+        #logger.info(f"应答内容: {result}")
         return JSONResponse(content=result)
 
 @app.post("/v1/messages")

@@ -78,6 +78,8 @@ def extract_image_urls_from_content(content: Union[str, list]) -> list[str]:
 def build_request_body(messages: list[ChatMessage], conversation_id: str = "0",
                        model: str = "doubao-pro-chat", attachments: list[dict] = None):
     last_msg = messages[-1] if messages else None
+    custom_prompt = CONFIG.get('custom_prompt', '')   # 新增
+
     need_create = conversation_id == "0"
 
     model_cfg = MODEL_CONFIG.get(model, MODEL_CONFIG["doubao-pro-chat"])
@@ -91,6 +93,10 @@ def build_request_body(messages: list[ChatMessage], conversation_id: str = "0",
     body_messages = []
     for msg in messages:
         text = extract_text_from_content(msg.content)
+        # 新增：仅对最后一条用户消息，在末尾追加自定义提示词
+        if msg is last_msg and msg.role == "user" and custom_prompt:
+            text = f"{text}\n\n\{custom_prompt}"
+
         msg_attachments = []
 
         if isinstance(msg.content, list):
@@ -229,8 +235,42 @@ def extract_conversation_id(parsed: dict) -> str:
     data = parsed.get("data", {})
     return data.get("conversation_id", "")
 
+def format_openai_chunk(content: str, model: str, chat_id: str, conversation_id: str = None,
+                        reasoning_content: str = None, tool_calls: list = None,
+                        role: str = None, finish_reason: str = None) -> str:
+    delta = {}
+    if role:
+        delta["role"] = role
+    if tool_calls is not None:
+        delta["role"] = "assistant"
+    if content is not None:
+        delta["content"] = content
+    if content == "":
+        delta["content"] = None
+    if tool_calls is not None:
+        delta["tool_calls"] = tool_calls
 
-def format_openai_chunk(content: str, model: str, chat_id: str, conversation_id: str = None, reasoning_content: str = None) -> str:
+    chunk = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }]
+    }
+    if tool_calls is not None:
+        chunk["choices"][0]["finish_reason"] = "tool_calls"
+    if reasoning_content:
+        chunk["choices"][0]["delta"]["reasoning_content"] = reasoning_content
+    if conversation_id and conversation_id != "0":
+        chunk["conversation_id"] = conversation_id
+    logger.info(f"流式应答内容: {json.dumps(chunk, ensure_ascii=False)}")
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+def format_openai_chunk1(content: str, model: str, chat_id: str, conversation_id: str = None, reasoning_content: str = None) -> str:
     chunk = {
         "id": chat_id,
         "object": "chat.completion.chunk",

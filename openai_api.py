@@ -112,7 +112,7 @@ async def call_doubao_api(messages: list[ChatMessage], conversation_id: str = "0
                         collected_chunks.append(chunk)
                         chunk_text = chunk.decode('utf-8', errors='replace')
                         if cookie_pool.is_cookie_expired(chunk_text, 200):
-                            logger.warning(f"Cookie expired detected in SSE stream, aborting and retrying")
+                            logger.warning(f"Cookie expired detected in SSE stream, aborting and retrying {chunk_text}")
                             cookie_pool.report_fail(account, reason="cookie_expired_in_stream")
                             cookie_pool.maybe_refresh()
                             if attempt < max_retries:
@@ -230,9 +230,43 @@ async def stream_chat_completion(request):
                     conversation_id = conv_id
 
                 if event_data.get("event_type") == 2003:
+                    # 检测工具调用
+                    try:
+                        tool_call_data = json.loads(full_text) if isinstance(full_text, str) else full_text
+                        is_tool_call = isinstance(tool_call_data, dict) and "tool_calls" in tool_call_data
+                    except (json.JSONDecodeError, TypeError):
+                        is_tool_call = False
+
+                    if is_tool_call:
+                        # logger.info(f"Stream detected tool_calls: {full_text[:200]}")
+                        tool_calls = tool_call_data.get("tool_calls", [])
+                        for i, tc in enumerate(tool_calls):
+                            yield format_openai_chunk(
+                                "", request.model, chat_id, conversation_id,
+                                role="assistant" if i == 0 else None,
+                                tool_calls=[{
+                                    "index": i,
+                                    "id": tc.get("id", ""),
+                                    "type": tc.get("type", "function"),
+                                    "function": {
+                                        "name": tc.get("function", {}).get("name", ""),
+                                        "arguments": ""
+                                    }
+                                }]
+                            )
+                            args = tc.get("function", {}).get("arguments", "")
+                            if args:
+                                yield format_openai_chunk(
+                                    "", request.model, chat_id, conversation_id,
+                                    tool_calls=[{"index": i, "function": {"arguments": args}}]
+                                )
+                        yield format_openai_chunk(None, request.model, chat_id, conversation_id, finish_reason="tool_calls")
+                    else:
+                        yield format_openai_chunk("", request.model, chat_id, conversation_id).replace(
+                            '"finish_reason": null', '"finish_reason": "stop"')
+
                     save_conversation_log(user_input, full_text, request.model, conversation_id, chat_id, all_image_urls)
                     save_conversation_state(chat_id, request.messages, conversation_id, request.model)
-                    yield format_openai_chunk("", request.model, chat_id, conversation_id).replace('"finish_reason": null', '"finish_reason": "stop"')
                     yield format_openai_done()
                     return
     except Exception as e:
@@ -240,21 +274,54 @@ async def stream_chat_completion(request):
         if not full_text:
             yield format_openai_chunk(f"[Error: {str(e)}]", request.model, chat_id, conversation_id)
 
-    if buffer.strip():
-        line = buffer.strip()
-        event_data = parse_sse_line(line)
-        if event_data is not None:
-            extracted, thinking = extract_text_from_event(event_data)
-            if thinking:
-                full_thinking += thinking
-                yield format_openai_chunk("", request.model, chat_id, conversation_id, reasoning_content=thinking)
-            if extracted:
-                full_text += extracted
-                yield format_openai_chunk(extracted, request.model, chat_id, conversation_id)
+        # 检测工具调用
+        try:
+            tool_call_data = json.loads(full_text) if isinstance(full_text, str) else full_text
+            is_tool_call = isinstance(tool_call_data, dict) and "tool_calls" in tool_call_data
+        except (json.JSONDecodeError, TypeError):
+            is_tool_call = False
 
-            img_urls = extract_image_urls_from_event(event_data)
-            if img_urls:
-                all_image_urls.extend(img_urls)
+        if is_tool_call:
+            # logger.info(f"Buffer completed with tool_calls: {full_text[:200]}")
+            tool_calls = tool_call_data.get("tool_calls", [])
+            for i, tc in enumerate(tool_calls):
+                yield format_openai_chunk(
+                    None, request.model, chat_id, conversation_id,
+                    role="assistant" if i == 0 else None,
+                    tool_calls=[{
+                        "index": i,
+                        "id": tc.get("id", ""),
+                        "type": tc.get("type", "function"),
+                        "function": {
+                            "name": tc.get("function", {}).get("name", ""),
+                            "arguments": ""
+                        }
+                    }]
+                )
+                args = tc.get("function", {}).get("arguments", "")
+                if args:
+                    yield format_openai_chunk(
+                        None, request.model, chat_id, conversation_id,
+                        tool_calls=[{"index": i, "function": {"arguments": args}}]
+                    )
+            yield format_openai_chunk(None, request.model, chat_id, conversation_id, finish_reason="tool_calls")
+        else:
+            # 现有逻辑：常规文本流式输出...（第247-253行的 yield 处理）
+            if buffer.strip():
+                line = buffer.strip()
+                event_data = parse_sse_line(line)
+                if event_data is not None:
+                    extracted, thinking = extract_text_from_event(event_data)
+                    if thinking:
+                        full_thinking += thinking
+                        yield format_openai_chunk(...) 
+                    if extracted:
+                        full_text += extracted
+                        yield format_openai_chunk(...)
+                    img_urls = extract_image_urls_from_event(event_data)
+                    if img_urls:
+                        all_image_urls.extend(img_urls)
+
 
     save_conversation_log(user_input, full_text, request.model, conversation_id, chat_id, all_image_urls)
     save_conversation_state(chat_id, request.messages, conversation_id, request.model)
@@ -431,29 +498,58 @@ async def non_stream_chat_completion(request):
     save_conversation_state(chat_id, request.messages, conversation_id, request.model)
 
     import time
-    result = {
-        "id": chat_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": request.model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": full_text},
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
+    # 检测 full_text 是否为 tool_calls 格式的工具调用响应
+    try:
+        tool_call_data = json.loads(full_text) if isinstance(full_text, str) else full_text
+        is_tool_call = isinstance(tool_call_data, dict) and "tool_calls" in tool_call_data
+        if is_tool_call:
+            # logger.info(f"Detected tool_calls response: {json.dumps(tool_call_data, ensure_ascii=False)[:200]}")
+            tool_calls = tool_call_data.get("tool_calls", [])
+    except (json.JSONDecodeError, TypeError):
+        is_tool_call = False
+    if is_tool_call:
+        result = {
+            "id": chat_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", 
+                            "content":None,
+                            "tool_calls":tool_calls
+                            },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
         }
-    }
+    else:
+        result = {
+            "id": chat_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": full_text},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
+        }
 
     if full_thinking:
         result["choices"][0]["message"]["reasoning_content"] = full_thinking
 
     if all_image_urls:
         result["images"] = all_image_urls
-
     return result
 
 

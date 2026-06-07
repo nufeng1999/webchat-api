@@ -35,3 +35,5 @@ sse_response.txt
 music_result.json
 captured_music.json
 exports/
+/.refact
+/~
