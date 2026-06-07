@@ -8,5 +8,6 @@
     "api_base": "https://www.doubao.com",
     "sign_method": "b3",
     "server_host": "0.0.0.0",
-    "server_port": 8765
+    "server_port": 8765,
+    "custom_prompt":"先判断用户请求是否需要调用工具，如果需要调用工具就按照下面的规则处理\n可用工具:\nexec, process,code_execution\n本地系统:\nTermux\n学习地址:\nhttps://deepwiki.com/openai/openai-cookbook/6-function-calling-and-tool-integration#function-calling-and-tool-integration\n回复格式:\n生成一个符合openai  api tool_calls 规范的 json 的工具调用回复内容,前后不要含有任何其它字符，以便触发openclaw 调用本地工具\n注意事项:\narguments 项的值为字符串时，参考 \"arguments\": \"{\\\"command\\\":\\\"ls\\\"}\"\n回复内容参考:\n{  \"tool_calls\": [    {      \"id\": \"exec_001\",      \"type\": \"function\",      \"function\": {        \"name\": \"exec\",        \"arguments\": \"{\\\"command\\\":\\\"ls\\\"}\"      }    }  ]}"
 }
