@@ -424,6 +424,7 @@ async def _run_music_generation_playwright(task_id: str, prompt: str,
             pw = await async_playwright().start()
             browser = await pw.chromium.launch(
                 headless=True,
+                channel="msedge",
                 args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
             )
             logger.info("[Music] CloakBrowser not available, using Playwright")

@@ -172,9 +172,32 @@ class CookiePool:
                 else:
                     logger.warning(f"Cookie refresh script failed: {result.stderr[:200]}")
                     return False
-            else:
-                logger.warning("extract_session.py not found, cannot auto-refresh cookies")
+
+            logger.info("extract_session.py not found, trying browser login flow...")
+            try:
+                asyncio.get_running_loop()
+                logger.warning("Event loop already running, cannot launch sync login flow here. "
+                               "Run 'python main.py --login' manually to refresh cookies.")
                 return False
+            except RuntimeError:
+                pass
+
+            from login import do_login
+            result = asyncio.run(do_login(show_browser=True))
+            if result.get("success"):
+                reload_config()
+                for acc in self.accounts:
+                    if acc["name"] == "primary":
+                        acc["cookie"] = CONFIG.get('cookie', acc["cookie"])
+                        acc["device_id"] = CONFIG.get('device_id', acc["device_id"])
+                        acc["web_id"] = CONFIG.get('web_id', acc["web_id"])
+                        acc["tea_uuid"] = CONFIG.get('tea_uuid', acc["tea_uuid"])
+                        acc["enabled"] = True
+                        acc["fail_count"] = 0
+                self._last_refresh = time.time()
+                logger.info("Cookies refreshed via browser login flow")
+                return True
+            return False
         except Exception as e:
             logger.error(f"Cookie refresh failed: {e}")
             return False

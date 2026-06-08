@@ -37,3 +37,8 @@ captured_music.json
 exports/
 /.refact
 /~
+test.py
+test.json
+storage_state.json
+test.txt
+conversation_mapping.json

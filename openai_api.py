@@ -1,13 +1,15 @@
 import json
 import uuid
+import hashlib
 import asyncio
 import logging
 from typing import AsyncGenerator, Union
+from pathlib import Path
 
 import aiohttp
 from urllib.parse import urlencode
 
-from config import CONFIG, SIGN_METHOD, signer, cookie_pool, USER_AGENT
+from config import CONFIG, SIGN_METHOD, signer, cookie_pool, USER_AGENT, BASE_DIR
 from models import ChatMessage, MODEL_CONFIG
 from sse import (
     build_url_params, build_headers, build_request_body,
@@ -19,6 +21,25 @@ from sse import (
 from config import save_conversation_log, save_conversation_state
 
 logger = logging.getLogger("doubao-api")
+
+CONVERSATION_MAPPING_PATH = Path(BASE_DIR) / "conversation_mapping.json"
+
+def load_conversation_mapping() -> dict:
+    if CONVERSATION_MAPPING_PATH.exists():
+        try:
+            with open(CONVERSATION_MAPPING_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_conversation_mapping(mapping: dict) -> None:
+    try:
+        CONVERSATION_MAPPING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONVERSATION_MAPPING_PATH, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Failed to save conversation mapping: {e}")
 
 
 async def upload_images_for_message(image_urls: list[str], account: dict) -> list[dict]:
@@ -45,106 +66,113 @@ async def upload_images_for_message(image_urls: list[str], account: dict) -> lis
 
 async def call_doubao_api(messages: list[ChatMessage], conversation_id: str = "0",
                           model: str = "doubao-pro-chat", max_retries: int = 2,
-                          attachments: list[dict] = None) -> AsyncGenerator[bytes, None]:
-    account = cookie_pool.get_next()
-    body = build_request_body(messages, conversation_id, model, attachments)
+                          attachments: list[dict] = None,
+                          doc_attachments: list[dict] = None) -> AsyncGenerator[bytes, None]:
+    """通过持久化浏览器代理调用豆包 /chat/completion（浏览器 SDK 自动签名 a_bogus/msToken/fp）。
+    将新版 SSE 响应转换回旧版 wire 格式，保持下游解析逻辑不变。"""
+    from browser_client import browser_client
+    from sse import build_browser_body, parse_browser_sse
 
-    if SIGN_METHOD == 'b2' and signer and signer._initialized:
-        base_params = {
-            "aid": "497858",
-            "device_platform": "web",
-            "language": "zh",
-            "pc_version": "3.17.3",
-            "pkg_type": "release_version",
-            "real_aid": "497858",
-            "region": "CN",
-            "samantha_web": "1",
-            "sys_region": "CN",
-            "use-olympus-account": "1",
-            "version_code": "20800",
-        }
-        signed_url = await signer.get_signed_url(
-            f"{CONFIG['api_base']}/samantha/chat/completion",
-            base_params
-        )
-        if signed_url:
-            url = signed_url
-            logger.info(f"Using B2 signed URL with a_bogus")
-        else:
-            logger.warning("B2 signing failed, falling back to B3")
-            params = build_url_params(account)
-            url = f"{CONFIG['api_base']}/samantha/chat/completion?{params}"
-    else:
-        params = build_url_params(account)
-        url = f"{CONFIG['api_base']}/samantha/chat/completion?{params}"
+    body = build_browser_body(messages, conversation_id, model, attachments, doc_attachments)
+    logger.info(f"Calling Doubao via browser proxy: conv_id={conversation_id}, model={model}")
 
-    headers = build_headers(account)
+    def _emit_text(delta: str, conv: str) -> bytes:
+        inner = {"message": {"content_type": 2001, "content": json.dumps({"text": delta}, ensure_ascii=False)}}
+        if conv and conv != "0":
+            inner["conversation_id"] = conv
+        outer = {"event_type": 2001, "event_data": json.dumps(inner, ensure_ascii=False), "event_id": "1"}
+        return (f"data: {json.dumps(outer, ensure_ascii=False)}\n").encode()
 
-    logger.info(f"Calling Doubao API: conv_id={conversation_id}, account={account['name']}, method={SIGN_METHOD}, model={model}")
+    def _emit_end() -> bytes:
+        outer = {"event_type": 2003, "event_data": json.dumps({}), "event_id": "end"}
+        return (f"data: {json.dumps(outer, ensure_ascii=False)}\n").encode()
 
-    for attempt in range(max_retries + 1):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                    if resp.status != 200:
-                        body_text = await resp.text()
-                        logger.error(f"Doubao API returned {resp.status}: {body_text[:200]}")
-
-                        if cookie_pool.is_cookie_expired(body_text, resp.status):
-                            cookie_pool.report_fail(account, reason="cookie_expired")
-                            cookie_pool.maybe_refresh()
-                            if attempt < max_retries:
-                                account = cookie_pool.get_next()
-                                headers = build_headers(account)
-                                continue
-
-                        if attempt < max_retries:
-                            account = cookie_pool.get_next()
-                            headers = build_headers(account)
-                            continue
-                        yield json.dumps({"error": True, "status": resp.status, "body": body_text[:500]}).encode()
-                        return
-
-                    cookie_pool.report_success(account)
-
-                    collected_chunks = []
-                    async for chunk in resp.content.iter_any():
-                        collected_chunks.append(chunk)
-                        chunk_text = chunk.decode('utf-8', errors='replace')
-                        if cookie_pool.is_cookie_expired(chunk_text, 200):
-                            logger.warning(f"Cookie expired detected in SSE stream, aborting and retrying {chunk_text}")
-                            cookie_pool.report_fail(account, reason="cookie_expired_in_stream")
-                            cookie_pool.maybe_refresh()
-                            if attempt < max_retries:
-                                account = cookie_pool.get_next()
-                                headers = build_headers(account)
-                                break
-                            for c in collected_chunks:
-                                yield c
-                            return
-                    else:
-                        for c in collected_chunks:
-                            yield c
-                        return
-                    for c in collected_chunks:
-                        yield c
-                    continue
-        except asyncio.TimeoutError:
-            logger.error(f"Doubao API timeout (attempt {attempt + 1})")
-            if attempt < max_retries:
-                account = cookie_pool.get_next()
-                headers = build_headers(account)
-                continue
-            yield json.dumps({"error": True, "status": 0, "body": "Request timeout after retries"}).encode()
-            return
-        except Exception as e:
-            logger.error(f"Doubao API exception: {e}")
-            if attempt < max_retries:
-                account = cookie_pool.get_next()
-                headers = build_headers(account)
-                continue
+    text_buffer = ""
+    current_conv = conversation_id
+    got_any = False
+    try:
+        async for kind, value in browser_client.stream_completion(body):
+            logger.info(f"[DEBUG] Browser event: kind={kind}, value={value[:200]!r}")
+            if kind == "error":
+                yield json.dumps({"error": True, "status": 0, "body": str(value)[:500]}).encode()
+                return
+            if kind == "chunk" and "STREAM_ERROR" in value:
+                logger.error(f"Browser SSE error: {value[:300]}")
+                yield json.dumps({"error": True, "status": 0, "body": str(value)[:500]}).encode()
+                return
+            text_buffer += value
+            while "\n\n" in text_buffer:
+                event_block, text_buffer = text_buffer.split("\n\n", 1)
+                delta, conv_id, finished = parse_browser_sse(event_block + "\n\n")
+                if conv_id:
+                    current_conv = conv_id
+                if delta:
+                    got_any = True
+                    yield _emit_text(delta, current_conv)
+                if finished:
+                    yield _emit_end()
+                    return
+        if text_buffer.strip():
+            delta, conv_id, finished = parse_browser_sse(text_buffer)
+            if conv_id:
+                current_conv = conv_id
+            if delta:
+                got_any = True
+                yield _emit_text(delta, current_conv)
+        yield _emit_end()
+    except Exception as e:
+        logger.error(f"Browser proxy exception: {e}")
+        if not got_any:
             yield json.dumps({"error": True, "status": 0, "body": str(e)}).encode()
-            return
+        else:
+            yield _emit_end()
+        return
+
+
+def render_messages_as_text(messages: list[ChatMessage]) -> str:
+    parts = []
+    for i, m in enumerate(messages):
+        role = getattr(m, 'role', '') or ''
+        name = getattr(m, 'name', None)
+        tool_call_id = getattr(m, 'tool_call_id', None)
+        tool_calls = getattr(m, 'tool_calls', None)
+        content = getattr(m, 'content', None)
+
+        header = f"[{i}] role={role}"
+        if name:
+            header += f" name={name}"
+        if tool_call_id:
+            header += f" tool_call_id={tool_call_id}"
+        parts.append(header)
+
+        if tool_calls:
+            try:
+                parts.append("tool_calls:")
+                parts.append(json.dumps(tool_calls, ensure_ascii=False, indent=2))
+            except Exception:
+                parts.append(f"tool_calls: {tool_calls}")
+
+        if isinstance(content, str):
+            parts.append("content:")
+            parts.append(content)
+        elif isinstance(content, list):
+            parts.append("content:")
+            try:
+                parts.append(json.dumps(content, ensure_ascii=False, indent=2))
+            except Exception:
+                parts.append(str(content))
+        elif content is None:
+            parts.append("content:")
+            parts.append("<null>")
+        else:
+            parts.append("content:")
+            try:
+                parts.append(json.dumps(content, ensure_ascii=False, indent=2))
+            except Exception:
+                parts.append(str(content))
+
+        parts.append("")
+    return "\n".join(parts)
 
 
 async def stream_chat_completion(request):
@@ -152,9 +180,33 @@ async def stream_chat_completion(request):
     full_text = ""
     all_image_urls = []
     conversation_id = request.conversation_id or "0"
-    user_input = extract_text_from_content(request.messages[-1].content) if request.messages else ""
+    first_msg = request.messages[0] if request.messages else None
+    
+    logger.info(f"[DEBUG] Request: {len(request.messages)} messages, conversation_id={conversation_id}")
+    
+    # 1. Agent 请求时，不复用旧对话 ID，每次创建新对话
+    is_agent_request = any(
+        getattr(m, 'tool_calls', None) is not None or getattr(m, 'role', None) == 'tool'
+        for m in request.messages
+    ) if request.messages else False
+    
+    # 有 system prompt 也视为 agent 请求
+    has_system = any(getattr(m, 'role', None) == 'system' for m in request.messages)
+    if has_system and not is_agent_request:
+        is_agent_request = True
+    # agent 请求不复用旧对话 ID，每次创建新对话避免状态冲突
+    if is_agent_request:
+        conversation_id = "0"
+    logger.info(f"[DEBUG] is_agent_request={is_agent_request}, msgs={len(request.messages)}, conv_id={conversation_id}")
+    last_msg = request.messages[-1] if request.messages else None
+    last_is_tool = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+    if is_agent_request and not last_is_tool:
+        user_input = json.dumps([m.model_dump() for m in request.messages], ensure_ascii=False) if request.messages else ""
+    else:
+        user_input = extract_text_from_content(request.messages[-1].content) if request.messages else ""
     buffer = ""
     full_thinking = ""
+    suppress_text = False
 
     model_cfg = MODEL_CONFIG.get(request.model, {})
     is_image_model = model_cfg.get("is_image_model", False)
@@ -189,8 +241,27 @@ async def stream_chat_completion(request):
         except Exception as e:
             logger.error(f"Image upload failed, continuing without images: {e}")
 
+    doc_attachments = None
+    logger.info(f"[DEBUG] is_agent_request={is_agent_request}, last_is_tool={last_is_tool}, about to check upload path")
+    if is_agent_request and not last_is_tool:
+        logger.info("[DEBUG] Entering agent upload branch")
+        try:
+            from browser_client import browser_client
+            file_text = render_messages_as_text(request.messages)
+            file_data = file_text.encode('utf-8')
+            file_name = "messages.txt"
+            logger.info(f"[DEBUG] Calling upload_document_via_page, size={len(file_data)}")
+            attachment = await browser_client.upload_document_via_page(
+                file_data=file_data,
+                file_name=file_name,
+            )
+            doc_attachments = [attachment]
+            logger.info(f"[DEBUG] Uploaded document for agent request: {len(file_data)} bytes, uri={attachment['file']['uri'][:60]}...")
+        except Exception as e:
+            logger.error(f"[DEBUG] Document upload failed for agent request: {e}")
+
     try:
-        async for raw_chunk in call_doubao_api(request.messages, conversation_id, request.model, attachments=attachments):
+        async for raw_chunk in call_doubao_api(request.messages, conversation_id, request.model, attachments=attachments, doc_attachments=doc_attachments):
             try:
                 buffer += raw_chunk.decode('utf-8', errors='replace')
             except:
@@ -206,7 +277,9 @@ async def stream_chat_completion(request):
                 if event_data is None:
                     save_conversation_log(user_input, full_text, request.model, conversation_id, chat_id, all_image_urls)
                     save_conversation_state(chat_id, request.messages, conversation_id, request.model)
-                    yield format_openai_done()
+                    
+                    if is_agent_request:
+                        yield format_openai_done()
                     return
 
                 extracted, thinking = extract_text_from_event(event_data)
@@ -215,7 +288,10 @@ async def stream_chat_completion(request):
                     yield format_openai_chunk("", request.model, chat_id, conversation_id, reasoning_content=thinking)
                 if extracted:
                     full_text += extracted
-                    yield format_openai_chunk(extracted, request.model, chat_id, conversation_id)
+                    if not suppress_text and full_text.lstrip()[:1] == "{":
+                        suppress_text = True
+                    if not suppress_text:
+                        yield format_openai_chunk(extracted, request.model, chat_id, conversation_id)
 
                 img_urls = extract_image_urls_from_event(event_data)
                 if img_urls:
@@ -262,11 +338,18 @@ async def stream_chat_completion(request):
                                 )
                         yield format_openai_chunk(None, request.model, chat_id, conversation_id, finish_reason="tool_calls")
                     else:
+                        if suppress_text and full_text.strip():
+                            yield format_openai_chunk(full_text, request.model, chat_id, conversation_id)
                         yield format_openai_chunk("", request.model, chat_id, conversation_id).replace(
                             '"finish_reason": null', '"finish_reason": "stop"')
 
                     save_conversation_log(user_input, full_text, request.model, conversation_id, chat_id, all_image_urls)
                     save_conversation_state(chat_id, request.messages, conversation_id, request.model)
+                    
+                    # 保存对话映射（if 有附件）
+                    if is_agent_request:
+                        pass  # Agent requests don't save mapping since we use new conv_id each time
+                        
                     yield format_openai_done()
                     return
     except Exception as e:
@@ -325,6 +408,7 @@ async def stream_chat_completion(request):
 
     save_conversation_log(user_input, full_text, request.model, conversation_id, chat_id, all_image_urls)
     save_conversation_state(chat_id, request.messages, conversation_id, request.model)
+    
     yield format_openai_done()
 
 
@@ -333,7 +417,22 @@ async def non_stream_chat_completion(request):
     full_text = ""
     all_image_urls = []
     conversation_id = request.conversation_id or "0"
-    user_input = extract_text_from_content(request.messages[-1].content) if request.messages else ""
+    first_msg = request.messages[0] if request.messages else None
+    is_agent_request = any(
+        getattr(m, 'tool_calls', None) is not None or getattr(m, 'role', None) == 'tool'
+        for m in request.messages
+    ) if request.messages else False
+    
+    # 1. Agent 请求时，不复用旧对话 ID，每次创建新对话
+    mapping = load_conversation_mapping()
+    last_msg = request.messages[-1] if request.messages else None
+    last_is_tool = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+    if is_agent_request:
+        conversation_id = "0"
+    if is_agent_request and not last_is_tool:
+        user_input = json.dumps([m.model_dump() for m in request.messages], ensure_ascii=False) if request.messages else ""
+    else:
+        user_input = extract_text_from_content(request.messages[-1].content) if request.messages else ""
     buffer = ""
     full_thinking = ""
 
@@ -459,7 +558,23 @@ async def non_stream_chat_completion(request):
         if attachments:
             logger.info(f"Uploaded {len(attachments)} images for vision request")
 
-    async for raw_chunk in call_doubao_api(request.messages, conversation_id, request.model, attachments=attachments):
+    doc_attachments = None
+    if is_agent_request and not last_is_tool:
+        try:
+            from browser_client import browser_client
+            file_text = render_messages_as_text(request.messages)
+            file_data = file_text.encode('utf-8')
+            file_name = "messages.txt"
+            attachment = await browser_client.upload_document_via_page(
+                file_data=file_data,
+                file_name=file_name,
+            )
+            doc_attachments = [attachment]
+            logger.info(f"Uploaded document for agent request (non-stream): {len(file_data)} bytes")
+        except Exception as e:
+            logger.error(f"Document upload failed for agent request (non-stream): {e}")
+
+    async for raw_chunk in call_doubao_api(request.messages, conversation_id, request.model, attachments=attachments, doc_attachments=doc_attachments):
         try:
             buffer += raw_chunk.decode('utf-8', errors='replace')
         except:
@@ -550,6 +665,10 @@ async def non_stream_chat_completion(request):
 
     if all_image_urls:
         result["images"] = all_image_urls
+        
+    # Save conversation log
+    save_conversation_log(user_input, full_text, request.model, conversation_id, chat_id, all_image_urls)
+    
     return result
 
 

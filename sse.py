@@ -49,6 +49,8 @@ def build_headers(account: dict):
 
 
 def extract_text_from_content(content: Union[str, list]) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -95,7 +97,7 @@ def build_request_body(messages: list[ChatMessage], conversation_id: str = "0",
         text = extract_text_from_content(msg.content)
         # 新增：仅对最后一条用户消息，在末尾追加自定义提示词
         if msg is last_msg and msg.role == "user" and custom_prompt:
-            text = f"{text}\n\n\{custom_prompt}"
+            text = f"{text}\n\n{custom_prompt}"
 
         msg_attachments = []
 
@@ -267,7 +269,6 @@ def format_openai_chunk(content: str, model: str, chat_id: str, conversation_id:
         chunk["choices"][0]["delta"]["reasoning_content"] = reasoning_content
     if conversation_id and conversation_id != "0":
         chunk["conversation_id"] = conversation_id
-    logger.info(f"流式应答内容: {json.dumps(chunk, ensure_ascii=False)}")
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 def format_openai_chunk1(content: str, model: str, chat_id: str, conversation_id: str = None, reasoning_content: str = None) -> str:
@@ -303,3 +304,220 @@ def is_cookie_expired(status_code: int, body: str) -> bool:
     expired_keywords = ["login", "session expired", "unauthorized", "need_login", "csrf"]
     body_lower = body.lower()
     return any(kw in body_lower for kw in expired_keywords)
+
+
+def build_browser_body(messages: list, conversation_id: str = "0",
+                        model: str = "doubao-pro-chat", attachments: list = None,
+                        doc_attachments: list = None):
+    """构建新版豆包 /chat/completion 请求体（content_block 格式，配合浏览器代理）。
+    
+    doc_attachments: 文档附件列表（新版协议 type=3），挂载为独立 block_type 10052 块。"""
+    import time
+    
+    last_msg = messages[-1] if messages else None
+    custom_prompt = CONFIG.get('custom_prompt', '')
+
+    model_cfg = MODEL_CONFIG.get(model, MODEL_CONFIG["doubao-pro-chat"])
+    bot_id = model_cfg.get("bot_id", "7338286299411103781")
+    use_deep_think = model_cfg.get("use_deep_think", False)
+
+    need_create = (not conversation_id) or conversation_id == "0"
+
+    # 有文档附件时，文本块使用 custom_prompt；否则提取最后一条消息的文本
+    if doc_attachments:
+        text = extract_text_from_content(last_msg.content) if last_msg else ""
+        user_request=""
+        if last_msg and getattr(last_msg, "role", "") == "user" and custom_prompt:
+            user_request = f"{text}"
+        text = f"{str(uuid.uuid4())}\n\n{custom_prompt}\n{user_request}\n" if custom_prompt else f"{str(uuid.uuid4())}\n\n\n{user_request}\n请阅读附件中的文件内容（包含完整对话历史），并根据文件后面的内容继续回复。"
+    else:
+        text = extract_text_from_content(last_msg.content) if last_msg else ""
+        if last_msg and getattr(last_msg, "role", "") == "user" and custom_prompt:
+            text = f"{text}\n\n{custom_prompt}"
+
+    content_block = []
+    
+    # 文档附件块（block_type 10052）必须排在最前面
+    if doc_attachments:
+        attachment_block = {
+            "block_type": 10052,
+            "content": {
+                "attachment_block": {"attachments": doc_attachments},
+                "pc_event_block": ""
+            },
+            "block_id": str(uuid.uuid4()),
+            "parent_id": "",
+            "meta_info": [],
+            "append_fields": []
+        }
+        content_block.append(attachment_block)
+    
+    # 文本块（block_type 10000）
+    text_block = {
+        "block_type": 10000,
+        "content": {
+            "text_block": {"text": text, "icon_url": "", "icon_url_dark": "", "summary": ""},
+            "pc_event_block": "",
+        },
+        "block_id": str(uuid.uuid4()),
+        "parent_id": "",
+        "meta_info": [],
+        "append_fields": [],
+    }
+    content_block.append(text_block)
+
+    # 完全对齐抓包的 option 结构
+    option = {
+        "send_message_scene": "",
+        "create_time_ms": int(time.time() * 1000),
+        "collect_id": "",
+        "is_audio": False,
+        "answer_with_suggest": False,
+        "tts_switch": False,
+        "need_deep_think": 1 if use_deep_think else 0,
+        "click_clear_context": False,
+        "from_suggest": False,
+        "is_regen": False,
+        "is_replace": False,
+        "is_from_click_option": False,
+        "disable_sse_cache": False,
+        "select_text_action": "",
+        "is_select_text": False,
+        "resend_for_regen": False,
+        "scene_type": 0,
+        "unique_key": str(uuid.uuid4()),
+        "start_seq": 0,
+        "need_create_conversation": need_create,
+        "conversation_init_option": {"need_ack_conversation": True},
+        "regen_query_id": [],
+        "edit_query_id": [],
+        "regen_instruction": "",
+        "no_replace_for_regen": False,
+        "message_from": 0,
+        "shared_app_name": "",
+        "shared_app_id": "",
+        "sse_recv_event_options": {"support_chunk_delta": True},
+        "is_ai_playground": False,
+        "is_old_user": True,
+        "recovery_option": {
+            "is_recovery": False,
+            "req_create_time_sec": int(time.time()),
+            "append_sse_event_scene": 0
+        },
+        "message_storage_type": 0
+    }
+    
+    # ext 字段对齐抓包
+    ext = {
+        "input_skill": '{"skill_id":"16","skill_type":16,"template_key":""}' if doc_attachments else "",
+        "use_deep_think": "1" if use_deep_think else "0",
+        "fp": CONFIG.get('fp', ''),
+        "sub_conv_firstmet_type": "1",
+        "collection_id": "",
+        "conversation_init_option": '{"need_ack_conversation":true}',
+        "commerce_credit_config_enable": "0"
+    }
+
+    body = {
+        "client_meta": {
+            "local_conversation_id": f"local_{uuid.uuid4().int % 10000000000000000}",
+            "conversation_id": "" if need_create else conversation_id,
+            "bot_id": bot_id,
+            "last_section_id": "",
+            "last_message_index": None,
+        },
+        "messages": [{
+            "local_message_id": str(uuid.uuid4()),
+            "content_block": content_block,
+            "message_status": 0,
+        }],
+        "option": option,
+        "chat_ability": {"ability_type": 16} if doc_attachments else {},
+        "user_context": [],
+        "ext": ext,
+    }
+    
+    # 如果没有 doc_attachments，移除 chat_ability（空字典不需要）
+    if not doc_attachments:
+        body.pop("chat_ability", None)
+    
+    return body
+
+
+def parse_browser_sse(text: str):
+    """解析新版浏览器代理 SSE 文本，返回 (delta_text, conversation_id, finished)。
+    文本增量来源：
+    - STREAM_MSG_NOTIFY 首帧：data.content.content（JSON 字符串 {"text":...}）
+    - STREAM_CHUNK 增量：patch_op 中 patch_object==102 的 patch_value.content（JSON 字符串 {"text":...}）
+    - content_block 形态：patch_value.content_block[].content.text_block.text"""
+    delta = ""
+    conv_id = ""
+    finished = False
+
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        event_type = ""
+        data_str = ""
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                data_str = line[5:].strip()
+
+        if not data_str:
+            continue
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        if event_type == "SSE_ACK":
+            ack = data.get("ack_client_meta", {})
+            cid = ack.get("conversation_id", "")
+            if cid and cid != "0":
+                conv_id = cid
+        elif event_type == "STREAM_MSG_NOTIFY":
+            content_obj = data.get("content", {})
+            # 解析嵌套字符串形态
+            raw = content_obj.get("content", "")
+            if raw:
+                try:
+                    delta += json.loads(raw).get("text", "")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # 解析 content_block 形态（首段文本可能在这里）
+            for cb in content_obj.get("content_block", []):
+                if cb.get("block_type") == 10000:
+                    t = cb.get("content", {}).get("text_block", {}).get("text", "")
+                    if t:
+                        delta += t
+                elif cb.get("block_type") == 10052:
+                    pass  # 附件块，忽略
+            cid = data.get("meta", {}).get("conversation_id", "")
+            if cid and cid != "0":
+                conv_id = cid
+        elif event_type == "STREAM_CHUNK":
+            for op in data.get("patch_op", []):
+                pv = op.get("patch_value", {})
+                if op.get("patch_object") == 102:
+                    content = pv.get("content", "")
+                    if content:
+                        try:
+                            delta += json.loads(content).get("text", "")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                for cb in pv.get("content_block", []):
+                    if cb.get("block_type") == 10000:
+                        t = cb.get("content", {}).get("text_block", {}).get("text", "")
+                        if t:
+                            delta += t
+        elif event_type == "CHUNK_DELTA":
+            delta += data.get("text", "")
+        elif event_type == "SSE_REPLY_END":
+            finished = True
+
+    return delta, conv_id, finished
+

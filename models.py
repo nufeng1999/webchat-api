@@ -40,7 +40,10 @@ ANTHROPIC_MODEL_MAP = {
 
 class ChatMessage(BaseModel):
     role: str = "user"
-    content: Union[str, list] = ""
+    content: Union[str, list, None] = ""
+    name: Optional[str] = None
+    tool_calls: Optional[list] = None
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):

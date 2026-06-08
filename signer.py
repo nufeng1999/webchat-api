@@ -35,6 +35,7 @@ class PlaywrightSigner:
                 self.playwright = await async_playwright().start()
                 self.browser = await self.playwright.chromium.launch(
                     headless=True,
+                    channel="msedge",
                     args=["--no-sandbox", "--disable-setuid-sandbox"]
                 )
                 stealth = Stealth()
@@ -80,7 +81,7 @@ class PlaywrightSigner:
                     timeout=60000
                 )
                 logger.info("Page loaded, waiting for bdms.frontierSign...")
-
+                
                 try:
                     await self.page.wait_for_function(
                         "() => typeof window.bdms?.frontierSign === 'function'",

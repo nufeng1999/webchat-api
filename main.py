@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import logging
 import asyncio
 import aiohttp
@@ -43,11 +44,28 @@ async def lifespan(app: FastAPI):
     logger.info(f"Active sign method: {SIGN_METHOD}")
     _cleanup_task = asyncio.create_task(_auto_cleanup_task())
     await init_db()
+
+    from browser_client import browser_client, STORAGE_STATE_PATH
+    if os.path.exists(STORAGE_STATE_PATH):
+        try:
+            logger.info("Initializing browser proxy client (this may take 10-30s)...")
+            await browser_client.ensure_ready()
+            logger.info("Browser proxy client ready")
+        except Exception as e:
+            logger.error(f"Browser proxy init failed: {e}. Run 'python main.py --login' first.")
+    else:
+        logger.warning("storage_state.json not found. Run 'python main.py --login' to enable chat.")
+
     yield
     if _cleanup_task:
         _cleanup_task.cancel()
     if signer:
         await signer.close()
+    try:
+        from browser_client import browser_client
+        await browser_client.close()
+    except Exception:
+        pass
 
 app = FastAPI(title="Doubao Free API", version="3.3.0", lifespan=lifespan)
 
@@ -86,6 +104,7 @@ async def rate_limit_middleware(request: Request, call_next):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
+    #logger.info(f"原始请求内容: {json.dumps(request.model_dump(), ensure_ascii=False)}")
     if request.stream:
         return StreamingResponse(
             stream_chat_completion(request),
@@ -765,5 +784,31 @@ async def _auto_cleanup_task():
             logger.error(f"Auto cleanup task error: {e}")
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Doubao Free API")
+    parser.add_argument("--login", action="store_true",
+                        help="Open browser for login and save credentials, then exit")
+    parser.add_argument("--host", default=None,
+                        help="Server host (default: from config.json)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Server port (default: from config.json)")
+    args = parser.parse_args()
+
+    if args.login:
+        from login import do_login
+        result = asyncio.run(do_login(show_browser=True))
+        if result.get("success"):
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        else:
+            print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
+
+    host = args.host or CONFIG.get('server_host', '0.0.0.0')
+    port = args.port or CONFIG.get('server_port', 8765)
     import uvicorn
-    uvicorn.run(app, host=CONFIG.get('server_host', '0.0.0.0'), port=CONFIG.get('server_port', 8765))
+    uvicorn.run(app, host=host, port=port)

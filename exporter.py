@@ -45,6 +45,7 @@ async def _launch_browser():
         pw = await async_playwright().start()
         return await pw.chromium.launch(
             headless=True,
+            channel="msedge",
             args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
         )
 
