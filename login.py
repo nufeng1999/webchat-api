@@ -95,12 +95,37 @@ async def do_login(show_browser: bool = True) -> dict:
 
         logger.info("Navigating to doubao.com/chat/ ...")
         await page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
+        await asyncio.sleep(2)
 
-        # 通过会话 cookie 判断是否已登录（URL 在 SPA 中不可靠）
+        # 检查 session cookie；如果 storage_state 恢复的 cookies 不包含有效会话，尝试从 config.json 补充注入
         async def _is_logged_in() -> bool:
             cks = await context.cookies()
             names = {c["name"] for c in cks if c.get("value")}
             return bool(names & {"sessionid", "sessionid_ss", "sid_guard", "sid_tt"})
+
+        if not await _is_logged_in():
+            cookie_str = CONFIG.get('cookie', '')
+            if cookie_str and 'sessionid' in cookie_str:
+                logger.info("Session cookie missing after page load, trying config.json cookie string...")
+                cookies_to_add = []
+                for part in cookie_str.split(';'):
+                    part = part.strip()
+                    if '=' in part:
+                        name, value = part.split('=', 1)
+                        # 检查是否已存在同名 cookie
+                        if not any(c.get("name") == name for c in await context.cookies()):
+                            cookies_to_add.append({
+                                'name': name.strip(),
+                                'value': value.strip(),
+                                'domain': '.doubao.com',
+                                'path': '/'
+                            })
+                if cookies_to_add:
+                    await context.add_cookies(cookies_to_add)
+                    logger.info(f"Added {len(cookies_to_add)} missing cookies from config.json")
+                    # 再次检查
+                    if await _is_logged_in():
+                        logger.info("Login state restored from config.json cookies")
 
         if await _is_logged_in():
             logger.info("Already logged in (valid session cookie found)")

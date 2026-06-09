@@ -92,7 +92,7 @@ async def call_doubao_api(messages: list[ChatMessage], conversation_id: str = "0
     got_any = False
     try:
         async for kind, value in browser_client.stream_completion(body):
-            logger.info(f"[DEBUG] Browser event: kind={kind}, value={value[:200]!r}")
+            #logger.info(f"[DEBUG] Browser event: kind={kind}, value={value[:200]!r}")
             if kind == "error":
                 yield json.dumps({"error": True, "status": 0, "body": str(value)[:500]}).encode()
                 return
@@ -182,7 +182,7 @@ async def stream_chat_completion(request):
     conversation_id = request.conversation_id or "0"
     first_msg = request.messages[0] if request.messages else None
     
-    logger.info(f"[DEBUG] Request: {len(request.messages)} messages, conversation_id={conversation_id}")
+    #logger.info(f"[DEBUG] Request: {len(request.messages)} messages, conversation_id={conversation_id}")
     
     # 1. Agent 请求时，不复用旧对话 ID，每次创建新对话
     is_agent_request = any(
@@ -197,7 +197,7 @@ async def stream_chat_completion(request):
     # agent 请求不复用旧对话 ID，每次创建新对话避免状态冲突
     if is_agent_request:
         conversation_id = "0"
-    logger.info(f"[DEBUG] is_agent_request={is_agent_request}, msgs={len(request.messages)}, conv_id={conversation_id}")
+    #logger.info(f"[DEBUG] is_agent_request={is_agent_request}, msgs={len(request.messages)}, conv_id={conversation_id}")
     last_msg = request.messages[-1] if request.messages else None
     last_is_tool = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
     if is_agent_request and not last_is_tool:
@@ -242,21 +242,21 @@ async def stream_chat_completion(request):
             logger.error(f"Image upload failed, continuing without images: {e}")
 
     doc_attachments = None
-    logger.info(f"[DEBUG] is_agent_request={is_agent_request}, last_is_tool={last_is_tool}, about to check upload path")
+    #logger.info(f"[DEBUG] is_agent_request={is_agent_request}, last_is_tool={last_is_tool}, about to check upload path")
     if is_agent_request and not last_is_tool:
-        logger.info("[DEBUG] Entering agent upload branch")
+        #logger.info("[DEBUG] Entering agent upload branch")
         try:
             from browser_client import browser_client
             file_text = render_messages_as_text(request.messages)
             file_data = file_text.encode('utf-8')
             file_name = "messages.txt"
-            logger.info(f"[DEBUG] Calling upload_document_via_page, size={len(file_data)}")
+            #logger.info(f"[DEBUG] Calling upload_document_via_page, size={len(file_data)}")
             attachment = await browser_client.upload_document_via_page(
                 file_data=file_data,
                 file_name=file_name,
             )
             doc_attachments = [attachment]
-            logger.info(f"[DEBUG] Uploaded document for agent request: {len(file_data)} bytes, uri={attachment['file']['uri'][:60]}...")
+            #logger.info(f"[DEBUG] Uploaded document for agent request: {len(file_data)} bytes, uri={attachment['file']['uri'][:60]}...")
         except Exception as e:
             logger.error(f"[DEBUG] Document upload failed for agent request: {e}")
 
@@ -891,6 +891,16 @@ async def delete_conversation(conversation_id: str) -> tuple[bool, str]:
     if not conversation_id or conversation_id == "0":
         return True, "No conversation to delete"
 
+    # 1. 先尝试浏览器代理方式（最新接口）
+    from browser_client import browser_client
+    try:
+        success, err = await browser_client.delete_conversation_via_browser(conversation_id)
+        if success:
+            return True, ""
+    except Exception as e:
+        logger.warning(f"Browser delete failed, falling back: {e}")
+
+    # 2. 降级到旧接口 /samantha/thread/delete
     account = cookie_pool.get_next()
     params = build_url_params(account)
     url = f"{CONFIG['api_base']}/samantha/thread/delete?{params}"
@@ -913,7 +923,7 @@ async def delete_conversation(conversation_id: str) -> tuple[bool, str]:
                     error_text = await resp.text()
                     logger.warning(f"Delete conversation {conversation_id} failed: {resp.status} {error_text[:200]}")
                     return False, f"HTTP {resp.status}"
-                logger.info(f"Deleted conversation {conversation_id} on Doubao server")
+                logger.info(f"Deleted conversation {conversation_id} on Doubao server (fallback)")
                 return True, ""
     except Exception as e:
         logger.error(f"Delete conversation exception: {e}")

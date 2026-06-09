@@ -1,10 +1,10 @@
-# Doubao Free API
+# Doubao API （Doubao Free API 分支版）
 
 将豆包桌面客户端的对话能力包装为 OpenAI 兼容的标准 API，供 Claude Code、OpenCode 等 AI Agent 软件直接调用。
 
 ## ✨ 功能特性
 
-- 🔄 **OpenAI 兼容** — 完全兼容 `/v1/chat/completions` 接口，支持流式/非流式
+- 🔄 **OpenAI 兼容** — 完全兼容 `/v1/chat/completions` 接口，支持流式/非流式，支持工具调用
 - 🤖 **Anthropic 兼容** — 完全兼容 `/v1/messages` 接口，支持 Claude Code 原生对接
 - 🖼️ **Vision 图片识别** — 支持 OpenAI Vision 格式，自动上传图片到豆包 ImageX
 - 🎨 **图片生成** — 支持 `/v1/images/generations`，兼容 OpenAI Image API

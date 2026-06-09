@@ -101,6 +101,55 @@ class BrowserClient:
             return
         q.put_nowait((kind, value))
 
+    async def get_user_info(self) -> dict:
+        await self.ensure_ready()
+        async with self._lock:
+            user_info = {}
+            got_data = asyncio.Event()
+
+            async def on_response(response):
+                url = response.url
+                try:
+                    if '/alice/profile/self' in url:
+                        body = await response.json()
+                        profile = body.get("data", {}).get("profile_brief", {})
+                        if profile and profile.get("nickname"):
+                            user_info["name"] = profile.get("nickname", "")
+                            user_info["username"] = profile.get("user_name", "")
+                            user_info["nick_name"] = profile.get("nickname", "")
+                            user_info["user_id"] = str(profile.get("id", ""))
+                            img_data = profile.get("image", {})
+                            if isinstance(img_data, dict):
+                                user_info["avatar_url"] = img_data.get("tiny_url", "")
+                            got_data.set()
+                    elif '/im/conversation/info' in url:
+                        body = await response.json()
+                        dl = body.get("downlink_body", {})
+                        conv_body = dl.get("get_conv_info_downlink_body", {})
+                        participants = conv_body.get("first_page_participant_list", [])
+                        for p in participants:
+                            if p.get("user_type") == 1:
+                                user_info["name"] = user_info.get("name") or p.get("nick_name", "")
+                                user_info["nick_name"] = user_info.get("nick_name") or p.get("nick_name", "")
+                                avatar = p.get("avatar_url", {})
+                                if isinstance(avatar, dict):
+                                    user_info["avatar_url"] = user_info.get("avatar_url") or avatar.get("key", "")
+                                got_data.set()
+                except Exception:
+                    pass
+
+            self._page.on("response", on_response)
+            try:
+                await self._page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await asyncio.wait_for(got_data.wait(), timeout=12)
+                except asyncio.TimeoutError:
+                    pass
+                await asyncio.sleep(1)
+            finally:
+                self._page.remove_listener("response", on_response)
+            return user_info
+
     async def stream_completion(self, body: dict):
         await self.ensure_ready()
         stream_id = uuid.uuid4().hex
@@ -174,7 +223,82 @@ class BrowserClient:
         except Exception:
             pass
 
-    async def upload_document_via_page(self, file_data: bytes, file_name: str) -> dict:
+    async def delete_conversation_via_browser(self, conversation_id: str) -> tuple[bool, str]:
+        """通过浏览器代理删除豆包对话，复用 storage_state.json 中的 cookie。
+        新接口失败时降级到旧接口 /samantha/thread/delete。"""
+        await self._lock.acquire()
+        try:
+            await self.ensure_ready()
+            import base64
+            import httpx
+            from requests_aws4auth import AWS4Auth
+
+            cookie = _get_latest_cookie_from_storage()
+            if not cookie:
+                return False, "No cookie available"
+
+            device_id = CONFIG.get('device_id', '')
+            web_id = CONFIG.get('web_id', '')
+            tea_uuid = CONFIG.get('tea_uuid', '')
+
+            headers = {
+                'content-type': 'application/json',
+                'cookie': cookie,
+                'origin': 'https://www.doubao.com',
+                'referer': f'https://www.doubao.com/chat/{conversation_id}',
+                'user-agent': USER_AGENT,
+            }
+
+            params = "&".join([
+                "version_code=20800",
+                "language=zh",
+                "device_platform=web",
+                "aid=497858",
+                f"real_aid=497858",
+                "pkg_type=release_version",
+                f"device_id={device_id}",
+                "pc_version=3.22.1",
+                f"web_id={web_id}",
+                f"tea_uuid={tea_uuid}",
+                "region=CN",
+                "sys_region=CN",
+                "samantha_web=1",
+                "web_platform=browser",
+                "use-olympus-account=1",
+                f"web_tab_id=23925501-4864-4709-b680-59081e5ce770",
+#{uuid.uuid4()}
+            ])
+            url = f"https://www.doubao.com/im/conversation/batch_del_user_conv?{params}"
+
+            body = {
+                "cmd": 4171,
+                "uplink_body": {
+                    "batch_delete_user_conversation_uplink_body": {
+                        "conversation_id": [conversation_id],
+                        "delete_all": False,
+                        "conversation_type": 3,
+                    }
+                },
+                "sequence_id": uuid.uuid4().hex,
+                "channel": 2,
+                "version": "1",
+            }
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(url, headers=headers, json=body)
+                data = resp.json()
+
+            result = data.get("downlink_body", {}).get(
+                "batch_delete_user_conversation_downlink_body", {}
+            ).get("result", {})
+
+            if result.get(conversation_id) is True:
+                logger.info(f"Deleted conversation {conversation_id} via browser")
+                return True, ""
+
+            return False, f"Server rejected: {json.dumps(data, ensure_ascii=False)[:300]}"
+        finally:
+            self._lock.release()
         """通过 httpx 从 storage_state.json 读取 cookie 执行文档上传，与浏览器代理同一会话。
         返回 attachment dict 用于 content_block (block_type 10052)。"""
         import base64

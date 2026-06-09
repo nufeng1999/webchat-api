@@ -318,61 +318,13 @@ async def fetch_user_info() -> dict:
     if _USER_INFO_CACHE and time.time() - _USER_INFO_CACHE_TIME < 300:
         return _USER_INFO_CACHE
 
-    account = _get_valid_account()
-    cookie_str = account.get('cookie', CONFIG.get('cookie', ''))
-
-    if 'sessionid' not in cookie_str and 'session_id' not in cookie_str:
-        return {}
-
     try:
-        async with PW_EXPORT_LOCK:
-            browser = await _launch_browser()
-            user_info = {}
-            conv_info = {}
-
-            context = await _create_context(browser, cookie_str)
-            page = await context.new_page()
-
-            async def capture(route):
-                url = route.request.url
-                response = await route.fetch()
-                try:
-                    body = await response.json()
-                    if '/alice/profile/self' in url:
-                        profile = body.get("data", {}).get("profile_brief", {})
-                        if profile and profile.get("nickname"):
-                            user_info["name"] = profile.get("nickname", "")
-                            user_info["username"] = profile.get("user_name", "")
-                            user_info["nick_name"] = profile.get("nickname", "")
-                            user_info["user_id"] = str(profile.get("id", ""))
-                            img_data = profile.get("image", {})
-                            if isinstance(img_data, dict):
-                                user_info["avatar_url"] = img_data.get("tiny_url", "")
-                    elif '/im/conversation/info' in url:
-                        dl = body.get("downlink_body", {})
-                        conv_body = dl.get("get_conv_info_downlink_body", {})
-                        participants = conv_body.get("first_page_participant_list", [])
-                        for p in participants:
-                            if p.get("user_type") == 1:
-                                user_info["name"] = user_info.get("name") or p.get("nick_name", "")
-                                user_info["nick_name"] = user_info.get("nick_name") or p.get("nick_name", "")
-                                avatar = p.get("avatar_url", {})
-                                if isinstance(avatar, dict):
-                                    user_info["avatar_url"] = user_info.get("avatar_url") or avatar.get("key", "")
-                except:
-                    pass
-                await route.fulfill(response=response)
-
-            await page.route('**', capture)
-            await page.goto('https://www.doubao.com/chat/', wait_until='domcontentloaded', timeout=30000)
-            await asyncio.sleep(8)
-            await browser.close()
-
+        from browser_client import browser_client
+        user_info = await browser_client.get_user_info()
         if user_info:
             _USER_INFO_CACHE = user_info
             _USER_INFO_CACHE_TIME = time.time()
         return user_info
-
     except Exception as e:
         logger.error(f"[User] Failed to fetch user info: {e}")
         return {}
