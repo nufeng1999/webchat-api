@@ -57,27 +57,29 @@ class BrowserClient:
         self._browser = None
         self._context = None
         self._page = None
+        self._qianwen_page = None
+        self._qianwen_context = None
         self._lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
         self._queues = {}
 
-    async def ensure_ready(self):
+    async def ensure_ready(self, headless: bool = True):
         if self._page and self._browser and self._browser.is_connected():
             return True
         async with self._init_lock:
             if self._page and self._browser and self._browser.is_connected():
                 return True
-            await self._launch()
+            await self._launch(headless)
             return True
 
-    async def _launch(self):
+    async def _launch(self, headless=True):
         from playwright.async_api import async_playwright
         if not os.path.exists(STORAGE_STATE_PATH):
             raise RuntimeError("storage_state.json 不存在，请先运行 python main.py --login 登录")
 
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
-            headless=True,
+            headless=headless,
             channel="msedge",
             args=["--no-sandbox", "--disable-setuid-sandbox"],
         )
@@ -93,6 +95,17 @@ class BrowserClient:
         logger.info("Browser client: navigating to doubao.com/chat/ ...")
         await self._page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
         await asyncio.sleep(2)
+
+        # 等待 bdms.frontierSign 签名 SDK 加载完成
+        try:
+            await self._page.wait_for_function(
+                "() => typeof window.bdms?.frontierSign === 'function'",
+                timeout=30000
+            )
+            logger.info("bdms.frontierSign SDK ready")
+        except Exception as e:
+            logger.warning(f"bdms.frontierSign not available: {e}")
+
         logger.info("Browser client ready")
 
     def _on_push(self, stream_id: str, kind: str, value):
@@ -100,6 +113,195 @@ class BrowserClient:
         if q is None:
             return
         q.put_nowait((kind, value))
+
+    async def ensure_qianwen_ready(self):
+        if self._qianwen_page and self._browser and self._browser.is_connected():
+            return True
+        if not self._browser or not self._browser.is_connected():
+            await self.ensure_ready()
+        qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
+        ctx_kwargs = {
+            "user_agent": USER_AGENT,
+            "viewport": {"width": 1280, "height": 900},
+        }
+        if os.path.exists(qianwen_state):
+            try:
+                ctx_kwargs["storage_state"] = qianwen_state
+                logger.info("Qianwen: loading saved storage_state")
+            except Exception as e:
+                logger.warning(f"Failed to load qianwen storage_state: {e}")
+        else:
+            qianwen_cookie = CONFIG.get("qianwen_cookie", "")
+            if qianwen_cookie and "qianwen" in qianwen_cookie.lower():
+                logger.info("Qianwen: will inject cookies from config")
+        try:
+            self._qianwen_context = await self._browser.new_context(**ctx_kwargs)
+        except Exception as e:
+            logger.warning(f"Failed to create qianwen context: {e}")
+            self._qianwen_context = await self._browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+            )
+        self._qianwen_page = await self._qianwen_context.new_page()
+        await self._qianwen_page.expose_function("__sse_push", self._on_push)
+        logger.info("Qianwen: navigating to qianwen.com ...")
+        await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+        await asyncio.sleep(3)
+        # Detect if login is required (session cookies expired)
+        body_text = await self._qianwen_page.text_content("body") or ""
+        if any(kw in body_text for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
+            logger.warning("Qianwen: login required - session cookies expired. Opening visible browser...")
+            # Open a visible browser window for manual login
+            from playwright.async_api import async_playwright
+            try:
+                pw = await async_playwright().start()
+                login_browser = await pw.chromium.launch(
+                    headless=False,
+                    channel="msedge",
+                    args=["--no-sandbox", "--disable-setuid-sandbox"]
+                )
+                login_context = await login_browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1280, "height": 900},
+                )
+                login_page = await login_context.new_page()
+                await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+                logger.info("Qianwen: visible browser opened for manual login. Please log in...")
+                # Wait for login
+                while True:
+                    await asyncio.sleep(1)
+                    if not login_browser.is_connected():
+                        break
+                    try:
+                        body = await login_page.text_content("body") or ""
+                        if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
+                            logger.info("Qianwen: login detected, capturing cookies...")
+                            break
+                    except:
+                        pass
+                # Capture cookies
+                cookies = await login_context.cookies()
+                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                config = CONFIG.copy()
+                config["qianwen_cookie"] = cookie_str
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=4)
+                # Save storage_state
+                try:
+                    await login_context.storage_state(path=qianwen_state)
+                    logger.info(f"Storage state saved to {qianwen_state}")
+                except:
+                    pass
+                # Close login browser
+                await login_browser.close()
+                await pw.stop()
+                logger.info("Qianwen: login browser closed, server will use the captured cookies")
+                # Now re-init qianwen page with fresh cookies
+                await self._qianwen_page.close()
+                await self._qianwen_context.close()
+                self._qianwen_context = await self._browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1280, "height": 900},
+                    storage_state=qianwen_state,
+                )
+                self._qianwen_page = await self._qianwen_context.new_page()
+                await self._qianwen_page.expose_function("__sse_push", self._on_push)
+                await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error(f"Qianwen login recovery failed: {e}")
+                raise
+        else:
+            logger.info("Qianwen page ready")
+        return True
+
+    async def stream_qianwen_chat(self, messages: list, session_id: str, topic_id: str):
+        """Route interception for qianwen API response + DOM typing."""
+        await self.ensure_qianwen_ready()
+        stream_id = uuid.uuid4().hex
+        q = asyncio.Queue()
+        self._queues[stream_id] = q
+
+        user_text = messages[0].get("content", "") if messages else ""
+        logger.info(f"[Qwen] typing {len(user_text)} chars")
+
+        async def handle_route(route):
+            if 'chat2.qianwen.com' not in route.request.url or 'api/v2/chat' not in route.request.url:
+                await route.continue_()
+                return
+            try:
+                resp = await route.fetch()
+                body = await resp.body()
+                text = body.decode("utf-8", errors="replace")
+                logger.info(f"[Qwen] API: {len(text)} bytes")
+                last = ""
+                count = 0
+                for line in text.split("\n"):
+                    if line.startswith("data:"):
+                        ds = line[5:].strip()
+                        if ds and ds != "[DONE]":
+                            try:
+                                ev = json.loads(ds)
+                                for m in ev.get("data", {}).get("messages", []):
+                                    if m.get("mime_type") == "multi_load/iframe":
+                                        c = m.get("content", "")
+                                        if c and c != last:
+                                            delta = c[len(last):]
+                                            last = c
+                                            if delta:
+                                                count += 1
+                                                self._queues[stream_id].put_nowait(("chunk", delta))
+                            except json.JSONDecodeError:
+                                pass
+                logger.info(f"[Qwen] parsed {count} chunks")
+                q.put_nowait(("done", ""))
+                await route.fulfill(response=resp)
+            except Exception as e:
+                logger.warning(f"[Qwen] route err: {e}")
+                q.put_nowait(("error", str(e)))
+                q.put_nowait(("done", ""))
+                await route.continue_()
+
+        await self._qianwen_page.route("**/api/v2/chat**", handle_route)
+
+        try:
+            ok = await self._qianwen_page.evaluate("""() => {
+                const ed = document.querySelector('[contenteditable]') || document.querySelector('textarea');
+                if (ed) { ed.focus(); ed.click(); return true; }
+                return false;
+            }""")
+            if not ok:
+                yield ("error", "No editor")
+                yield ("done", "")
+                return
+            await asyncio.sleep(0.5)
+            await self._qianwen_page.keyboard.type(user_text, delay=30)
+            await asyncio.sleep(0.3)
+            await self._qianwen_page.keyboard.press("Enter")
+            logger.info("[Qwen] typed + Enter")
+        except Exception as e:
+            yield ("error", f"Keyboard: {e}")
+            yield ("done", "")
+            return
+
+        try:
+            # Use longer timeout for file chunks
+            while True:
+                kind, value = await asyncio.wait_for(q.get(), timeout=120)
+                if kind == "done":
+                    yield ("done", "")
+                    break
+                if kind == "error":
+                    yield ("error", value)
+                    continue
+                yield ("chunk", value)
+        except asyncio.TimeoutError:
+            logger.warning("[Qwen] timeout")
+            yield ("error", "Timeout")
+            yield ("done", "")
+        finally:
+            self._queues.pop(stream_id, None)
+            await self._qianwen_page.unroute("**/api/v2/chat**", handle_route)
 
     async def get_user_info(self) -> dict:
         await self.ensure_ready()
@@ -156,24 +358,105 @@ class BrowserClient:
         queue: asyncio.Queue = asyncio.Queue()
         self._queues[stream_id] = queue
 
-        url = _build_completion_url()
+        trace_id = uuid.uuid4().hex
+        span_id = uuid.uuid4().hex
 
+        # 通过浏览器页面调用 Doubao SDK 签名生成带 a_bogus 的完整 URL
         js = """
         async (args) => {
-            const { url, body, streamId } = args;
+            const { body, traceId, spanId, deviceId, webId, teaUuid, fp, streamId } = args;
+            const baseUrl = "https://www.doubao.com/chat/completion";
+
             try {
-                const resp = await fetch(url, {
+                window.__sse_push(streamId, "chunk", "[DEBUG] step1: args received\\n");
+            } catch(e) {}
+
+            // 等待 bdms.frontierSign 可用
+            let retries = 0;
+            while (typeof window.bdms?.frontierSign !== 'function' && retries < 50) {
+                await new Promise(r => setTimeout(r, 100));
+                retries++;
+            }
+            if (typeof window.bdms?.frontierSign !== 'function') {
+                window.__sse_push(streamId, "error", "bdms.frontierSign not available after 5s");
+                window.__sse_push(streamId, "done", "");
+                return;
+            }
+
+            try {
+                window.__sse_push(streamId, "chunk", "[DEBUG] step2: frontierSign available\\n");
+            } catch(e) {}
+            
+            const params = {
+                aid: '497858',
+                device_id: deviceId,
+                device_platform: 'web',
+                fp: fp || '',
+                language: 'zh',
+                pc_version: '3.22.0',
+                pkg_type: 'release_version',
+                real_aid: '497858',
+                region: 'CN',
+                samantha_web: '1',
+                sys_region: 'CN',
+                tea_uuid: teaUuid,
+                'use-olympus-account': '1',
+                version_code: '20800',
+                web_id: webId,
+                web_platform: 'browser',
+                web_tab_id: crypto.randomUUID(),
+            };
+            
+            // 获取 msToken
+            const msToken = (document.cookie.match(/msToken=([^;]+)/) || [null, ''])[1];
+            if (msToken) params.msToken = msToken;
+            
+            // 排序并编码参数
+            const sortedKeys = Object.keys(params).sort();
+            const queryParts = sortedKeys.map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`);
+            const queryString = queryParts.join('&');
+            
+            // 调用 frontierSign 生成 a_bogus
+            let signedUrl;
+            try {
+                window.__sse_push(streamId, "chunk", "[DEBUG] step3: calling frontierSign\\n");
+            } catch(e) {}
+            try {
+                const signResult = await window.bdms.frontierSign(queryString);
+                window.__sse_push(streamId, "chunk", "[DEBUG] step4: frontierSign returned: " + JSON.stringify(signResult).slice(0,200) + "\\n");
+                if (signResult && (signResult.a_bogus || signResult['X-Bogus'])) {
+                    const bogusKey = signResult.a_bogus ? 'a_bogus' : 'X-Bogus';
+                    const bogusVal = signResult.a_bogus || signResult['X-Bogus'];
+                    signedUrl = `${baseUrl}?${queryString}&${bogusKey}=${encodeURIComponent(bogusVal)}`;
+                } else {
+                    signedUrl = `${baseUrl}?${queryString}`;
+                }
+            } catch (e) {
+                window.__sse_push(streamId, "chunk", "[DEBUG] step4 FAIL: " + String(e) + "\\n");
+                signedUrl = `${baseUrl}?${queryString}`;
+            }
+            
+            window.__sse_push(streamId, "chunk", "[DEBUG] step5: url=" + signedUrl.slice(0, 200) + "...\\n");
+            
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 30000);
+                const resp = await fetch(signedUrl, {
                     method: "POST",
                     headers: {
                         "content-type": "application/json",
                         "agw-js-conv": "str",
                         "accept": "text/event-stream",
+                        "x-flow-trace": JSON.stringify({trace_id: traceId, span_id: spanId}),
                     },
                     body: JSON.stringify(body),
+                    signal: controller.signal,
                 });
+                clearTimeout(timeoutId);
+                window.__sse_push(streamId, "chunk", "[DEBUG] step6: resp.status=" + resp.status + "\\n");
                 if (!resp.ok) {
                     const t = await resp.text();
-                    window.__sse_push(streamId, "error", "HTTP " + resp.status + ": " + t.slice(0, 300));
+                    window.__sse_push(streamId, "error", "HTTP " + resp.status + ": " + t.slice(0, 500));
                     window.__sse_push(streamId, "done", "");
                     return;
                 }
@@ -195,7 +478,16 @@ class BrowserClient:
 
         async with self._lock:
             eval_task = asyncio.create_task(
-                self._page.evaluate(js, {"url": url, "body": body, "streamId": stream_id})
+                self._page.evaluate(js, {
+                    "body": body,
+                    "traceId": trace_id,
+                    "spanId": span_id,
+                    "streamId": stream_id,
+                    "deviceId": CONFIG.get('device_id', ''),
+                    "webId": CONFIG.get('web_id', ''),
+                    "teaUuid": CONFIG.get('tea_uuid', ''),
+                    "fp": CONFIG.get('fp', ''),
+                })
             )
             try:
                 while True:
@@ -242,11 +534,10 @@ class BrowserClient:
             tea_uuid = CONFIG.get('tea_uuid', '')
 
             headers = {
-                'content-type': 'application/json',
-                'cookie': cookie,
-                'origin': 'https://www.doubao.com',
-                'referer': f'https://www.doubao.com/chat/{conversation_id}',
-                'user-agent': USER_AGENT,
+                'content-type': 'application/json; encoding=utf-8',
+                'referer': 'https://www.doubao.com/chat/',
+                'accept': 'application/json, text/plain, */*',
+                'agw-js-conv': 'str',
             }
 
             params = "&".join([
@@ -265,7 +556,7 @@ class BrowserClient:
                 "samantha_web=1",
                 "web_platform=browser",
                 "use-olympus-account=1",
-                f"web_tab_id=23925501-4864-4709-b680-59081e5ce770",
+                f"web_tab_id={uuid.uuid4()}",
 #{uuid.uuid4()}
             ])
             url = f"https://www.doubao.com/im/conversation/batch_del_user_conv?{params}"
@@ -299,6 +590,8 @@ class BrowserClient:
             return False, f"Server rejected: {json.dumps(data, ensure_ascii=False)[:300]}"
         finally:
             self._lock.release()
+
+    async def upload_document_via_page(self, file_data: bytes, file_name: str) -> dict:
         """通过 httpx 从 storage_state.json 读取 cookie 执行文档上传，与浏览器代理同一会话。
         返回 attachment dict 用于 content_block (block_type 10052)。"""
         import base64
@@ -437,6 +730,59 @@ class BrowserClient:
                 "progress": 100,
                 "src": ""
             }
+    
+    async def upload_file_via_qianwen_page(self, file_data: bytes, file_name: str) -> str:
+        await self.ensure_qianwen_ready()
+        import tempfile, os
+        tmp = None
+        try:
+            ext = f".{file_name.rsplit('.', 1)[-1]}" if '.' in file_name else ""
+            fd, tmp = tempfile.mkstemp(suffix=ext)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(file_data)
+        except Exception as e:
+            logger.error(f"[Qwen] tmp: {e}"); raise
+        try:
+            page = self._qianwen_page
+            fi = await page.query_selector("input[type='file']")
+            if not fi:
+                await page.evaluate("""() => {
+                    const i = document.createElement('input');
+                    i.type = 'file'; i.id = '__qfu';
+                    i.style = 'position:fixed;top:0;left:0;opacity:0;z-index:99999';
+                    document.body.appendChild(i);
+                }""")
+                await asyncio.sleep(0.3)
+                fi = await page.query_selector("#__qfu")
+
+            if not fi:
+                raise RuntimeError("No file input")
+
+            await fi.set_input_files(tmp)
+            await page.evaluate("""() => {
+                const i = document.getElementById('__qfu') || document.querySelector('input[type=file]');
+                if(i) {
+                    i.dispatchEvent(new Event('input', {bubbles:true}));
+                    i.dispatchEvent(new Event('change', {bubbles:true}));
+                }
+            }""")
+            logger.info(f"[Qwen] file input set + events dispatched: {file_name}")
+
+            await asyncio.sleep(5)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+            await page.evaluate("""() => {
+                const el = document.querySelector('[contenteditable]')||document.querySelector('textarea');
+                if(el) {el.focus();el.click();}
+            }""")
+            return file_name
+        except Exception as e:
+            logger.error(f"[Qwen] upload fail: {e}")
+            raise
+        finally:
+            if tmp and os.path.exists(tmp):
+                try: os.remove(tmp)
+                except: pass
 
 
 browser_client = BrowserClient()

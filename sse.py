@@ -269,6 +269,7 @@ def format_openai_chunk(content: str, model: str, chat_id: str, conversation_id:
         chunk["choices"][0]["delta"]["reasoning_content"] = reasoning_content
     if conversation_id and conversation_id != "0":
         chunk["conversation_id"] = conversation_id
+    logger.info(f"format_openai_chunk data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 def format_openai_chunk1(content: str, model: str, chat_id: str, conversation_id: str = None, reasoning_content: str = None) -> str:

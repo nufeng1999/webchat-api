@@ -24,6 +24,7 @@ from podcast import start_podcast_generation, get_podcast_status, get_podcast_au
 from music import start_music_generation, get_music_status, get_music_audio, get_music_lyric, list_music, get_music_styles
 from exporter import fetch_user_info, fetch_conversation_list, export_conversation_full
 from storage import init_db, save_conversation, list_conversations as db_list_conversations, get_conversation as db_get_conversation, save_message, get_messages as db_get_messages, delete_conversation as db_delete_conversation, search_conversations
+from adapters import init_all as adapters_init_all, close_all as adapters_close_all, get_adapter, get_models as get_adapter_models
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("doubao-api")
@@ -49,12 +50,29 @@ async def lifespan(app: FastAPI):
     if os.path.exists(STORAGE_STATE_PATH):
         try:
             logger.info("Initializing browser proxy client (this may take 10-30s)...")
-            await browser_client.ensure_ready()
+            await browser_client.ensure_ready(headless=False)
             logger.info("Browser proxy client ready")
         except Exception as e:
-            logger.error(f"Browser proxy init failed: {e}. Run 'python main.py --login' first.")
+            logger.error(f"Browser proxy init failed: {e}.")
     else:
-        logger.warning("storage_state.json not found. Run 'python main.py --login' to enable chat.")
+        has_cookie = bool(CONFIG.get('cookie'))
+        if has_cookie:
+            logger.warning("storage_state.json not found. Attempting to launch browser with cookie...")
+            try:
+                logger.info("Initializing browser proxy client (this may take 10-30s)...")
+                await browser_client.ensure_ready(headless=False)
+                logger.info("Browser proxy client ready")
+            except Exception as e:
+                logger.error(f"Browser proxy init failed: {e}")
+        else:
+            logger.info("No cookie or storage_state found. Server will start in non-logged-in mode.")
+            logger.info("Chat API will require valid credentials. Use --login to set up, or open http://localhost:8765")
+            try:
+                logger.info("Launching visible browser for login (close browser window when done)...")
+                await browser_client.ensure_ready(headless=False)
+                logger.info("Browser proxy client ready (visible mode)")
+            except Exception as e:
+                logger.warning(f"Visible browser launch failed: {e}")
 
     yield
     if _cleanup_task:
@@ -66,6 +84,7 @@ async def lifespan(app: FastAPI):
         await browser_client.close()
     except Exception:
         pass
+    await adapters_close_all()
 
 app = FastAPI(title="Doubao Free API", version="3.3.0", lifespan=lifespan)
 
@@ -104,10 +123,10 @@ async def rate_limit_middleware(request: Request, call_next):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    #logger.info(f"原始请求内容: {json.dumps(request.model_dump(), ensure_ascii=False)}")
+    adapter = get_adapter(request.model)
     if request.stream:
         return StreamingResponse(
-            stream_chat_completion(request),
+            adapter.stream_chat(request),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -116,8 +135,7 @@ async def chat_completions(request: ChatCompletionRequest):
             }
         )
     else:
-        result = await non_stream_chat_completion(request)
-        #logger.info(f"应答内容: {result}")
+        result = await adapter.non_stream_chat(request)
         return JSONResponse(content=result)
 
 @app.post("/v1/messages")
@@ -138,8 +156,9 @@ async def anthropic_messages(request: AnthropicMessageRequest):
 
 @app.get("/v1/models")
 async def list_models():
+    adapter_models = get_adapter_models()
     models = []
-    for model_id, cfg in MODEL_CONFIG.items():
+    for model_id, cfg in adapter_models.items():
         models.append({
             "id": model_id,
             "object": "model",
@@ -787,8 +806,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Doubao Free API")
-    parser.add_argument("--login", action="store_true",
-                        help="Open browser for login and save credentials, then exit")
+    parser.add_argument("--login", type=str, nargs='?', const='doubao', default=None,
+                        help="Open browser for login and save credentials. Specify 'doubao' or 'qianwen' (default: doubao)")
     parser.add_argument("--host", default=None,
                         help="Server host (default: from config.json)")
     parser.add_argument("--port", type=int, default=None,
@@ -796,17 +815,40 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.login:
-        from login import do_login
-        result = asyncio.run(do_login(show_browser=True))
-        if result.get("success"):
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(0)
-        else:
-            print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
-            sys.stdout.flush()
-            sys.stderr.flush()
+        target = args.login.lower()
+        if target not in ("doubao", "qianwen"):
+            print(f"Unknown login target: {target}. Use 'doubao' or 'qianwen'", file=sys.stderr)
             os._exit(1)
+        if target == "doubao":
+            from login import do_login
+            result = asyncio.run(do_login(show_browser=True))
+            if result.get("success"):
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
+            else:
+                print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
+        else:
+            from qianwen_login import do_qianwen_login
+            result = asyncio.run(do_qianwen_login(show_browser=True))
+            if result.get("success"):
+                print("=" * 50)
+                print("千问登录成功！")
+                print("注意：千问使用的是会话 cookie，每次启动服务器时")
+                print("如果检测到未登录，会自动打开浏览器让你登录。")
+                print("请保持浏览器窗口打开直到服务器关闭。")
+                print("=" * 50)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
+            else:
+                print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
 
     host = args.host or CONFIG.get('server_host', '0.0.0.0')
     port = args.port or CONFIG.get('server_port', 8765)

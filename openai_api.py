@@ -64,17 +64,45 @@ async def upload_images_for_message(image_urls: list[str], account: dict) -> lis
     return attachments
 
 
+async def _browser_proxy_stream(body: dict) -> AsyncGenerator[tuple, None]:
+    """通过浏览器代理调用豆包 API，产出 (kind, value) 元组。"""
+    from browser_client import browser_client
+    async for kind, value in browser_client.stream_completion(body):
+        yield kind, value
+
+
+async def _direct_b3_call(body: dict) -> AsyncGenerator[tuple, None]:
+    """直接 HTTP 调用豆包 API（B3 x-flow-trace 绕过，无需 a_bogus）。"""
+    import aiohttp
+    from sse import build_url_params, build_headers
+
+    account = cookie_pool.get_next()
+    url = f"https://www.doubao.com/chat/completion?{build_url_params(account)}"
+    headers = build_headers(account)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+            if resp.status != 200:
+                err_text = await resp.text()
+                yield "error", f"HTTP {resp.status}: {err_text[:500]}"
+                return
+            text_buffer = ""
+            while True:
+                chunk = await resp.content.read(8192)
+                if not chunk:
+                    break
+                text = chunk.decode('utf-8', errors='replace')
+                yield "chunk", text
+
+
 async def call_doubao_api(messages: list[ChatMessage], conversation_id: str = "0",
                           model: str = "doubao-pro-chat", max_retries: int = 2,
                           attachments: list[dict] = None,
                           doc_attachments: list[dict] = None) -> AsyncGenerator[bytes, None]:
-    """通过持久化浏览器代理调用豆包 /chat/completion（浏览器 SDK 自动签名 a_bogus/msToken/fp）。
-    将新版 SSE 响应转换回旧版 wire 格式，保持下游解析逻辑不变。"""
-    from browser_client import browser_client
+    """调用豆包 /chat/completion。优先使用浏览器代理（自动签名），失败时回退到直接 HTTP（B3 x-flow-trace 绕过）。"""
     from sse import build_browser_body, parse_browser_sse
 
     body = build_browser_body(messages, conversation_id, model, attachments, doc_attachments)
-    logger.info(f"Calling Doubao via browser proxy: conv_id={conversation_id}, model={model}")
 
     def _emit_text(delta: str, conv: str) -> bytes:
         inner = {"message": {"content_type": 2001, "content": json.dumps({"text": delta}, ensure_ascii=False)}}
@@ -87,20 +115,36 @@ async def call_doubao_api(messages: list[ChatMessage], conversation_id: str = "0
         outer = {"event_type": 2003, "event_data": json.dumps({}), "event_id": "end"}
         return (f"data: {json.dumps(outer, ensure_ascii=False)}\n").encode()
 
-    text_buffer = ""
-    current_conv = conversation_id
-    got_any = False
-    try:
-        async for kind, value in browser_client.stream_completion(body):
-            #logger.info(f"[DEBUG] Browser event: kind={kind}, value={value[:200]!r}")
+    def _process_sse(text_buffer: str, current_conv: str, got_any: bool) -> tuple[str, str, bool]:
+        """处理缓冲区中的完整SSE事件，更新状态并返回 (current_conv, got_any)。"""
+        while "\n\n" in text_buffer:
+            event_block, text_buffer = text_buffer.split("\n\n", 1)
+            delta, conv_id, finished = parse_browser_sse(event_block + "\n\n")
+            if conv_id:
+                current_conv = conv_id
+            if delta:
+                got_any = True
+                yield _emit_text(delta, current_conv), current_conv, got_any
+            if finished:
+                yield _emit_end(), current_conv, got_any
+                return  # Generator will return, which raises StopIteration in caller
+        return text_buffer, current_conv, got_any
+
+    async def _process_stream(source) -> AsyncGenerator[bytes, None]:
+        """处理 SSE 流，转换为 OpenAI 格式。不捕获异常——让异常自然传播以便触发 fallback。"""
+        text_buffer = ""
+        current_conv = conversation_id
+        got_any = False
+        async for kind, value in source:
             if kind == "error":
                 yield json.dumps({"error": True, "status": 0, "body": str(value)[:500]}).encode()
                 return
             if kind == "chunk" and "STREAM_ERROR" in value:
-                logger.error(f"Browser SSE error: {value[:300]}")
+                logger.error(f"SSE error: {value[:300]}")
                 yield json.dumps({"error": True, "status": 0, "body": str(value)[:500]}).encode()
                 return
             text_buffer += value
+            # 处理完整事件块
             while "\n\n" in text_buffer:
                 event_block, text_buffer = text_buffer.split("\n\n", 1)
                 delta, conv_id, finished = parse_browser_sse(event_block + "\n\n")
@@ -112,6 +156,7 @@ async def call_doubao_api(messages: list[ChatMessage], conversation_id: str = "0
                 if finished:
                     yield _emit_end()
                     return
+        # 处理残留缓冲
         if text_buffer.strip():
             delta, conv_id, finished = parse_browser_sse(text_buffer)
             if conv_id:
@@ -120,13 +165,24 @@ async def call_doubao_api(messages: list[ChatMessage], conversation_id: str = "0
                 got_any = True
                 yield _emit_text(delta, current_conv)
         yield _emit_end()
-    except Exception as e:
-        logger.error(f"Browser proxy exception: {e}")
-        if not got_any:
-            yield json.dumps({"error": True, "status": 0, "body": str(e)}).encode()
-        else:
-            yield _emit_end()
+
+    # 路径1: 浏览器代理（自动签名，支持已登录/未登录）
+    try:
+        logger.info(f"Doubao browser proxy: conv_id={conversation_id}, model={model}")
+        async for chunk in _process_stream(_browser_proxy_stream(body)):
+            yield chunk
         return
+    except Exception as e:
+        logger.warning(f"Browser proxy failed ({e}), falling back to direct B3")
+
+    # 路径2: 直接 HTTP（B3 x-flow-trace 绕过，不需要浏览器）
+    try:
+        logger.info(f"Doubao direct B3 call: conv_id={conversation_id}, model={model}")
+        async for chunk in _process_stream(_direct_b3_call(body)):
+            yield chunk
+    except Exception as e:
+        logger.error(f"Direct B3 call also failed: {e}")
+        yield json.dumps({"error": True, "status": 0, "body": str(e)}).encode()
 
 
 def render_messages_as_text(messages: list[ChatMessage]) -> str:
@@ -892,9 +948,12 @@ async def delete_conversation(conversation_id: str) -> tuple[bool, str]:
         return True, "No conversation to delete"
 
     # 1. 先尝试浏览器代理方式（最新接口）
+    logger.warning(f"1. 先尝试浏览器代理方式（最新接口）")
     from browser_client import browser_client
     try:
         success, err = await browser_client.delete_conversation_via_browser(conversation_id)
+        logger.warning(f"delete_conversation:{conversation_id} ,{success}, {err}")
+    
         if success:
             return True, ""
     except Exception as e:
