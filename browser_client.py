@@ -53,184 +53,262 @@ def _build_completion_url():
 
 class BrowserClient:
     def __init__(self):
-        self._pw = None
-        self._browser = None
-        self._context = None
-        self._page = None
-        self._qianwen_page = None
+        # Doubao 专属
+        self._doubao_pw = None
+        self._doubao_browser = None
+        self._doubao_context = None
+        self._doubao_page = None
+        self._doubao_lock = asyncio.Lock()
+        self._doubao_queues = {}
+
+        # Qianwen 专属
+        self._qianwen_pw = None
+        self._qianwen_browser = None
         self._qianwen_context = None
-        self._lock = asyncio.Lock()
-        self._init_lock = asyncio.Lock()
-        self._queues = {}
+        self._qianwen_page = None
+        self._qianwen_lock = asyncio.Lock()
+        self._qianwen_queues = {}
 
-    async def ensure_ready(self, headless: bool = True):
-        if self._page and self._browser and self._browser.is_connected():
-            return True
-        async with self._init_lock:
-            if self._page and self._browser and self._browser.is_connected():
-                return True
-            await self._launch(headless)
-            return True
-
-    async def _launch(self, headless=True):
-        from playwright.async_api import async_playwright
-        if not os.path.exists(STORAGE_STATE_PATH):
-            raise RuntimeError("storage_state.json 不存在，请先运行 python main.py --login 登录")
-
-        self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=headless,
-            channel="msedge",
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
-        )
-        self._context = await self._browser.new_context(
-            storage_state=STORAGE_STATE_PATH,
-            user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-        )
-        self._page = await self._context.new_page()
-
-        await self._page.expose_function("__sse_push", self._on_push)
-
-        logger.info("Browser client: navigating to doubao.com/chat/ ...")
-        await self._page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
-        await asyncio.sleep(2)
-
-        # 等待 bdms.frontierSign 签名 SDK 加载完成
-        try:
-            await self._page.wait_for_function(
-                "() => typeof window.bdms?.frontierSign === 'function'",
-                timeout=30000
-            )
-            logger.info("bdms.frontierSign SDK ready")
-        except Exception as e:
-            logger.warning(f"bdms.frontierSign not available: {e}")
-
-        logger.info("Browser client ready")
-
-    def _on_push(self, stream_id: str, kind: str, value):
-        q = self._queues.get(stream_id)
+    def _on_doubao_push(self, stream_id: str, kind: str, value):
+        q = self._doubao_queues.get(stream_id)
         if q is None:
             return
         q.put_nowait((kind, value))
 
-    async def ensure_qianwen_ready(self):
-        if self._qianwen_page and self._browser and self._browser.is_connected():
+    def _on_qianwen_push(self, stream_id: str, kind: str, value):
+        q = self._qianwen_queues.get(stream_id)
+        if q is None:
+            return
+        q.put_nowait((kind, value))
+
+    async def ensure_doubao_ready(self, headless=True):
+        """确保 Doubao 浏览器就绪，按需启动独立浏览器实例。"""
+        if self._doubao_page and self._doubao_browser and self._doubao_browser.is_connected():
             return True
-        if not self._browser or not self._browser.is_connected():
-            await self.ensure_ready()
-        qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
-        ctx_kwargs = {
-            "user_agent": USER_AGENT,
-            "viewport": {"width": 1280, "height": 900},
-        }
-        if os.path.exists(qianwen_state):
-            try:
-                ctx_kwargs["storage_state"] = qianwen_state
-                logger.info("Qianwen: loading saved storage_state")
-            except Exception as e:
-                logger.warning(f"Failed to load qianwen storage_state: {e}")
-        else:
-            qianwen_cookie = CONFIG.get("qianwen_cookie", "")
-            if qianwen_cookie and "qianwen" in qianwen_cookie.lower():
-                logger.info("Qianwen: will inject cookies from config")
-        try:
-            self._qianwen_context = await self._browser.new_context(**ctx_kwargs)
-        except Exception as e:
-            logger.warning(f"Failed to create qianwen context: {e}")
-            self._qianwen_context = await self._browser.new_context(
+        async with self._doubao_lock:
+            if self._doubao_page and self._doubao_browser and self._doubao_browser.is_connected():
+                return True
+
+            if not os.path.exists(STORAGE_STATE_PATH):
+                raise RuntimeError("storage_state.json 不存在，请先运行 python main.py --login doubao 登录")
+
+            from playwright.async_api import async_playwright
+            self._doubao_pw = await async_playwright().start()
+            self._doubao_browser = await self._doubao_pw.chromium.launch(
+                headless=headless,
+                channel="msedge",
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+
+            self._doubao_context = await self._doubao_browser.new_context(
+                storage_state=STORAGE_STATE_PATH,
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
-        self._qianwen_page = await self._qianwen_context.new_page()
-        await self._qianwen_page.expose_function("__sse_push", self._on_push)
-        logger.info("Qianwen: navigating to qianwen.com ...")
-        await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
-        await asyncio.sleep(3)
-        # Detect if login is required (session cookies expired)
-        body_text = await self._qianwen_page.text_content("body") or ""
-        if any(kw in body_text for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
-            logger.warning("Qianwen: login required - session cookies expired. Opening visible browser...")
-            # Open a visible browser window for manual login
-            from playwright.async_api import async_playwright
+            self._doubao_page = await self._doubao_context.new_page()
+            await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
+
+            logger.info("Doubao: navigating to doubao.com/chat/ ...")
+            await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
+            await asyncio.sleep(2)
+
             try:
-                pw = await async_playwright().start()
-                login_browser = await pw.chromium.launch(
-                    headless=False,
-                    channel="msedge",
-                    args=["--no-sandbox", "--disable-setuid-sandbox"]
+                await self._doubao_page.wait_for_function(
+                    "() => typeof window.bdms?.frontierSign === 'function'",
+                    timeout=30000
                 )
-                login_context = await login_browser.new_context(
-                    user_agent=USER_AGENT,
-                    viewport={"width": 1280, "height": 900},
-                )
-                login_page = await login_context.new_page()
-                await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
-                logger.info("Qianwen: visible browser opened for manual login. Please log in...")
-                # Wait for login
-                while True:
-                    await asyncio.sleep(1)
-                    if not login_browser.is_connected():
-                        break
-                    try:
-                        body = await login_page.text_content("body") or ""
-                        if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
-                            logger.info("Qianwen: login detected, capturing cookies...")
-                            break
-                    except:
-                        pass
-                # Capture cookies
-                cookies = await login_context.cookies()
-                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                config = CONFIG.copy()
-                config["qianwen_cookie"] = cookie_str
-                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(config, f, ensure_ascii=False, indent=4)
-                # Save storage_state
+                logger.info("Doubao: bdms.frontierSign SDK ready")
+            except Exception as e:
+                logger.warning(f"Doubao: bdms.frontierSign not available: {e}")
+
+            body_text = await self._doubao_page.text_content("body") or ""
+            if any(kw in body_text for kw in ["登录", "请先登录", "扫码登录"]):
+                logger.warning("Doubao: login required - session cookies expired. Opening visible browser...")
+                await self._doubao_login_recovery()
+
+            logger.info("Doubao browser ready")
+            return True
+
+    async def _doubao_login_recovery(self):
+        """打开可见浏览器让用户手动登录 Doubao，然后保存 cookies。"""
+        from playwright.async_api import async_playwright
+        try:
+            pw = await async_playwright().start()
+            login_browser = await pw.chromium.launch(
+                headless=False,
+                channel="msedge",
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            login_context = await login_browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+            )
+            login_page = await login_context.new_page()
+            await login_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
+            logger.info("Doubao: visible browser opened for manual login. Please log in...")
+
+            while True:
+                await asyncio.sleep(1)
+                if not login_browser.is_connected():
+                    break
                 try:
-                    await login_context.storage_state(path=qianwen_state)
-                    logger.info(f"Storage state saved to {qianwen_state}")
+                    body = await login_page.text_content("body") or ""
+                    if "登录" not in body and "请先登录" not in body:
+                        logger.info("Doubao: login detected, capturing cookies...")
+                        break
                 except:
                     pass
-                # Close login browser
-                await login_browser.close()
-                await pw.stop()
-                logger.info("Qianwen: login browser closed, server will use the captured cookies")
-                # Now re-init qianwen page with fresh cookies
-                await self._qianwen_page.close()
-                await self._qianwen_context.close()
-                self._qianwen_context = await self._browser.new_context(
+
+            await login_context.storage_state(path=STORAGE_STATE_PATH)
+            logger.info(f"Doubao: storage_state saved to {STORAGE_STATE_PATH}")
+
+            await login_browser.close()
+            await pw.stop()
+
+            await self._doubao_page.close()
+            await self._doubao_context.close()
+            self._doubao_context = await self._doubao_browser.new_context(
+                storage_state=STORAGE_STATE_PATH,
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+            )
+            self._doubao_page = await self._doubao_context.new_page()
+            await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
+            await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Doubao login recovery failed: {e}")
+            raise
+
+    async def ensure_qianwen_ready(self, headless=True):
+        """确保 Qianwen 浏览器就绪，按需启动独立浏览器实例。"""
+        if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.is_connected():
+            return True
+        async with self._qianwen_lock:
+            if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.is_connected():
+                return True
+
+            qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
+            ctx_kwargs = {
+                "user_agent": USER_AGENT,
+                "viewport": {"width": 1280, "height": 900},
+            }
+            if os.path.exists(qianwen_state):
+                try:
+                    ctx_kwargs["storage_state"] = qianwen_state
+                    logger.info("Qianwen: loading saved storage_state")
+                except Exception as e:
+                    logger.warning(f"Failed to load qianwen storage_state: {e}")
+            else:
+                qianwen_cookie = CONFIG.get("qianwen_cookie", "")
+                if qianwen_cookie and "qianwen" in qianwen_cookie.lower():
+                    logger.info("Qianwen: will inject cookies from config")
+
+            from playwright.async_api import async_playwright
+            self._qianwen_pw = await async_playwright().start()
+            self._qianwen_browser = await self._qianwen_pw.chromium.launch(
+                headless=headless,
+                channel="msedge",
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+
+            try:
+                self._qianwen_context = await self._qianwen_browser.new_context(**ctx_kwargs)
+            except Exception as e:
+                logger.warning(f"Failed to create qianwen context: {e}")
+                self._qianwen_context = await self._qianwen_browser.new_context(
                     user_agent=USER_AGENT,
                     viewport={"width": 1280, "height": 900},
-                    storage_state=qianwen_state,
                 )
-                self._qianwen_page = await self._qianwen_context.new_page()
-                await self._qianwen_page.expose_function("__sse_push", self._on_push)
-                await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
-                await asyncio.sleep(3)
-            except Exception as e:
-                logger.error(f"Qianwen login recovery failed: {e}")
-                raise
-        else:
-            logger.info("Qianwen page ready")
-        return True
+            self._qianwen_page = await self._qianwen_context.new_page()
+            await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
+            logger.info("Qianwen: navigating to qianwen.com ...")
+            await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+            await asyncio.sleep(3)
+
+            body_text = await self._qianwen_page.text_content("body") or ""
+            if any(kw in body_text for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
+                logger.warning("Qianwen: login required - session cookies expired. Opening visible browser...")
+                try:
+                    pw = await async_playwright().start()
+                    login_browser = await pw.chromium.launch(
+                        headless=False,
+                        channel="msedge",
+                        args=["--no-sandbox", "--disable-setuid-sandbox"]
+                    )
+                    login_context = await login_browser.new_context(
+                        user_agent=USER_AGENT,
+                        viewport={"width": 1280, "height": 900},
+                    )
+                    login_page = await login_context.new_page()
+                    await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+                    logger.info("Qianwen: visible browser opened for manual login. Please log in...")
+
+                    while True:
+                        await asyncio.sleep(1)
+                        if not login_browser.is_connected():
+                            break
+                        try:
+                            body = await login_page.text_content("body") or ""
+                            if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
+                                logger.info("Qianwen: login detected, capturing cookies...")
+                                break
+                        except:
+                            pass
+
+                    cookies = await login_context.cookies()
+                    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                    config = CONFIG.copy()
+                    config["qianwen_cookie"] = cookie_str
+                    from config import CONFIG_PATH
+                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                        json.dump(config, f, ensure_ascii=False, indent=4)
+
+                    try:
+                        await login_context.storage_state(path=qianwen_state)
+                        logger.info(f"Storage state saved to {qianwen_state}")
+                    except:
+                        pass
+
+                    await login_browser.close()
+                    await pw.stop()
+                    logger.info("Qianwen: login browser closed, server will use the captured cookies")
+
+                    await self._qianwen_page.close()
+                    await self._qianwen_context.close()
+                    self._qianwen_context = await self._qianwen_browser.new_context(
+                        user_agent=USER_AGENT,
+                        viewport={"width": 1280, "height": 900},
+                        storage_state=qianwen_state,
+                    )
+                    self._qianwen_page = await self._qianwen_context.new_page()
+                    await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
+                    await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    logger.error(f"Qianwen login recovery failed: {e}")
+                    raise
+            else:
+                logger.info("Qianwen page ready")
+            return True
 
     async def stream_qianwen_chat(self, messages: list, session_id: str, topic_id: str):
         """Route interception for qianwen API response + DOM typing."""
-        await self.ensure_qianwen_ready()
+        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_qianwen_ready(headless=headless)
         stream_id = uuid.uuid4().hex
         q = asyncio.Queue()
-        self._queues[stream_id] = q
+        self._qianwen_queues[stream_id] = q
 
         user_text = messages[0].get("content", "") if messages else ""
-        logger.info(f"[Qwen] typing {len(user_text)} chars")
+        logger.info(f"{len(user_text)} chars")
 
         async def handle_route(route):
             if 'chat2.qianwen.com' not in route.request.url or 'api/v2/chat' not in route.request.url:
                 await route.continue_()
                 return
             try:
-                resp = await route.fetch()
+                resp = await route.fetch(timeout=120000)
                 body = await resp.body()
                 text = body.decode("utf-8", errors="replace")
                 logger.info(f"[Qwen] API: {len(text)} bytes")
@@ -250,7 +328,7 @@ class BrowserClient:
                                             last = c
                                             if delta:
                                                 count += 1
-                                                self._queues[stream_id].put_nowait(("chunk", delta))
+                                                self._qianwen_queues[stream_id].put_nowait(("chunk", delta))
                             except json.JSONDecodeError:
                                 pass
                 logger.info(f"[Qwen] parsed {count} chunks")
@@ -274,8 +352,12 @@ class BrowserClient:
                 yield ("error", "No editor")
                 yield ("done", "")
                 return
-            await asyncio.sleep(0.5)
-            await self._qianwen_page.keyboard.type(user_text, delay=30)
+            # 聚焦编辑器后逐字输入（\n 用 Shift+Enter 避免提前提交）
+            for char in user_text:
+                if char == "\n":
+                    await self._qianwen_page.keyboard.press("Shift+Enter")
+                else:
+                    await self._qianwen_page.keyboard.type(char, delay=5)
             await asyncio.sleep(0.3)
             await self._qianwen_page.keyboard.press("Enter")
             logger.info("[Qwen] typed + Enter")
@@ -300,12 +382,13 @@ class BrowserClient:
             yield ("error", "Timeout")
             yield ("done", "")
         finally:
-            self._queues.pop(stream_id, None)
+            self._qianwen_queues.pop(stream_id, None)
             await self._qianwen_page.unroute("**/api/v2/chat**", handle_route)
 
     async def get_user_info(self) -> dict:
-        await self.ensure_ready()
-        async with self._lock:
+        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_doubao_ready(headless=headless)
+        async with self._doubao_lock:
             user_info = {}
             got_data = asyncio.Event()
 
@@ -340,23 +423,24 @@ class BrowserClient:
                 except Exception:
                     pass
 
-            self._page.on("response", on_response)
+            self._doubao_page.on("response", on_response)
             try:
-                await self._page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
+                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
                 try:
                     await asyncio.wait_for(got_data.wait(), timeout=12)
                 except asyncio.TimeoutError:
                     pass
                 await asyncio.sleep(1)
             finally:
-                self._page.remove_listener("response", on_response)
+                self._doubao_page.remove_listener("response", on_response)
             return user_info
 
     async def stream_completion(self, body: dict):
-        await self.ensure_ready()
+        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_doubao_ready(headless=headless)
         stream_id = uuid.uuid4().hex
         queue: asyncio.Queue = asyncio.Queue()
-        self._queues[stream_id] = queue
+        self._doubao_queues[stream_id] = queue
 
         trace_id = uuid.uuid4().hex
         span_id = uuid.uuid4().hex
@@ -476,9 +560,9 @@ class BrowserClient:
         }
         """
 
-        async with self._lock:
+        async with self._doubao_lock:
             eval_task = asyncio.create_task(
-                self._page.evaluate(js, {
+                self._doubao_page.evaluate(js, {
                     "body": body,
                     "traceId": trace_id,
                     "spanId": span_id,
@@ -500,27 +584,146 @@ class BrowserClient:
                         continue
                     yield ("chunk", value)
             finally:
-                self._queues.pop(stream_id, None)
+                self._doubao_queues.pop(stream_id, None)
                 try:
                     await eval_task
                 except Exception:
                     pass
 
-    async def close(self):
+    async def delete_all_qianwen_conversations(self):
+        """删除千问网页版所有历史对话（httpx 直接调用，不依赖浏览器页面）。"""
         try:
-            if self._browser:
-                await self._browser.close()
-            if self._pw:
-                await self._pw.stop()
+            qianwen_cookie = ""
+            if self._qianwen_context:
+                try:
+                    cookies = await self._qianwen_context.cookies()
+                    qianwen_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                except Exception:
+                    pass
+            if not qianwen_cookie:
+                qianwen_cookie = CONFIG.get("qianwen_cookie", "")
+            if not qianwen_cookie:
+                logger.warning("[Qwen] no cookie for delete API, skip")
+                return
+
+            import httpx
+            ut = ""
+            for part in qianwen_cookie.split("; "):
+                if part.startswith("b-user-id="):
+                    ut = part.split("=", 1)[1].strip()
+                    break
+            if not ut:
+                qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
+                if os.path.exists(qianwen_state):
+                    try:
+                        with open(qianwen_state, 'r', encoding='utf-8') as f:
+                            for c in json.load(f).get("cookies", []):
+                                if c.get("name") == "b-user-id":
+                                    ut = c.get("value", "")
+                                    break
+                    except Exception:
+                        pass
+            if not ut:
+                logger.warning("[Qwen] cannot extract ut (b-user-id) from cookie, skip delete")
+                return
+
+            query_params = {
+                "biz_id": "ai_qwen", "chat_client": "h5", "device": "pc",
+                "fr": "pc", "pr": "qwen", "la": "zh-CN",
+                "tz": "Asia/Shanghai", "wv": "2.11.9", "ve": "2.11.9", "ut": ut,
+            }
+            headers = {
+                "content-type": "application/json",
+                "cookie": qianwen_cookie,
+                "origin": "https://www.qianwen.com",
+                "referer": "https://www.qianwen.com/",
+                "user-agent": USER_AGENT,
+            }
+
+            session_ids = []
+            next_token = ""
+            async with httpx.AsyncClient(timeout=30) as client:
+                while True:
+                    resp = await client.post(
+                        "https://chat2-api.qianwen.com/api/v2/session/page/list",
+                        headers=headers, params=query_params,
+                        json={"next_token": next_token} if next_token else {},
+                    )
+                    data = resp.json()
+                    items = data.get("data", {}).get("list", [])
+                    for s in items:
+                        sid = s.get("session_id", "")
+                        if sid:
+                            session_ids.append(sid)
+                    if not data.get("data", {}).get("have_next_page", False):
+                        break
+                    next_token = data.get("data", {}).get("next_token", "")
+                    if not next_token:
+                        break
+
+            if not session_ids:
+                logger.info("[Qwen] no conversations to delete")
+                return
+
+            logger.info(f"[Qwen] deleting {len(session_ids)} conversations ...")
+            async with httpx.AsyncClient(timeout=30) as client:
+                batch_size = 20
+                for i in range(0, len(session_ids), batch_size):
+                    batch = session_ids[i:i + batch_size]
+                    try:
+                        resp = await client.post(
+                            "https://chat2-api.qianwen.com/api/v1/session/delete/batch",
+                            headers=headers, params=query_params,
+                            json={"session_ids": batch},
+                        )
+                        result = resp.json()
+                        if result.get("data", {}).get("delete_success"):
+                            logger.info(f"[Qwen] deleted batch {i // batch_size + 1}: {len(batch)} sessions")
+                        else:
+                            logger.warning(f"[Qwen] delete batch failed: {json.dumps(result, ensure_ascii=False)[:300]}")
+                    except Exception as e:
+                        logger.warning(f"[Qwen] delete batch error: {e}")
+
+            logger.info(f"[Qwen] finished deleting {len(session_ids)} conversations")
+        except Exception as e:
+            logger.warning(f"[Qwen] delete_all_conversations error: {e}")
+
+    async def delete_doubao_conversations(self, conversation_ids: list):
+        """批量删除豆包网页版对话。"""
+        for conv_id in conversation_ids:
+            try:
+                ok, err = await self.delete_conversation_via_browser(conv_id)
+                if ok:
+                    logger.info(f"Deleted doubao conversation {conv_id}")
+                else:
+                    logger.warning(f"Failed to delete doubao conversation {conv_id}: {err}")
+            except Exception as e:
+                logger.warning(f"Error deleting doubao conversation {conv_id}: {e}")
+
+    async def close(self):
+        # 关闭 Doubao
+        try:
+            if self._doubao_browser:
+                await self._doubao_browser.close()
+            if self._doubao_pw:
+                await self._doubao_pw.stop()
+        except Exception:
+            pass
+
+        # 关闭 Qianwen
+        try:
+            if self._qianwen_browser:
+                await self._qianwen_browser.close()
+            if self._qianwen_pw:
+                await self._qianwen_pw.stop()
         except Exception:
             pass
 
     async def delete_conversation_via_browser(self, conversation_id: str) -> tuple[bool, str]:
         """通过浏览器代理删除豆包对话，复用 storage_state.json 中的 cookie。
         新接口失败时降级到旧接口 /samantha/thread/delete。"""
-        await self._lock.acquire()
+        await self._doubao_lock.acquire()
         try:
-            await self.ensure_ready()
             import base64
             import httpx
             from requests_aws4auth import AWS4Auth
@@ -589,7 +792,7 @@ class BrowserClient:
 
             return False, f"Server rejected: {json.dumps(data, ensure_ascii=False)[:300]}"
         finally:
-            self._lock.release()
+            self._doubao_lock.release()
 
     async def upload_document_via_page(self, file_data: bytes, file_name: str) -> dict:
         """通过 httpx 从 storage_state.json 读取 cookie 执行文档上传，与浏览器代理同一会话。
@@ -732,7 +935,8 @@ class BrowserClient:
             }
     
     async def upload_file_via_qianwen_page(self, file_data: bytes, file_name: str) -> str:
-        await self.ensure_qianwen_ready()
+        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_qianwen_ready(headless=headless)
         import tempfile, os
         tmp = None
         try:

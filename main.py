@@ -46,35 +46,50 @@ async def lifespan(app: FastAPI):
     _cleanup_task = asyncio.create_task(_auto_cleanup_task())
     await init_db()
 
-    from browser_client import browser_client, STORAGE_STATE_PATH
-    if os.path.exists(STORAGE_STATE_PATH):
-        try:
-            logger.info("Initializing browser proxy client (this may take 10-30s)...")
-            await browser_client.ensure_ready(headless=False)
-            logger.info("Browser proxy client ready")
-        except Exception as e:
-            logger.error(f"Browser proxy init failed: {e}.")
-    else:
-        has_cookie = bool(CONFIG.get('cookie'))
-        if has_cookie:
-            logger.warning("storage_state.json not found. Attempting to launch browser with cookie...")
-            try:
-                logger.info("Initializing browser proxy client (this may take 10-30s)...")
-                await browser_client.ensure_ready(headless=False)
-                logger.info("Browser proxy client ready")
-            except Exception as e:
-                logger.error(f"Browser proxy init failed: {e}")
-        else:
-            logger.info("No cookie or storage_state found. Server will start in non-logged-in mode.")
-            logger.info("Chat API will require valid credentials. Use --login to set up, or open http://localhost:8765")
-            try:
-                logger.info("Launching visible browser for login (close browser window when done)...")
-                await browser_client.ensure_ready(headless=False)
-                logger.info("Browser proxy client ready (visible mode)")
-            except Exception as e:
-                logger.warning(f"Visible browser launch failed: {e}")
+    # 浏览器按需初始化：Doubao → ensure_doubao_ready(), Qianwen → ensure_qianwen_ready()
+    # 不在启动时预加载，由各 adapter 在实际请求时按需初始化
+    logger.info("Browser clients will be initialized on-demand (lazy loading)")
 
     yield
+    if not CONFIG.get('_keep_conversations', False):
+        logger.info("Cleaning up conversation history before shutdown...")
+        try:
+            from storage import clear_all_conversations
+            await clear_all_conversations()
+            logger.info("SQLite database conversations cleared")
+        except Exception as e:
+            logger.warning(f"Failed to clear SQLite conversations: {e}")
+
+        try:
+            import glob
+            conv_dir = os.path.join(BASE_DIR, "conversations")
+            if os.path.exists(conv_dir):
+                doubao_conv_ids = []
+                for f in glob.glob(os.path.join(conv_dir, "*.json")):
+                    try:
+                        with open(f, 'r', encoding='utf-8') as fh:
+                            state = json.load(fh)
+                        conv_id = state.get("doubao_conversation_id", "")
+                        if conv_id and conv_id != "0":
+                            doubao_conv_ids.append(conv_id)
+                        os.remove(f)
+                    except Exception as e:
+                        logger.warning(f"Failed to process conversation file {f}: {e}")
+                if doubao_conv_ids:
+                    from browser_client import browser_client
+                    await browser_client.delete_doubao_conversations(doubao_conv_ids)
+                    logger.info(f"Deleted {len(doubao_conv_ids)} Doubao conversations from server")
+                logger.info("Conversation JSON files removed")
+        except Exception as e:
+            logger.warning(f"Failed to clean conversation files: {e}")
+
+        try:
+            from browser_client import browser_client
+            await browser_client.delete_all_qianwen_conversations()
+            logger.info("Qianwen conversations deleted from server")
+        except Exception as e:
+            logger.warning(f"Failed to delete Qianwen conversations: {e}")
+
     if _cleanup_task:
         _cleanup_task.cancel()
     if signer:
@@ -812,7 +827,22 @@ if __name__ == "__main__":
                         help="Server host (default: from config.json)")
     parser.add_argument("--port", type=int, default=None,
                         help="Server port (default: from config.json)")
+    parser.add_argument("--show", action="store_true", default=False,
+                        help="Show browser windows for all sites (default: headless mode)")
+    parser.add_argument("--show-doubao", action="store_true", default=False,
+                        help="Show Doubao browser window only")
+    parser.add_argument("--show-qianwen", action="store_true", default=False,
+                        help="Show Qianwen browser window only")
+    parser.add_argument("--keep-conversations", action="store_true", default=False,
+                        help="Keep all conversation history after server shutdown (default: delete)")
     args = parser.parse_args()
+
+    # 全局 headless 配置（旧参数兼容）
+    CONFIG['_headless_browser'] = not args.show
+    # 各站点独立配置（优先级：--show-xxx > --show > 默认 headless）
+    CONFIG['_doubao_headless'] = not (args.show or args.show_doubao)
+    CONFIG['_qianwen_headless'] = not (args.show or args.show_qianwen)
+    CONFIG['_keep_conversations'] = args.keep_conversations
 
     if args.login:
         target = args.login.lower()

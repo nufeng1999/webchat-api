@@ -80,7 +80,7 @@ def extract_image_urls_from_content(content: Union[str, list]) -> list[str]:
 def build_request_body(messages: list[ChatMessage], conversation_id: str = "0",
                        model: str = "doubao-pro-chat", attachments: list[dict] = None):
     last_msg = messages[-1] if messages else None
-    custom_prompt = CONFIG.get('custom_prompt', '')   # 新增
+    webchat_task = CONFIG.get('webchat_task', '')
 
     need_create = conversation_id == "0"
 
@@ -95,9 +95,8 @@ def build_request_body(messages: list[ChatMessage], conversation_id: str = "0",
     body_messages = []
     for msg in messages:
         text = extract_text_from_content(msg.content)
-        # 新增：仅对最后一条用户消息，在末尾追加自定义提示词
-        if msg is last_msg and msg.role == "user" and custom_prompt:
-            text = f"{text}\n\n{custom_prompt}"
+        if msg is last_msg and msg.role == "user" and webchat_task:
+            text = f"{text}\n\n{webchat_task}"
 
         msg_attachments = []
 
@@ -243,8 +242,6 @@ def format_openai_chunk(content: str, model: str, chat_id: str, conversation_id:
     delta = {}
     if role:
         delta["role"] = role
-    if tool_calls is not None:
-        delta["role"] = "assistant"
     if content is not None:
         delta["content"] = content
     if content == "":
@@ -263,13 +260,11 @@ def format_openai_chunk(content: str, model: str, chat_id: str, conversation_id:
             "finish_reason": finish_reason
         }]
     }
-    if tool_calls is not None:
-        chunk["choices"][0]["finish_reason"] = "tool_calls"
     if reasoning_content:
         chunk["choices"][0]["delta"]["reasoning_content"] = reasoning_content
     if conversation_id and conversation_id != "0":
         chunk["conversation_id"] = conversation_id
-    logger.info(f"format_openai_chunk data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
+    #logger.info(f"format_openai_chunk data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 def format_openai_chunk1(content: str, model: str, chat_id: str, conversation_id: str = None, reasoning_content: str = None) -> str:
@@ -316,7 +311,7 @@ def build_browser_body(messages: list, conversation_id: str = "0",
     import time
     
     last_msg = messages[-1] if messages else None
-    custom_prompt = CONFIG.get('custom_prompt', '')
+    webchat_task = CONFIG.get('webchat_task', '')
 
     model_cfg = MODEL_CONFIG.get(model, MODEL_CONFIG["doubao-pro-chat"])
     bot_id = model_cfg.get("bot_id", "7338286299411103781")
@@ -324,17 +319,16 @@ def build_browser_body(messages: list, conversation_id: str = "0",
 
     need_create = (not conversation_id) or conversation_id == "0"
 
-    # 有文档附件时，文本块使用 custom_prompt；否则提取最后一条消息的文本
     if doc_attachments:
         text = extract_text_from_content(last_msg.content) if last_msg else ""
         user_request=""
-        if last_msg and getattr(last_msg, "role", "") == "user" and custom_prompt:
+        if last_msg and getattr(last_msg, "role", "") == "user" and webchat_task:
             user_request = f"{text}"
-        text = f"{str(uuid.uuid4())}\n\n{custom_prompt}\n{user_request}\n" if custom_prompt else f"{str(uuid.uuid4())}\n\n\n{user_request}\n请阅读附件中的文件内容（包含完整对话历史），并根据文件后面的内容继续回复。"
+        text = f"{str(uuid.uuid4())}\n\n{webchat_task}\n{user_request}\n" if webchat_task else f"{str(uuid.uuid4())}\n\n\n{user_request}\n请阅读附件中的文件内容（包含完整对话历史），并根据文件后面的内容继续回复。"
     else:
         text = extract_text_from_content(last_msg.content) if last_msg else ""
-        if last_msg and getattr(last_msg, "role", "") == "user" and custom_prompt:
-            text = f"{text}\n\n{custom_prompt}"
+        if last_msg and getattr(last_msg, "role", "") == "user" and webchat_task:
+            text = f"{text}\n\n{webchat_task}"
 
     content_block = []
     

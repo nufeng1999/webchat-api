@@ -39,6 +39,7 @@ class QianwenAdapter(BaseAdapter):
     def __init__(self):
         self._session_id = ""
         self._topic_id = ""
+        self._qianwen_lock = asyncio.Lock()
 
     def get_adapter_name(self) -> str:
         return "qianwen"
@@ -182,16 +183,8 @@ class QianwenAdapter(BaseAdapter):
         from sse import extract_text_from_content
         return extract_text_from_content(getattr(message, 'content', ''))
 
-    async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
-        from browser_client import browser_client
-
-        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        model = request.model
-
-        # 判断是否为 agent 请求
-        is_agent = self._is_agent_request(request)
-
-        # 非 agent 请求：保留原有的文件上传逻辑
+    async def _prepare_messages(self, request, browser_client, is_agent):
+        """准备发送给千问页面的 messages 列表。"""
         if not is_agent:
             file_items = self._extract_file_items(request)
             if file_items:
@@ -201,168 +194,252 @@ class QianwenAdapter(BaseAdapter):
                             data = await self._download_url(fi["url"])
                             ext = fi['url'].rsplit('.', 1)[-1] if '.' in fi['url'] else 'png'
                             await browser_client.upload_file_via_qianwen_page(data, f"image.{ext}")
-                            logger.info("[Qwen] waiting after file upload...")
                             await asyncio.sleep(5)
                         elif fi["kind"] == "file":
                             await browser_client.upload_file_via_qianwen_page(fi["data"], fi["name"])
-                            logger.info("[Qwen] waiting after file upload...")
                             await asyncio.sleep(5)
                     except Exception as e:
                         logger.error(f"[Qwen] file upload error: {e}")
             last_msg = request.messages[-1] if request.messages else None
             last_text = self._extract_last_text_content(last_msg) if last_msg else ""
             last_text = last_text.replace('\n', ' ').replace('\r', ' ')
-            messages = [{
+            logger.info(f"Qianwen stream_chat: model={request.model}, last_text={len(last_text)} chars")
+            return [{
                 "mime_type": "text/plain",
                 "content": last_text,
                 "meta_data": {"ori_query": last_text},
                 "status": "complete"
             }]
-            logger.info(f"Qianwen stream_chat: model={model}, last_text={len(last_text)} chars")
-        else:
-            last_msg = request.messages[-1] if request.messages else None
-            last_role = getattr(last_msg, 'role', '') if last_msg else ''
-            if last_role == 'tool':
-                tool_content = getattr(last_msg, 'content', '') or ''
-                tool_text = tool_content if isinstance(tool_content, str) else json.dumps(tool_content, ensure_ascii=False, indent=2)
-                try:
-                    logs_dir = os.path.join(BASE_DIR, "logs")
-                    os.makedirs(logs_dir, exist_ok=True)
-                    tool_path = os.path.join(logs_dir, "toolreturn.txt")
-                    with open(tool_path, 'w', encoding='utf-8') as f:
-                        f.write(tool_text)
-                    logger.info(f"[Qwen] saved toolreturn.txt to {tool_path}")
-                    await browser_client.upload_file_via_qianwen_page(
-                        file_data=tool_text.encode('utf-8'),
-                        file_name="toolreturn.txt"
-                    )
-                    logger.info(f"[Qwen] uploaded toolreturn.txt ({len(tool_text)} bytes)")
-                except Exception as e:
-                    logger.error(f"[Qwen] upload toolreturn.txt failed: {e}")
 
-                prompt_text = "将这次上传的附件中的文件内容美化后返回给我，回复的内容前后不要附加任何其它内容。"
-                messages = [{
-                    "mime_type": "text/plain",
-                    "content": prompt_text,
-                    "meta_data": {"ori_query": prompt_text},
-                    "status": "complete"
-                }]
-                logger.info(f"Qianwen tool return: model={model}, uploaded toolreturn.txt")
-            else:
-                custom_prompt = CONFIG.get('custom_prompt', '')
-                custom_prompt = custom_prompt.replace('\n', ' ').replace('\r', ' ')
-                messages_text = json.dumps(
-                    [m.model_dump() for m in request.messages],
-                    ensure_ascii=False, indent=2
+        last_msg = request.messages[-1] if request.messages else None
+        last_role = getattr(last_msg, 'role', '') if last_msg else ''
+        if last_role == 'tool':
+            # tool_content = getattr(last_msg, 'content', '') or ''
+            # tool_raw = tool_content if isinstance(tool_content, str) else json.dumps(tool_content, ensure_ascii=False, indent=2)
+            # tool_data = {"content": tool_raw, "task": CONFIG.get('ret_format_prompt', '')}
+            # tool_text = json.dumps(tool_data, ensure_ascii=False, indent=2)
+            request_dict = request.model_dump()
+            request_dict['task'] = CONFIG.get('ret_format_prompt', '')
+            request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
+            request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
+            try:
+                logs_dir = os.path.join(BASE_DIR, "logs")
+                os.makedirs(logs_dir, exist_ok=True)
+                tool_path = os.path.join(logs_dir, "toolreturn.json")
+                with open(tool_path, 'w', encoding='utf-8') as f:
+                    f.write(request_json)
+                logger.info(f"[Qwen] saved toolreturn.json to {tool_path}")
+                await browser_client.upload_file_via_qianwen_page(
+                    file_data=request_json.encode('utf-8'), file_name="toolreturn.json"
                 )
-                try:
-                    logs_dir = os.path.join(BASE_DIR, "logs")
-                    os.makedirs(logs_dir, exist_ok=True)
-                    saved_path = os.path.join(logs_dir, "messages.txt")
-                    with open(saved_path, 'w', encoding='utf-8') as f:
-                        f.write(messages_text)
-                    logger.info(f"[Qwen] saved messages.txt to {saved_path}")
-                    await browser_client.upload_file_via_qianwen_page(
-                        file_data=messages_text.encode('utf-8'),
-                        file_name="messages.txt"
-                    )
-                    logger.info(f"[Qwen] uploaded messages.txt ({len(messages_text)} bytes)")
-                except Exception as e:
-                    logger.error(f"[Qwen] upload messages.txt failed: {e}")
+                await asyncio.sleep(5)
+                logger.info(f"[Qwen] uploaded toolreturn.json ({len(request_json)} bytes)")
+            except Exception as e:
+                logger.error(f"[Qwen] upload toolreturn.json failed: {e}")
+            prompt_text = CONFIG.get('exectask_prompt', '')
+            logger.info(f"Qianwen tool return: model={request.model}, uploaded toolreturn.json")
+        else:
+            request_dict = request.model_dump()
+            request_dict['task'] = CONFIG.get('webchat_task', '')
+            request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
+            request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
+            try:
+                logs_dir = os.path.join(BASE_DIR, "logs")
+                os.makedirs(logs_dir, exist_ok=True)
+                saved_path = os.path.join(logs_dir, "request.json")
+                with open(saved_path, 'w', encoding='utf-8') as f:
+                    f.write(request_json)
+                logger.info(f"[Qwen] saved request.json to {saved_path}")
+                await browser_client.upload_file_via_qianwen_page(
+                    file_data=request_json.encode('utf-8'), file_name="request.json"
+                )
+                await asyncio.sleep(5)
+                logger.info(f"[Qwen] uploaded request.json ({len(request_json)} bytes)")
+            except Exception as e:
+                logger.error(f"[Qwen] upload request.json failed: {e}")
+            prompt_text = CONFIG.get('exectask_prompt', '') if CONFIG.get('exectask_prompt', '') else "请查看我上传的请求文件。"
+            logger.info(f"Qianwen agent request: model={request.model}, sent exectask_prompt ({len(prompt_text)} chars), uploaded request.json")
 
-                prompt_text = custom_prompt if custom_prompt else "请查看我上传的消息文件。"
-                messages = [{
-                    "mime_type": "text/plain",
-                    "content": prompt_text,
-                    "meta_data": {"ori_query": prompt_text},
-                    "status": "complete"
-                }]
-                logger.info(f"Qianwen agent request: model={model}, sent custom_prompt ({len(prompt_text)} chars), uploaded messages.txt")
+        return [{
+            "mime_type": "text/plain",
+            "content": prompt_text,
+            "meta_data": {"ori_query": prompt_text},
+            "status": "complete"
+        }]
 
-        full_text = ""
-        suppress_text = False
+    def _parse_response(self, full_text):
+        """解析千问返回的完整文本，提取 content / tool_calls / finish_reason。"""
+        is_openai_chunk=False
+        is_tool_calls=False
+        text_to_parse = full_text.strip()
+        if text_to_parse.startswith("```"):
+            lines = text_to_parse.split("\n")
+            json_lines = []
+            in_code_block = False
+            for line in lines:
+                if line.startswith("```"):
+                    if in_code_block:
+                        break
+                    in_code_block = True
+                    continue
+                if in_code_block:
+                    json_lines.append(line)
+            text_to_parse = "\n".join(json_lines).strip()
 
-        async def _process_sse():
-            async for kind, value in browser_client.stream_qianwen_chat(
-                messages, self._session_id, self._topic_id
-            ):
-                if kind == "error":
-                    yield ("error", str(value))
-                    return
-                if kind == "done":
-                    yield ("done", "")
-                    return
-                if kind == "chunk":
-                    yield ("chunk", value)
+        if not text_to_parse:
+            return None, None, None,is_openai_chunk,is_tool_calls
 
         try:
-            async for kind, value in _process_sse():
-                if kind == "error":
-                    yield self._format_error(value, model, chat_id)
-                    return
-                if kind == "chunk":
-                    full_text += value
-                    if not suppress_text:
-                        ft = full_text.lstrip()
-                        if ft[:1] == "{" or ft[:3] == "```":
-                            suppress_text = True
-                    if not suppress_text:
-                        yield self._format_chunk(value, model, chat_id)
-                if kind == "done":
-                    logger.info(f"[Qwen] done event, full_text length={len(full_text)}, content={full_text[:200]}")
-                    is_tool_call = False
-                    tool_call_data = None
+            parsed = json.loads(text_to_parse)
+        except json.JSONDecodeError as e:
+            pos = e.pos
+            snippet = text_to_parse[max(0,pos-40):pos+40]
+            logger.warning(f"Qianwen JSON decode error at char {pos}: ...{snippet!r}...")
+            brace_diff = text_to_parse.count("}") - text_to_parse.count("{")
+            if brace_diff > 0 and text_to_parse.rstrip().endswith("}"):
+                stripped = text_to_parse.rstrip()
+                while stripped.endswith("}") and stripped.count("}") > stripped.count("{"):
+                    stripped = stripped[:-1].rstrip()
                     try:
-                        text_to_parse = full_text.strip()
-                        if text_to_parse.startswith("```"):
-                            lines = text_to_parse.split("\n")
-                            json_lines = []
-                            in_code_block = False
-                            for line in lines:
-                                if line.startswith("```"):
-                                    in_code_block = not in_code_block
-                                    continue
-                                if in_code_block:
-                                    json_lines.append(line)
-                            text_to_parse = "\n".join(json_lines).strip()
-                        if text_to_parse:
-                            tool_call_data = json.loads(text_to_parse)
-                            is_tool_call = isinstance(tool_call_data, dict) and "tool_calls" in tool_call_data
-                    except (json.JSONDecodeError, TypeError) as e:
-                        logger.warning(f"[Qwen] JSON parse failed: {e}, text_to_parse={text_to_parse[:200] if text_to_parse else 'empty'}")
+                        parsed = json.loads(stripped)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                else:
+                    logger.error(f"Qianwen JSON repair failed after brace strip, text={text_to_parse[:200]!r}")
+                    return None, None, None,is_openai_chunk,is_tool_calls
+            else:
+                logger.error(f"Qianwen JSON decode internal error at char {pos}, text={text_to_parse[:200]!r}")
+                return None, None, None,is_openai_chunk,is_tool_calls
+        except TypeError as e:
+            logger.error(f"Qianwen JSON decode TypeError: {e}")
+            return None, None, None,is_openai_chunk,is_tool_calls
 
-                    if is_tool_call:
-                        tool_calls = tool_call_data.get("tool_calls", [])
-                        for i, tc in enumerate(tool_calls):
-                            yield format_openai_chunk(
-                                "", model, chat_id, "",
-                                role="assistant" if i == 0 else None,
-                                tool_calls=[{
-                                    "index": i,
-                                    "id": tc.get("id", ""),
-                                    "type": tc.get("type", "function"),
-                                    "function": {
-                                        "name": tc.get("function", {}).get("name", ""),
-                                        "arguments": ""
-                                    }
-                                }]
-                            ).encode()
-                            args = tc.get("function", {}).get("arguments", "")
-                            if args:
-                                yield format_openai_chunk(
-                                    "", model, chat_id, "",
-                                    tool_calls=[{"index": i, "function": {"arguments": args}}]
-                                ).encode()
-                        yield format_openai_chunk(None, model, chat_id, "", finish_reason="tool_calls").encode()
-                    else:
-                        if suppress_text and full_text.strip():
-                            yield self._format_chunk(full_text, model, chat_id)
-                        yield self._format_chunk("", model, chat_id).replace(b'"finish_reason": null', b'"finish_reason": "stop"')
-                    yield format_openai_done().encode()
-                    return
-        except Exception as e:
-            logger.error(f"Qianwen stream error: {e}")
-            yield self._format_error(str(e), model, chat_id)
+        if not isinstance(parsed, dict):
+            return None, None, None,is_openai_chunk,is_tool_calls
+
+        # 1. OpenAI 标准格式：choices[].delta 或 choices[].message
+        if parsed.get("choices") and isinstance(parsed["choices"], list) and parsed["choices"]:
+            choice = parsed["choices"][0]
+            if isinstance(choice, dict):
+                is_openai_chunk=True
+                delta_or_message = choice.get("delta") or choice.get("message", {})
+                if isinstance(delta_or_message, dict):
+                    content = delta_or_message.get("content") or None
+                    if content == "":
+                        content = None
+                    tool_calls = delta_or_message.get("tool_calls") or choice.get("tool_calls")
+                    finish_reason = choice.get("finish_reason") or parsed.get("finish_reason")
+                    return content, tool_calls, finish_reason,is_openai_chunk,is_tool_calls
+
+        # 2. 旧格式：顶层 tool_calls 数组
+        if "tool_calls" in parsed and isinstance(parsed.get("tool_calls"), list):
+            is_tool_calls=True
+            return None, parsed["tool_calls"], "tool_calls",is_openai_chunk,is_tool_calls
+
+# 3. 单个 tool_call 对象（无 wrapper）
+        if parsed.get("id") and parsed.get("type") == "function" and parsed.get("function"):
+            is_tool_calls=True
+            return None, [parsed], "tool_calls",is_openai_chunk,is_tool_calls
+
+        return None, None, None,is_openai_chunk,is_tool_calls
+
+    def _yield_tool_calls(self, tool_calls, model, chat_id, content=None):
+        """生成 tool_calls 的 OpenAI chunk 流。content 在第一个 chunk 中一起发送。"""
+        for i, tc in enumerate(tool_calls):
+            yield format_openai_chunk(
+                content if i == 0 else None,
+                model, chat_id, "",
+                role="assistant" if i == 0 else None,
+                tool_calls=[{
+                    "index": i,
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": ""
+                    }
+                }]
+            ).encode()
+            args = tc.get("function", {}).get("arguments", "")
+            if args:
+                yield format_openai_chunk(
+                    None, model, chat_id, "",
+                    tool_calls=[{"index": i, "function": {"arguments": args}}]
+                ).encode()
+
+    async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
+        from browser_client import browser_client
+
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        model = request.model
+        is_agent = self._is_agent_request(request)
+
+        await self._qianwen_lock.acquire()
+        try:
+            messages = await self._prepare_messages(request, browser_client, is_agent)
+            logger.info(f"Qianwen stream_chat: model={model}, messages={len(messages)}, is_agent={is_agent}")
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                full_text = ""
+                suppress_text = False
+
+                async for kind, value in browser_client.stream_qianwen_chat(
+                    messages, self._session_id, self._topic_id
+                ):
+                    if kind == "error":
+                        yield self._format_error(str(value), model, chat_id)
+                        return
+                    if kind == "chunk":
+                        full_text += value
+                        if not suppress_text:
+                            ft = full_text.lstrip()
+                            if ft[:1] == "{" or ft[:3] == "```":
+                                suppress_text = True
+                                logger.info(f"Qianwen suppress_text triggered: ft_start={ft[:100]!r}")
+                        if not suppress_text:
+                            yield self._format_chunk(value, model, chat_id)
+                    if kind == "done":
+                        logger.info(f"Qianwen done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview={full_text[:1000]!r}")
+                        try:
+                            content, tool_calls, finish_reason,is_openai_chunk,is_tool_calls = self._parse_response(full_text)
+                            logger.info(f"Qianwen done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}, is_openai_chunk={is_openai_chunk}, is_tool_calls={is_tool_calls}")
+
+                            if content is None and tool_calls is None and suppress_text:
+                                if attempt < max_retries - 1:
+                                    logger.warning(f"Qianwen parse failed (attempt {attempt+1}/{max_retries}), retrying...")
+                                    break
+                                else:
+                                    logger.error(f"Qianwen parse failed after {max_retries} attempts")
+                                    yield self._format_error(f"Parse failed after {max_retries} retries", model, chat_id)
+                                    return
+
+                            if content and not tool_calls:
+                                yield self._format_chunk(content, model, chat_id)
+                            elif not tool_calls and suppress_text and full_text.strip():
+                                yield self._format_chunk(full_text, model, chat_id)
+
+                            if tool_calls:
+                                logger.info(f"Qianwen yielding {len(tool_calls)} tool_calls")
+                                for chunk in self._yield_tool_calls(tool_calls, model, chat_id, content=content):
+                                    logger.debug(f"Qianwen tool_call chunk: {chunk.decode(errors='replace')[:200]}")
+                                    yield chunk
+                                fr = finish_reason or "tool_calls"
+                                yield format_openai_chunk(None, model, chat_id, "", finish_reason=fr).encode()
+                            else:
+                                yield format_openai_chunk(None, model, chat_id, "", finish_reason="stop").encode()
+
+                            yield format_openai_done().encode()
+                            return
+                        except Exception as e:
+                            logger.error(f"Qianwen done handler error: {e}")
+                            yield self._format_error(str(e), model, chat_id)
+                            return
+            # Should not reach here
+            yield self._format_error("Max retries exceeded for JSON parse", model, chat_id)
+        finally:
+            self._qianwen_lock.release()
 
     async def non_stream_chat(self, request: ChatCompletionRequest) -> dict:
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

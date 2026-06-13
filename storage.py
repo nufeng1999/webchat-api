@@ -169,6 +169,19 @@ async def delete_conversation(conv_id: str) -> bool:
     return result
 
 
+async def clear_all_conversations():
+    def _clear():
+        conn = _get_conn()
+        try:
+            conn.execute("DELETE FROM messages")
+            conn.execute("DELETE FROM conversations")
+            conn.commit()
+        finally:
+            conn.close()
+    await asyncio.to_thread(_clear)
+    logger.info("Cleared all conversations from database")
+
+
 async def search_conversations(query: str) -> list:
     def _search():
         conn = _get_conn()
