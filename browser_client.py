@@ -320,15 +320,16 @@ class BrowserClient:
                         if ds and ds != "[DONE]":
                             try:
                                 ev = json.loads(ds)
-                                for m in ev.get("data", {}).get("messages", []):
-                                    if m.get("mime_type") == "multi_load/iframe":
-                                        c = m.get("content", "")
-                                        if c and c != last:
-                                            delta = c[len(last):]
-                                            last = c
-                                            if delta:
-                                                count += 1
-                                                self._qianwen_queues[stream_id].put_nowait(("chunk", delta))
+                                if isinstance(ev, dict):
+                                    for m in ev.get("data", {}).get("messages", []):
+                                        if m.get("mime_type") == "multi_load/iframe":
+                                            c = m.get("content", "")
+                                            if c and c != last:
+                                                delta = c[len(last):]
+                                                last = c
+                                                if delta:
+                                                    count += 1
+                                                    self._qianwen_queues[stream_id].put_nowait(("chunk", delta))
                             except json.JSONDecodeError:
                                 pass
                 logger.info(f"[Qwen] parsed {count} chunks")
@@ -688,6 +689,86 @@ class BrowserClient:
         except Exception as e:
             logger.warning(f"[Qwen] delete_all_conversations error: {e}")
 
+    async def delete_qianwen_conversation(self, session_id: str):
+        """删除单个千问对话。"""
+        if not session_id:
+            return
+        try:
+            qianwen_cookie = ""
+            if self._qianwen_context:
+                try:
+                    cookies = await self._qianwen_context.cookies()
+                    qianwen_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                except Exception:
+                    pass
+            if not qianwen_cookie:
+                qianwen_cookie = CONFIG.get("qianwen_cookie", "")
+            if not qianwen_cookie:
+                logger.warning("[Qwen] no cookie for delete API, skip")
+                return
+
+            import httpx
+            ut = ""
+            for part in qianwen_cookie.split("; "):
+                if part.startswith("b-user-id="):
+                    ut = part.split("=", 1)[1].strip()
+                    break
+            if not ut:
+                qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
+                if os.path.exists(qianwen_state):
+                    try:
+                        with open(qianwen_state, 'r', encoding='utf-8') as f:
+                            for c in json.load(f).get("cookies", []):
+                                if c.get("name") == "b-user-id":
+                                    ut = c.get("value", "")
+                                    break
+                    except Exception:
+                        pass
+            if not ut:
+                logger.warning("[Qwen] cannot extract ut (b-user-id) from cookie, skip delete")
+                return
+
+            query_params = {
+                "biz_id": "ai_qwen", "chat_client": "h5", "device": "pc",
+                "fr": "pc", "pr": "qwen", "la": "zh-CN",
+                "tz": "Asia/Shanghai", "wv": "2.11.9", "ve": "2.11.9", "ut": ut,
+            }
+            headers = {
+                "content-type": "application/json",
+                "cookie": qianwen_cookie,
+                "origin": "https://www.qianwen.com",
+                "referer": "https://www.qianwen.com/",
+                "user-agent": USER_AGENT,
+            }
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://chat2-api.qianwen.com/api/v1/session/delete/batch",
+                    headers=headers, params=query_params,
+                    json={"session_ids": [session_id]},
+                )
+                result = resp.json()
+                if result.get("data", {}).get("delete_success"):
+                    logger.info(f"[Qwen] deleted session {session_id}")
+                else:
+                    logger.warning(f"[Qwen] delete session {session_id} failed: {json.dumps(result, ensure_ascii=False)[:300]}")
+        except Exception as e:
+            logger.warning(f"[Qwen] delete_qianwen_conversation error: {e}")
+
+    async def get_qianwen_session_id(self) -> str:
+        """从千问页面 URL 提取当前会话 session_id。"""
+        try:
+            if not self._qianwen_page:
+                return ""
+            url = self._qianwen_page.url
+            if "/chat/" in url:
+                sid = url.split("/chat/", 1)[1].split("?")[0].split("#")[0]
+                if sid:
+                    return sid
+            return ""
+        except Exception:
+            return ""
+
     async def delete_doubao_conversations(self, conversation_ids: list):
         """批量删除豆包网页版对话。"""
         for conv_id in conversation_ids:
@@ -987,6 +1068,264 @@ class BrowserClient:
             if tmp and os.path.exists(tmp):
                 try: os.remove(tmp)
                 except: pass
+
+    async def fetch_qianwen_models(self) -> list[dict]:
+        """从千问页面模型选择弹窗中获取可用模型列表。"""
+        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_qianwen_ready(headless=headless)
+        page = self._qianwen_page
+        if not page:
+            return []
+
+        models = []
+        try:
+            # 等待模型按钮出现（React组件可能需要时间渲染）
+            max_tries = 150  # 15秒
+            for i in range(max_tries):
+                ready = await page.evaluate("""
+                    () => {
+                        const all = document.querySelectorAll('div');
+                        for (const el of all) {
+                            const rect = el.getBoundingClientRect();
+                            const text = el.textContent.trim();
+                            if (rect.width > 0 && rect.height > 0 && rect.height < 40 && text.length < 30) {
+                                if ((text.includes('Qwen') || text.includes('千问')) && 
+                                    el.className.includes('cursor-pointer') && el.className.includes('px-1.5')) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if ready:
+                    logger.info(f"[Qwen] Model button ready after {i*0.1:.1f}s")
+                    break
+                await asyncio.sleep(0.1)
+
+            clicked = await page.evaluate("""
+                () => {
+                    const all = document.querySelectorAll('div');
+                    for (const el of all) {
+                        const rect = el.getBoundingClientRect();
+                        const text = el.textContent.trim();
+                        if (rect.width > 0 && rect.height > 0 && rect.height < 40 && text.length < 30) {
+                            if ((text.includes('Qwen') || text.includes('千问')) && 
+                                el.className.includes('cursor-pointer') && el.className.includes('px-1.5')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+
+            if not clicked:
+                logger.warning("[Qwen] Could not open model selector")
+                return []
+
+            await asyncio.sleep(1.5)
+
+            model_list = await page.evaluate("""
+                () => {
+                    const models = [];
+                    const options = document.querySelectorAll('div[class*="cursor-pointer"][class*="px"]');
+                    for (const opt of options) {
+                        const nameDiv = opt.querySelector('div[class*="truncate"][class*="text-14"]');
+                        if (nameDiv) {
+                            const name = nameDiv.textContent.trim();
+                            if (name && name.length < 50 && (name.includes('Qwen') || name.includes('千问'))) {
+                                models.push(name);
+                            }
+                        }
+                    }
+                    return models;
+                }
+            """)
+
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+
+            models = [{"display_name": m, "model_id": self._normalize_model_name(m)} for m in model_list]
+            logger.info(f"[Qwen] Fetched models: {[m['display_name'] for m in models]}")
+
+        except Exception as e:
+            logger.error(f"[Qwen] Failed to fetch models: {e}")
+
+        return models
+
+    def _normalize_model_name(self, display_name: str) -> str:
+        """将显示名称转换为模型ID。"""
+        name_map = {
+            "qwen3.7": "qwen-3.7",
+            "qwen3.7-max": "qwen-3.7-max",
+            "qwen3.5-flash": "qwen-3.5-flash",
+            "qwen3-max": "qwen-3-max",
+            "qwen3-max-thinking": "qwen-3-max-thinking",
+            "qwen3-coder": "qwen-3-coder",
+            "qwen-max": "qwen-max",
+            "qwen-turbo": "qwen-turbo",
+            "qwen-coder": "qwen-coder",
+        }
+        name_lower = display_name.lower().replace(" ", "-").replace("（", "-").replace("）", "")
+        for key, val in name_map.items():
+            if key in name_lower:
+                return val
+        return name_lower
+
+    async def select_qianwen_model(self, model_name: str) -> bool:
+        """在千问页面上点击模型选择器中的目标模型。
+        
+        Args:
+            model_name: 模型ID（如 'qwen-3.7', 'qwen-3.7-max'），会自动映射为页面显示名称。
+        """
+        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_qianwen_ready(headless=headless)
+        page = self._qianwen_page
+        if not page:
+            return False
+
+        # 模型ID → 页面显示名称映射
+        display_map = {
+            "qwen-max": "Qwen3.7-Max",
+            "qwen-turbo": "Qwen3.5-Flash",
+            "qwen-coder": "Qwen3-Coder",
+            "qwen-3.7": "Qwen3.7-千问",
+            "qwen-3.7-max": "Qwen3.7-Max",
+            "qwen-3.5-flash": "Qwen3.5-Flash",
+            "qwen-3-max": "Qwen3-Max",
+            "qwen-3-max-thinking": "Qwen3-Max-Thinking",
+            "qwen-3-coder": "Qwen3-Coder",
+        }
+        search_name = display_map.get(model_name, model_name)
+
+        try:
+            # 找到页面上正确的模型按钮——通过精确的 class 特征定位
+            # 从 dump 结果：class=flex px-1.5 gap-1.5 rounded-lg hover:bg-tag items-center cursor-pointer...
+            current = await page.evaluate("""
+                () => {
+                    // 直接找包含 'Qwen3' 或 '千问' 且带有精确 class 的元素
+                    const all = document.querySelectorAll('div');
+                    const results = [];
+                    for (const el of all) {
+                        const rect = el.getBoundingClientRect();
+                        const text = el.textContent.trim();
+                        const cls = el.className;
+                        // 必须同时满足：包含 Qwen/千问, 有 cursor-pointer, 有 px-1.5 (这是模型按钮的特征)
+                        if (rect.width > 0 && rect.height > 0 && rect.height < 40 && text.length < 30) {
+                            if ((text.includes('Qwen') || text.includes('千问')) && 
+                                cls.includes('cursor-pointer') && 
+                                cls.includes('px-1.5')) {
+                                return {x: rect.x + rect.width/2, y: rect.y + rect.height/2, text: text};
+                            }
+                        }
+                    }
+                    return null;
+                }
+            """)
+
+            if not current:
+                logger.warning(f"[Qwen] Current model button not found (class filter: px-1.5)")
+                return False
+
+            current_model_name = current['text'].strip()
+            logger.info(f"[Qwen] Current model: '{current_model_name}', target: '{search_name}'")
+
+            if search_name in current_model_name or current_model_name in search_name:
+                logger.info(f"[Qwen] Already on model: {current_model_name}")
+                return True
+
+            # 通过 evaluate 触发 React 点击事件打开弹窗
+            await page.evaluate("""
+                () => {
+                    const all = document.querySelectorAll('div');
+                    for (const el of all) {
+                        const rect = el.getBoundingClientRect();
+                        const text = el.textContent.trim();
+                        if (rect.width > 0 && rect.height > 0 && rect.height < 40 && text.length < 30) {
+                            if ((text.includes('Qwen') || text.includes('千问')) && 
+                                el.className.includes('cursor-pointer') && el.className.includes('px-1.5')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            await asyncio.sleep(1.5)
+
+            # 确认弹窗已打开
+            popup_ready = await page.evaluate("""
+                () => {
+                    // 检查弹窗是否出现：找 z-index 高的面板容器
+                    const panels = document.querySelectorAll('[class*="z-"], [class*="popover"], [class*="Popover"]');
+                    for (const p of panels) {
+                        const rect = p.getBoundingClientRect();
+                        if (rect.width > 300 && rect.height > 100) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if not popup_ready:
+                # 重试一次点击
+                await asyncio.sleep(1)
+                logger.warning(f"[Qwen] Popup not detected after click, retrying...")
+                await page.evaluate("""
+                    () => {
+                        const all = document.querySelectorAll('div');
+                        for (const el of all) {
+                            const rect = el.getBoundingClientRect();
+                            const text = el.textContent.trim();
+                            if (rect.width > 0 && rect.height > 0 && rect.height < 40 && text.length < 30) {
+                                if ((text.includes('Qwen') || text.includes('千问')) && 
+                                    el.className.includes('cursor-pointer') && el.className.includes('px-1.5')) {
+                                    el.click();
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                await asyncio.sleep(1.5)
+
+            # 在弹窗中找到目标模型选项并点击
+            clicked = await page.evaluate(f"""
+                () => {{
+                    const options = document.querySelectorAll('div[class*="cursor-pointer"][class*="px"]');
+                    for (const opt of options) {{
+                        const nameDiv = opt.querySelector('div[class*="truncate"][class*="text-14"]');
+                        if (nameDiv) {{
+                            const name = nameDiv.textContent.trim();
+                            const rect = opt.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {{
+                                if (name === '{search_name}' || name.includes('{search_name}')) {{
+                                    opt.click();
+                                    return name;
+                                }}
+                            }}
+                        }}
+                    }}
+                    return null;
+                }}
+            """)
+
+            if clicked:
+                logger.info(f"[Qwen] Model switched to: {clicked}")
+                await asyncio.sleep(1)
+                return True
+            else:
+                logger.warning(f"[Qwen] Model '{search_name}' not found in popup")
+                await page.keyboard.press("Escape")
+                return False
+
+        except Exception as e:
+            logger.error(f"[Qwen] Failed to select model: {e}")
+            return False
 
 
 browser_client = BrowserClient()

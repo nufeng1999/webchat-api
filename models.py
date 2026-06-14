@@ -1,5 +1,5 @@
 from typing import Union, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 MODEL_CONFIG = {
     "doubao-pro-chat": {"bot_id": "7338286299411103781", "use_deep_think": False, "use_auto_cot": False, "desc": "快速模式 (Doubao-Seed-2.0-Mini)"},
@@ -53,6 +53,13 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0, le=2)
     max_tokens: int = Field(default=4096, ge=1, le=32768)
     conversation_id: Optional[str] = None
+    tools: Optional[list] = None
+    tool_choice: Optional[Union[str, dict]] = None
+    stream_options: Optional[dict] = None
+    user: Optional[str] = None
+    metadata: Optional[dict] = None
+
+    model_config = ConfigDict(extra='allow')
 
 
 class AnthropicMessageRequest(BaseModel):

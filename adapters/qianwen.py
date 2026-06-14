@@ -4,10 +4,9 @@ import time
 import base64
 import asyncio
 import logging
-from typing import AsyncGenerator, Optional
-from urllib.parse import urlparse
 import os
-
+from typing import AsyncGenerator, Optional
+from datetime import datetime
 from adapters.base import BaseAdapter
 from models import ChatCompletionRequest
 from config import CONFIG, BASE_DIR
@@ -15,31 +14,59 @@ from sse import format_openai_chunk, format_openai_done
 
 logger = logging.getLogger("qianwen-adapter")
 
-QIANWEN_MODELS = {
+QIANWEN_MODELS = {}
+
+DEFAULT_MODELS = {
     "qianwen-pro-chat": {"model": "qwen-max", "desc": "千问 Pro (Qwen Max)", "is_qianwen": True},
     "qianwen-lite-chat": {"model": "qwen-turbo", "desc": "千问 Lite (Qwen Turbo)", "is_qianwen": True},
     "qianwen-thinking": {"model": "qwen-max", "desc": "千问思考模式 (Qwen Max)", "is_qianwen": True, "use_deep_think": True},
     "qianwen-coding": {"model": "qwen-coder", "desc": "千问编程 (Qwen Coder)", "is_qianwen": True},
+    "qianwen-3.7": {"model": "qwen-3.7", "desc": "Qwen3.7-千问", "is_qianwen": True},
+    "qianwen-3.7-max": {"model": "qwen-3.7-max", "desc": "Qwen3.7-Max", "is_qianwen": True},
+    "qianwen-3.5-flash": {"model": "qwen-3.5-flash", "desc": "Qwen3.5-Flash", "is_qianwen": True},
+    "qianwen-3-max": {"model": "qwen-3-max", "desc": "Qwen3-Max", "is_qianwen": True},
+    "qianwen-3-max-thinking": {"model": "qwen-3-max-thinking", "desc": "Qwen3-Max-Thinking", "is_qianwen": True, "use_deep_think": True},
+    "qianwen-3-coder": {"model": "qwen-3-coder", "desc": "Qwen3-Coder", "is_qianwen": True},
 }
 
 SYSTEM_PROMPT_MAP = {
     "qianwen-coding": "你是一个专业的编程助手，擅长多种编程语言，能够编写、调试、优化代码，并解释技术概念。请用代码块格式输出代码。",
 }
 
+QIANWEN_MODELS.update(DEFAULT_MODELS)
+
+
+async def refresh_qianwen_models():
+    """从千问页面刷新模型列表，更新 QIANWEN_MODELS。"""
+    from browser_client import browser_client
+    
+    try:
+        models = await browser_client.fetch_qianwen_models()
+        if models:
+            for m in models:
+                display_name = m.get("display_name", "")
+                model_id = m.get("model_id", display_name)
+                if display_name:
+                    key = f"qianwen-{model_id.replace('qwen-', '').replace('qwen', '')}"
+                    if key not in QIANWEN_MODELS:
+                        QIANWEN_MODELS[key] = {
+                            "model": model_id,
+                            "desc": display_name,
+                            "is_qianwen": True
+                        }
+            logger.info(f"[Qianwen] Models refreshed: {list(QIANWEN_MODELS.keys())}")
+    except Exception as e:
+        logger.warning(f"[Qianwen] Failed to refresh models: {e}")
+
 
 class QianwenAdapter(BaseAdapter):
-    """千问 (qianwen.com) 适配器。
-    
-    通过浏览器代理访问千问网页版，利用页面 JS 处理签名。
-    API 端点: https://chat2.qianwen.com/api/v2/chat
-    
-    未登录用户也可以使用千问网页版进行基础对话。
-    """
+    """千问 (qianwen.com) 适配器。"""
 
     def __init__(self):
         self._session_id = ""
         self._topic_id = ""
         self._qianwen_lock = asyncio.Lock()
+        self._last_model = None
 
     def get_adapter_name(self) -> str:
         return "qianwen"
@@ -58,8 +85,6 @@ class QianwenAdapter(BaseAdapter):
         return cfg.get("model", "qwen-max")
 
     def _build_messages(self, request: ChatCompletionRequest) -> list:
-        """将 OpenAI 格式消息转换为千问格式。
-        支持 text、image_url、file 类型内容。"""
         qianwen_messages = []
         for msg in request.messages:
             role = getattr(msg, 'role', 'user')
@@ -87,7 +112,6 @@ class QianwenAdapter(BaseAdapter):
         return qianwen_messages
 
     def _extract_file_items(self, request: ChatCompletionRequest) -> list[dict]:
-        """从请求中提取需要上传的文件/图片项。"""
         file_items = []
         for msg in request.messages:
             content = getattr(msg, 'content', '')
@@ -106,7 +130,6 @@ class QianwenAdapter(BaseAdapter):
         return file_items
 
     async def upload_file(self, file_data: bytes, file_name: str) -> str:
-        """上传文件到千问页面，返回上传后的引用。"""
         from browser_client import browser_client
         return await browser_client.upload_file_via_qianwen_page(file_data, file_name)
 
@@ -184,7 +207,6 @@ class QianwenAdapter(BaseAdapter):
         return extract_text_from_content(getattr(message, 'content', ''))
 
     async def _prepare_messages(self, request, browser_client, is_agent):
-        """准备发送给千问页面的 messages 列表。"""
         if not is_agent:
             file_items = self._extract_file_items(request)
             if file_items:
@@ -194,10 +216,10 @@ class QianwenAdapter(BaseAdapter):
                             data = await self._download_url(fi["url"])
                             ext = fi['url'].rsplit('.', 1)[-1] if '.' in fi['url'] else 'png'
                             await browser_client.upload_file_via_qianwen_page(data, f"image.{ext}")
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(8)
                         elif fi["kind"] == "file":
                             await browser_client.upload_file_via_qianwen_page(fi["data"], fi["name"])
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(8)
                     except Exception as e:
                         logger.error(f"[Qwen] file upload error: {e}")
             last_msg = request.messages[-1] if request.messages else None
@@ -213,11 +235,9 @@ class QianwenAdapter(BaseAdapter):
 
         last_msg = request.messages[-1] if request.messages else None
         last_role = getattr(last_msg, 'role', '') if last_msg else ''
+        file_name="request.json"
         if last_role == 'tool':
-            # tool_content = getattr(last_msg, 'content', '') or ''
-            # tool_raw = tool_content if isinstance(tool_content, str) else json.dumps(tool_content, ensure_ascii=False, indent=2)
-            # tool_data = {"content": tool_raw, "task": CONFIG.get('ret_format_prompt', '')}
-            # tool_text = json.dumps(tool_data, ensure_ascii=False, indent=2)
+            file_name="toolreturn.json"
             request_dict = request.model_dump()
             request_dict['task'] = CONFIG.get('ret_format_prompt', '')
             request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
@@ -225,20 +245,23 @@ class QianwenAdapter(BaseAdapter):
             try:
                 logs_dir = os.path.join(BASE_DIR, "logs")
                 os.makedirs(logs_dir, exist_ok=True)
-                tool_path = os.path.join(logs_dir, "toolreturn.json")
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tool_path = os.path.join(logs_dir, f"toolreturn_{ts}.{file_name.rsplit('.', 1)[-1] if '.' in file_name else 'json'}")
                 with open(tool_path, 'w', encoding='utf-8') as f:
                     f.write(request_json)
                 logger.info(f"[Qwen] saved toolreturn.json to {tool_path}")
                 await browser_client.upload_file_via_qianwen_page(
-                    file_data=request_json.encode('utf-8'), file_name="toolreturn.json"
+                    file_data=request_json.encode('utf-8'), file_name=tool_path
                 )
-                await asyncio.sleep(5)
+                # await asyncio.sleep(8)
+                time.sleep(8)
                 logger.info(f"[Qwen] uploaded toolreturn.json ({len(request_json)} bytes)")
             except Exception as e:
                 logger.error(f"[Qwen] upload toolreturn.json failed: {e}")
             prompt_text = CONFIG.get('exectask_prompt', '')
-            logger.info(f"Qianwen tool return: model={request.model}, uploaded toolreturn.json")
+            logger.info(f"Qianwen tool return: model={request.model}, uploaded {tool_path}")
         else:
+            file_name="request.json"
             request_dict = request.model_dump()
             request_dict['task'] = CONFIG.get('webchat_task', '')
             request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
@@ -246,19 +269,22 @@ class QianwenAdapter(BaseAdapter):
             try:
                 logs_dir = os.path.join(BASE_DIR, "logs")
                 os.makedirs(logs_dir, exist_ok=True)
-                saved_path = os.path.join(logs_dir, "request.json")
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                saved_path = os.path.join(logs_dir, f"request_{ts}.{file_name.rsplit('.', 1)[-1] if '.' in file_name else 'json'}")
+                
                 with open(saved_path, 'w', encoding='utf-8') as f:
                     f.write(request_json)
                 logger.info(f"[Qwen] saved request.json to {saved_path}")
                 await browser_client.upload_file_via_qianwen_page(
-                    file_data=request_json.encode('utf-8'), file_name="request.json"
+                    file_data=request_json.encode('utf-8'), file_name=saved_path
                 )
-                await asyncio.sleep(5)
+                # await asyncio.sleep(8)
+                time.sleep(8)
                 logger.info(f"[Qwen] uploaded request.json ({len(request_json)} bytes)")
             except Exception as e:
                 logger.error(f"[Qwen] upload request.json failed: {e}")
             prompt_text = CONFIG.get('exectask_prompt', '') if CONFIG.get('exectask_prompt', '') else "请查看我上传的请求文件。"
-            logger.info(f"Qianwen agent request: model={request.model}, sent exectask_prompt ({len(prompt_text)} chars), uploaded request.json")
+            logger.info(f"Qianwen agent request: model={request.model}, sent exectask_prompt ({len(prompt_text)} chars), uploaded {saved_path}")
 
         return [{
             "mime_type": "text/plain",
@@ -268,7 +294,6 @@ class QianwenAdapter(BaseAdapter):
         }]
 
     def _parse_response(self, full_text):
-        """解析千问返回的完整文本，提取 content / tool_calls / finish_reason。"""
         is_openai_chunk=False
         is_tool_calls=False
         text_to_parse = full_text.strip()
@@ -318,7 +343,6 @@ class QianwenAdapter(BaseAdapter):
         if not isinstance(parsed, dict):
             return None, None, None,is_openai_chunk,is_tool_calls
 
-        # 1. OpenAI 标准格式：choices[].delta 或 choices[].message
         if parsed.get("choices") and isinstance(parsed["choices"], list) and parsed["choices"]:
             choice = parsed["choices"][0]
             if isinstance(choice, dict):
@@ -332,12 +356,10 @@ class QianwenAdapter(BaseAdapter):
                     finish_reason = choice.get("finish_reason") or parsed.get("finish_reason")
                     return content, tool_calls, finish_reason,is_openai_chunk,is_tool_calls
 
-        # 2. 旧格式：顶层 tool_calls 数组
         if "tool_calls" in parsed and isinstance(parsed.get("tool_calls"), list):
             is_tool_calls=True
             return None, parsed["tool_calls"], "tool_calls",is_openai_chunk,is_tool_calls
 
-# 3. 单个 tool_call 对象（无 wrapper）
         if parsed.get("id") and parsed.get("type") == "function" and parsed.get("function"):
             is_tool_calls=True
             return None, [parsed], "tool_calls",is_openai_chunk,is_tool_calls
@@ -345,7 +367,6 @@ class QianwenAdapter(BaseAdapter):
         return None, None, None,is_openai_chunk,is_tool_calls
 
     def _yield_tool_calls(self, tool_calls, model, chat_id, content=None):
-        """生成 tool_calls 的 OpenAI chunk 流。content 在第一个 chunk 中一起发送。"""
         for i, tc in enumerate(tool_calls):
             yield format_openai_chunk(
                 content if i == 0 else None,
@@ -374,9 +395,16 @@ class QianwenAdapter(BaseAdapter):
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         model = request.model
         is_agent = self._is_agent_request(request)
+        self._last_session_id = ""
 
         await self._qianwen_lock.acquire()
         try:
+            # 如果模型发生变化，在页面上切换模型
+            if model != self._last_model:
+                model_id = self._get_model_name(model)
+                await browser_client.select_qianwen_model(model_id)
+                self._last_model = model
+
             messages = await self._prepare_messages(request, browser_client, is_agent)
             logger.info(f"Qianwen stream_chat: model={model}, messages={len(messages)}, is_agent={is_agent}")
 
@@ -436,9 +464,14 @@ class QianwenAdapter(BaseAdapter):
                             logger.error(f"Qianwen done handler error: {e}")
                             yield self._format_error(str(e), model, chat_id)
                             return
-            # Should not reach here
             yield self._format_error("Max retries exceeded for JSON parse", model, chat_id)
         finally:
+            try:
+                self._last_session_id = await browser_client.get_qianwen_session_id()
+                if self._last_session_id:
+                    logger.info(f"[Qwen] captured session_id: {self._last_session_id}")
+            except Exception:
+                pass
             self._qianwen_lock.release()
 
     async def non_stream_chat(self, request: ChatCompletionRequest) -> dict:

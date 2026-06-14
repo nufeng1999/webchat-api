@@ -29,7 +29,17 @@ from adapters import init_all as adapters_init_all, close_all as adapters_close_
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("doubao-api")
 
+async def refresh_qianwen_models():
+    """异步刷新千问模型列表，失败时静默处理。"""
+    try:
+        from adapters.qianwen import refresh_qianwen_models as _refresh
+        await _refresh()
+    except Exception as e:
+        logger.warning(f"Failed to refresh Qianwen models: {e}")
+
+
 _cleanup_task = None
+_qianwen_model_refresh_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -47,7 +57,9 @@ async def lifespan(app: FastAPI):
     await init_db()
 
     # 浏览器按需初始化：Doubao → ensure_doubao_ready(), Qianwen → ensure_qianwen_ready()
-    # 不在启动时预加载，由各 adapter 在实际请求时按需初始化
+    # 千问模型列表启动时异步刷新，失败则使用默认模型列表
+    global _qianwen_model_refresh_task
+    _qianwen_model_refresh_task = asyncio.create_task(refresh_qianwen_models())
     logger.info("Browser clients will be initialized on-demand (lazy loading)")
 
     yield
@@ -136,12 +148,37 @@ async def rate_limit_middleware(request: Request, call_next):
 
     return await call_next(request)
 
+
+async def _delete_adapter_conversation(adapter):
+    try:
+        adapter_name = adapter.get_adapter_name()
+        if adapter_name == 'doubao':
+            conv_id = getattr(adapter, '_last_conversation_id', '')
+            if conv_id and conv_id != '0':
+                from openai_api import delete_conversation
+                await delete_conversation(conv_id)
+                logger.info(f"[Cleanup] deleted doubao conversation {conv_id}")
+        elif adapter_name == 'qianwen':
+            session_id = getattr(adapter, '_last_session_id', '')
+            if session_id:
+                from browser_client import browser_client
+                await browser_client.delete_qianwen_conversation(session_id)
+                logger.info(f"[Cleanup] deleted qianwen session {session_id}")
+            adapter._last_session_id = ""
+    except Exception as e:
+        logger.warning(f"[Cleanup] failed to delete conversation: {e}")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     adapter = get_adapter(request.model)
     if request.stream:
+        async def stream_with_cleanup():
+            async for chunk in adapter.stream_chat(request):
+                yield chunk
+            await _delete_adapter_conversation(adapter)
         return StreamingResponse(
-            adapter.stream_chat(request),
+            stream_with_cleanup(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -151,6 +188,7 @@ async def chat_completions(request: ChatCompletionRequest):
         )
     else:
         result = await adapter.non_stream_chat(request)
+        await _delete_adapter_conversation(adapter)
         return JSONResponse(content=result)
 
 @app.post("/v1/messages")

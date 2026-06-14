@@ -63,3 +63,9 @@ browser_client_qwen.py
 .gitignore
 browser_client_original.py
 rebuild_bc.py
+dump_qianwen_dom.py
+.gitignore
+.gitignore
+webchat_task.txt
+ret_format_prompt.md
+webchat_task.md
