@@ -48,10 +48,18 @@ def escape_md_for_json(text: str) -> str:
     """将 Markdown 文本转义为 JSON 安全的字符串，确保 json.dumps 后不会破坏结构。"""
     return text.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t').replace('"', '\\"')
 
+def get_prompt_path() -> str:
+    """从 config.json 读取 prompt_path 配置，返回绝对路径，自动创建目录。"""
+    prompt_dir = CONFIG.get('prompt_path', 'prompt')
+    if not os.path.isabs(prompt_dir):
+        prompt_dir = os.path.join(BASE_DIR, prompt_dir)
+    os.makedirs(prompt_dir, exist_ok=True)
+    return prompt_dir
+
 def get_webchat_task() -> str:
-    """从 request_task.md 文件读取 webchat_task 配置。"""
+    """从 prompt_path/request_task.md 文件读取 webchat_task 配置。"""
     try:
-        task_path = os.path.join(BASE_DIR, "request_task.md")
+        task_path = os.path.join(get_prompt_path(), "request_task.md")
         if os.path.exists(task_path):
             with open(task_path, 'r', encoding='utf-8') as f:
                 return escape_md_for_json(f.read().strip())
@@ -60,9 +68,9 @@ def get_webchat_task() -> str:
     return ""
 
 def get_ret_format_prompt() -> str:
-    """从 ret_format_task.md 文件读取 ret_format_prompt 配置。"""
+    """从 prompt_path/ret_format_task.md 文件读取 ret_format_prompt 配置。"""
     try:
-        task_path = os.path.join(BASE_DIR, "ret_format_task.md")
+        task_path = os.path.join(get_prompt_path(), "ret_format_task.md")
         if os.path.exists(task_path):
             with open(task_path, 'r', encoding='utf-8') as f:
                 return escape_md_for_json(f.read().strip())
@@ -71,9 +79,9 @@ def get_ret_format_prompt() -> str:
     return ""
 
 def get_exectask_prompt() -> str:
-    """从 exectask_prompt.md 文件读取 exectask_prompt 配置。"""
+    """从 prompt_path/exectask_prompt.md 文件读取 exectask_prompt 配置。"""
     try:
-        task_path = os.path.join(BASE_DIR, "exectask_prompt.md")
+        task_path = os.path.join(get_prompt_path(), "exectask_prompt.md")
         if os.path.exists(task_path):
             with open(task_path, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
