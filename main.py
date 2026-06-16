@@ -88,8 +88,14 @@ async def lifespan(app: FastAPI):
                     except Exception as e:
                         logger.warning(f"Failed to process conversation file {f}: {e}")
                 if doubao_conv_ids:
-                    from browser_client import browser_client
-                    await browser_client.delete_doubao_conversations(doubao_conv_ids)
+                    from openai_api import delete_conversation_sync
+                    for conv_id in doubao_conv_ids:
+                        try:
+                            success, err = delete_conversation_sync(conv_id)
+                            if not success:
+                                logger.warning(f"Failed to delete doubao conversation {conv_id}: {err}")
+                        except Exception as e:
+                            logger.warning(f"Error deleting doubao conversation {conv_id}: {e}")
                     logger.info(f"Deleted {len(doubao_conv_ids)} Doubao conversations from server")
                 logger.info("Conversation JSON files removed")
         except Exception as e:
@@ -154,10 +160,23 @@ async def _delete_adapter_conversation(adapter):
         adapter_name = adapter.get_adapter_name()
         if adapter_name == 'doubao':
             conv_id = getattr(adapter, '_last_conversation_id', '')
+            chat_id = getattr(adapter, '_last_chat_id', '')
             if conv_id and conv_id != '0':
                 from openai_api import delete_conversation
-                await delete_conversation(conv_id)
-                logger.info(f"[Cleanup] deleted doubao conversation {conv_id}")
+                success, err = await delete_conversation(conv_id)
+                if success:
+                    logger.info(f"[Cleanup] deleted doubao conversation {conv_id}")
+                    if chat_id:
+                        try:
+                            from config import CONVERSATION_DIR
+                            state_file = os.path.join(CONVERSATION_DIR, f"{chat_id}.json")
+                            if os.path.exists(state_file):
+                                os.remove(state_file)
+                        except Exception:
+                            pass
+                else:
+                    logger.warning(f"[Cleanup] failed to delete doubao conversation {conv_id}: {err}")
+            adapter._last_conversation_id = ""
         elif adapter_name == 'qianwen':
             session_id = getattr(adapter, '_last_session_id', '')
             if session_id:

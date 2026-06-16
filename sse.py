@@ -5,7 +5,7 @@ import logging
 from typing import Union
 
 from models import ChatMessage, MODEL_CONFIG, SYSTEM_PROMPT_MAP
-from config import CONFIG, USER_AGENT
+from config import CONFIG, USER_AGENT, get_webchat_task
 
 logger = logging.getLogger("doubao-api")
 
@@ -80,7 +80,7 @@ def extract_image_urls_from_content(content: Union[str, list]) -> list[str]:
 def build_request_body(messages: list[ChatMessage], conversation_id: str = "0",
                        model: str = "doubao-pro-chat", attachments: list[dict] = None):
     last_msg = messages[-1] if messages else None
-    webchat_task = CONFIG.get('webchat_task', '')
+    webchat_task = get_webchat_task()
 
     need_create = conversation_id == "0"
 
@@ -311,7 +311,7 @@ def build_browser_body(messages: list, conversation_id: str = "0",
     import time
     
     last_msg = messages[-1] if messages else None
-    webchat_task = CONFIG.get('webchat_task', '')
+    webchat_task = get_webchat_task()
 
     model_cfg = MODEL_CONFIG.get(model, MODEL_CONFIG["doubao-pro-chat"])
     bot_id = model_cfg.get("bot_id", "7338286299411103781")

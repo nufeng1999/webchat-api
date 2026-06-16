@@ -9,7 +9,7 @@ from typing import AsyncGenerator, Optional
 from datetime import datetime
 from adapters.base import BaseAdapter
 from models import ChatCompletionRequest
-from config import CONFIG, BASE_DIR
+from config import CONFIG, BASE_DIR, get_webchat_task, get_ret_format_prompt, get_exectask_prompt
 from sse import format_openai_chunk, format_openai_done
 
 logger = logging.getLogger("qianwen-adapter")
@@ -239,7 +239,7 @@ class QianwenAdapter(BaseAdapter):
         if last_role == 'tool':
             file_name="toolreturn.json"
             request_dict = request.model_dump()
-            request_dict['task'] = CONFIG.get('ret_format_prompt', '')
+            request_dict['task'] = get_ret_format_prompt()
             request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
             request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
             try:
@@ -258,12 +258,12 @@ class QianwenAdapter(BaseAdapter):
                 logger.info(f"[Qwen] uploaded toolreturn.json ({len(request_json)} bytes)")
             except Exception as e:
                 logger.error(f"[Qwen] upload toolreturn.json failed: {e}")
-            prompt_text = CONFIG.get('exectask_prompt', '')
+            prompt_text = get_exectask_prompt()
             logger.info(f"Qianwen tool return: model={request.model}, uploaded {tool_path}")
         else:
             file_name="request.json"
             request_dict = request.model_dump()
-            request_dict['task'] = CONFIG.get('webchat_task', '')
+            request_dict['task'] = get_webchat_task()
             request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
             request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
             try:
@@ -283,7 +283,7 @@ class QianwenAdapter(BaseAdapter):
                 logger.info(f"[Qwen] uploaded request.json ({len(request_json)} bytes)")
             except Exception as e:
                 logger.error(f"[Qwen] upload request.json failed: {e}")
-            prompt_text = CONFIG.get('exectask_prompt', '') if CONFIG.get('exectask_prompt', '') else "请查看我上传的请求文件。"
+            prompt_text = get_exectask_prompt() if CONFIG.get('exectask_prompt', '') else "请查看我上传的请求文件。"
             logger.info(f"Qianwen agent request: model={request.model}, sent exectask_prompt ({len(prompt_text)} chars), uploaded {saved_path}")
 
         return [{
@@ -315,7 +315,7 @@ class QianwenAdapter(BaseAdapter):
             return None, None, None,is_openai_chunk,is_tool_calls
 
         try:
-            parsed = json.loads(text_to_parse)
+            parsed = json.loads(text_to_parse, strict=False)
         except json.JSONDecodeError as e:
             pos = e.pos
             snippet = text_to_parse[max(0,pos-40):pos+40]
@@ -326,7 +326,7 @@ class QianwenAdapter(BaseAdapter):
                 while stripped.endswith("}") and stripped.count("}") > stripped.count("{"):
                     stripped = stripped[:-1].rstrip()
                     try:
-                        parsed = json.loads(stripped)
+                        parsed = json.loads(stripped, strict=False)
                         break
                     except json.JSONDecodeError:
                         continue

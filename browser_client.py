@@ -591,6 +591,295 @@ class BrowserClient:
                 except Exception:
                     pass
 
+    async def stream_doubao_chat_via_type(self, text: str, attachments: list | None = None, inline_file_content: str | None = None):
+        """Route interception for doubao API response + DOM typing.
+        attachments: 文档附件列表 (type=3)，注入 attachment_block + input_skill + chat_ability。
+        inline_file_content: 如果提供，直接作为 text_block 内容注入（不上传云存储）。
+        """
+        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_doubao_ready(headless=headless)
+        stream_id = uuid.uuid4().hex
+        q = asyncio.Queue()
+        self._doubao_queues[stream_id] = q
+        _attachments = attachments or []
+
+        async def handle_route(route):
+            #logger.info(f"[Doubao] handle_route called for URL: {route.request.url}")
+            if 'doubao.com/chat/completion' not in route.request.url:
+                logger.info("[Doubao] URL not target, continuing normally")
+                await route.continue_()
+                return
+            logger.info("[Doubao] Target URL intercepted, processing request")
+            try:
+                modify_body = False
+                body_dict = {}
+                orig_body = route.request.post_data
+                logger.info(f"[Doubao] Request method: {route.request.method}, has_body: {orig_body is not None}, content_len: {len(orig_body) if orig_body else 0}")
+                if orig_body:
+                    try:
+                        body_dict = json.loads(orig_body)
+                        logger.info(f"[Doubao] Request body keys: {list(body_dict.keys())}")
+                    except Exception as json_e:
+                        logger.warning(f"[Doubao] Failed to parse request body: {json_e}")
+                        # Continue with empty dict
+                        body_dict = {}
+                    messages = body_dict.get("messages", [])
+                    if messages:
+                        msg = messages[0]
+                        cbs = msg.get("content_block", [])
+                        logger.info(f"[Doubao] Original content_block count: {len(cbs)}")
+                        
+                        # Inject attachment block if provided
+                        if _attachments:
+                            file_block = {
+                                "block_type": 10052,
+                                "content": {
+                                    "attachment_block": {"attachments": _attachments},
+                                    "pc_event_block": ""
+                                },
+                                "block_id": str(uuid.uuid4()),
+                                "parent_id": "", "meta_info": [], "append_fields": []
+                            }
+                            cbs.insert(0, file_block)
+                            body_dict["chat_ability"] = {"ability_type": 16}
+                            body_dict.setdefault("ext", {})["input_skill"] = '{"skill_id":"16","skill_type":16,"template_key":""}'
+                            logger.info(f"[Doubao] injected {len(_attachments)} attachment(s)")
+                        
+                        # Inject inline file content as additional text_block
+                        if inline_file_content:
+                            file_text_block = {
+                                "block_type": 10000,
+                                "content": {
+                                    "text_block": {"text": inline_file_content, "icon_url": "", "icon_url_dark": "", "summary": ""},
+                                    "pc_event_block": ""
+                                },
+                                "block_id": str(uuid.uuid4()),
+                                "parent_id": "", "meta_info": [], "append_fields": []
+                            }
+                            cbs.append(file_text_block)
+                            logger.info(f"[Doubao] injected inline file content ({len(inline_file_content)} chars)")
+                        
+                        if _attachments or inline_file_content:
+                            msg["content_block"] = cbs
+                            modify_body = True
+                
+                if modify_body:
+                    modified_body = json.dumps(body_dict, ensure_ascii=False)
+                    resp = await route.fetch(timeout=180000, post_data=modified_body)
+                else:
+                    resp = await route.fetch(timeout=180000)
+                body = await resp.body()
+                raw_text = body.decode("utf-8", errors="replace")
+                logger.info(f"[Doubao] API: {len(raw_text)} bytes")
+                try:
+                    debug_dir = os.path.join(os.path.dirname(__file__), "logs")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    with open(os.path.join(debug_dir, "doubao_api_response_debug.txt"), 'w', encoding='utf-8') as f:
+                        f.write(raw_text)
+                except Exception:
+                    pass
+
+                last_block_text = {}
+                count = 0
+
+                for block in raw_text.split("\n\n"):
+                    block = block.strip()
+                    if not block:
+                        continue
+
+                    event_type = ""
+                    data_str = ""
+                    for line in block.split("\n"):
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                        elif line.startswith("data:"):
+                            data_str = line[5:].strip()
+
+                    if not data_str:
+                        continue
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event_type == "SSE_ACK":
+                        cid = data.get("ack_client_meta", {}).get("conversation_id", "")
+                        if cid:
+                            q.put_nowait(("conversation_id", cid))
+                        continue
+
+                    if event_type == "STREAM_ERROR":
+                        msg = data.get("error_msg") or data.get("message") or json.dumps(data, ensure_ascii=False)
+                        q.put_nowait(("error", msg))
+                        q.put_nowait(("done", ""))
+                        await route.fulfill(response=resp)
+                        return
+
+                    if event_type == "CHUNK_DELTA":
+                        delta = data.get("text", "")
+                        if delta:
+                            count += 1
+                            q.put_nowait(("chunk", delta))
+                        continue
+
+                    content_blocks = []
+                    if event_type == "STREAM_MSG_NOTIFY":
+                        content_blocks = data.get("content", {}).get("content_block", [])
+                    elif event_type == "STREAM_CHUNK":
+                        for op in data.get("patch_op", []):
+                            pv = op.get("patch_value", {})
+                            content_blocks.extend(pv.get("content_block", []))
+
+                    for cb in content_blocks:
+                        if cb.get("block_type") != 10000:
+                            continue
+                        block_id = cb.get("block_id", "") or "default"
+                        text_block = cb.get("content", {}).get("text_block", {})
+                        current = text_block.get("text", "")
+                        if not current:
+                            continue
+                        previous = last_block_text.get(block_id, "")
+                        delta = current[len(previous):] if current.startswith(previous) else current
+                        last_block_text[block_id] = current
+                        if delta:
+                            count += 1
+                            q.put_nowait(("chunk", delta))
+
+                    if event_type == "SSE_REPLY_END" and data.get("end_type") == 3:
+                        q.put_nowait(("done", ""))
+                        logger.info(f"[Doubao] parsed {count} chunks")
+                        await route.fulfill(response=resp)
+                        return
+
+                logger.info(f"[Doubao] parsed {count} chunks")
+                q.put_nowait(("done", ""))
+                try:
+                    await route.fulfill(response=resp)
+                except Exception as inner_e:
+                    if "already handled" in str(inner_e).lower():
+                        pass
+                    else:
+                        raise
+            except Exception as e:
+                if "already handled" in str(e).lower():
+                    return
+                logger.warning(f"[Doubao] route err: {e}")
+                q.put_nowait(("error", str(e)))
+                q.put_nowait(("done", ""))
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await self._doubao_page.route("**/chat/completion**", handle_route)
+
+        # 确保页面在新对话状态（而非旧对话）
+        current_url = self._doubao_page.url
+        if not current_url.endswith("/chat/") and "/chat/" in current_url:
+            # 页面在旧对话中，导航到新对话
+            logger.info("[Doubao] navigating to new chat (was in existing conversation)")
+            await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
+            await asyncio.sleep(1)
+
+        try:
+            # 检查是否有遮罩层阻挡输入
+            has_overlay = await self._doubao_page.evaluate("""() => {
+                const overlays = document.querySelectorAll('[role="dialog"], [data-testid="modal"], .modal, .overlay');
+                for (const el of overlays) {
+                    if (el.offsetParent !== null && el.style.display !== 'none') {
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if has_overlay:
+                logger.warning("[Doubao] overlay detected, attempting to dismiss")
+                # 尝试按 Escape 关闭弹窗
+                await self._doubao_page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+
+            ok = await self._doubao_page.evaluate("""() => {
+                const ta = document.querySelector('textarea');
+                if (!ta) return false;
+                ta.focus();
+                ta.click();
+                return true;
+            }""")
+            if not ok:
+                yield ("error", "No editor")
+                yield ("done", "")
+                return
+            await self._doubao_page.evaluate("""(text) => {
+                const ta = document.querySelector('textarea');
+                if (!ta) return;
+                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                nativeSetter.call(ta, text);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+            }""", text)
+            await asyncio.sleep(0.5)
+            
+            # 尝试发送：先点击发送按钮，再按 Enter（双重保险）
+            send_clicked = await self._doubao_page.evaluate("""() => {
+                // 查找发送按钮（豆包的发送按钮图标）
+                const btns = document.querySelectorAll('button, [role="button"], [data-testid]');
+                for (const btn of btns) {
+                    const svg = btn.querySelector('svg');
+                    const cls = btn.className || '';
+                    const testId = btn.getAttribute('data-testid') || '';
+                    // 发送按钮通常有 send/submit 相关标识
+                    if (testId.includes('send') || testId.includes('submit') || 
+                        cls.includes('send') || cls.includes('submit') ||
+                        (btn.title && (btn.title.includes('发送') || btn.title.includes('Send')))) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                // 没找到按钮，返回 false 让后续按 Enter
+                return false;
+            }""")
+            
+            if not send_clicked:
+                await self._doubao_page.keyboard.press("Enter")
+                logger.info("[Doubao] typed + Enter (keyboard)")
+            else:
+                logger.info("[Doubao] typed + clicked send button")
+            
+            # 等待 1 秒确认请求已发出
+            await asyncio.sleep(1)
+        except Exception as e:
+            yield ("error", f"Keyboard: {e}")
+            yield ("done", "")
+            return
+
+        try:
+            while True:
+                kind, value = await asyncio.wait_for(q.get(), timeout=60)
+                if kind == "done":
+                    yield ("done", "")
+                    break
+                if kind == "error":
+                    yield ("error", value)
+                    continue
+                if kind == "conversation_id":
+                    yield ("conversation_id", value)
+                    continue
+                yield ("chunk", value)
+        except asyncio.TimeoutError:
+            logger.warning("[Doubao] timeout after 60s - no response from server, resetting page")
+            yield ("error", "Timeout")
+            yield ("done", "")
+            try:
+                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
+                await asyncio.sleep(1)
+                logger.info("[Doubao] page reset after timeout")
+            except Exception as nav_err:
+                logger.warning(f"[Doubao] page reset failed: {nav_err}")
+        finally:
+            self._doubao_queues.pop(stream_id, None)
+            await self._doubao_page.unroute("**/chat/completion**", handle_route)
+
     async def delete_all_qianwen_conversations(self):
         """删除千问网页版所有历史对话（httpx 直接调用，不依赖浏览器页面）。"""
         try:
@@ -801,98 +1090,105 @@ class BrowserClient:
             pass
 
     async def delete_conversation_via_browser(self, conversation_id: str) -> tuple[bool, str]:
-        """通过浏览器代理删除豆包对话，复用 storage_state.json 中的 cookie。
-        新接口失败时降级到旧接口 /samantha/thread/delete。"""
+        """通过浏览器页面调用豆包 API 删除对话，使用页面自带的认证信息。"""
         await self._doubao_lock.acquire()
         try:
-            import base64
-            import httpx
-            from requests_aws4auth import AWS4Auth
-
-            cookie = _get_latest_cookie_from_storage()
-            if not cookie:
-                return False, "No cookie available"
+            # 检查浏览器是否可用
+            try:
+                browser_ok = (
+                    self._doubao_page is not None 
+                    and self._doubao_browser is not None 
+                    and self._doubao_browser.is_connected()
+                )
+            except Exception:
+                browser_ok = False
+            if not browser_ok:
+                logger.debug("[Doubao] Browser not connected, falling back to HTTP API")
+                return False, "Browser not connected"
 
             device_id = CONFIG.get('device_id', '')
             web_id = CONFIG.get('web_id', '')
             tea_uuid = CONFIG.get('tea_uuid', '')
-
-            headers = {
-                'content-type': 'application/json; encoding=utf-8',
-                'referer': 'https://www.doubao.com/chat/',
-                'accept': 'application/json, text/plain, */*',
-                'agw-js-conv': 'str',
-            }
-
-            params = "&".join([
-                "version_code=20800",
-                "language=zh",
-                "device_platform=web",
-                "aid=497858",
-                f"real_aid=497858",
-                "pkg_type=release_version",
-                f"device_id={device_id}",
-                "pc_version=3.22.1",
-                f"web_id={web_id}",
-                f"tea_uuid={tea_uuid}",
-                "region=CN",
-                "sys_region=CN",
-                "samantha_web=1",
-                "web_platform=browser",
-                "use-olympus-account=1",
-                f"web_tab_id={uuid.uuid4()}",
-#{uuid.uuid4()}
-            ])
-            url = f"https://www.doubao.com/im/conversation/batch_del_user_conv?{params}"
-
-            body = {
-                "cmd": 4171,
-                "uplink_body": {
-                    "batch_delete_user_conversation_uplink_body": {
-                        "conversation_id": [conversation_id],
-                        "delete_all": False,
-                        "conversation_type": 3,
+            
+            # 使用页面自带的 fetch API 删除对话（自动携带认证 cookie）
+            result = await self._doubao_page.evaluate("""
+                async (args) => {
+                    const { conv_id, device_id, web_id, tea_uuid } = args;
+                    try {
+                        const params = new URLSearchParams({
+                            'version_code': '20800',
+                            'language': 'zh',
+                            'device_platform': 'web',
+                            'aid': '497858',
+                            'real_aid': '497858',
+                            'pkg_type': 'release_version',
+                            'device_id': device_id,
+                            'pc_version': '3.22.1',
+                            'web_id': web_id,
+                            'tea_uuid': tea_uuid,
+                            'region': 'CN',
+                            'sys_region': 'CN',
+                            'samantha_web': '1',
+                            'web_platform': 'browser',
+                            'use-olympus-account': '1',
+                            'web_tab_id': crypto.randomUUID(),
+                        });
+                        const response = await fetch(
+                            '/im/conversation/batch_del_user_conv?' + params.toString(),
+                            {
+                                method: 'POST',
+                                headers: {
+                                    'content-type': 'application/json; encoding=utf-8',
+                                    'agw-js-conv': 'str',
+                                    'referer': 'https://www.doubao.com/chat/',
+                                },
+                                body: JSON.stringify({
+                                    'cmd': 4171,
+                                    'uplink_body': {
+                                        'batch_delete_user_conversation_uplink_body': {
+                                            'conversation_id': [conv_id],
+                                            'delete_all': false,
+                                            'conversation_type': 3,
+                                        }
+                                    },
+                                    'sequence_id': crypto.randomUUID(),
+                                    'channel': 2,
+                                    'version': '1',
+                                })
+                            }
+                        );
+                        const data = await response.json();
+                        const result = data?.downlink_body?.batch_delete_user_conversation_downlink_body?.result;
+                        return { success: result?.[conv_id] === true, data: data };
+                    } catch (e) {
+                        return { success: false, error: String(e) };
                     }
-                },
-                "sequence_id": uuid.uuid4().hex,
-                "channel": 2,
-                "version": "1",
-            }
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(url, headers=headers, json=body)
-                data = resp.json()
-
-            result = data.get("downlink_body", {}).get(
-                "batch_delete_user_conversation_downlink_body", {}
-            ).get("result", {})
-
-            if result.get(conversation_id) is True:
-                logger.info(f"Deleted conversation {conversation_id} via browser")
+                }
+            """, {"conv_id": conversation_id, "device_id": device_id, "web_id": web_id, "tea_uuid": tea_uuid})
+            
+            if result.get("success"):
+                logger.info(f"Deleted conversation {conversation_id} via browser page")
                 return True, ""
-
-            return False, f"Server rejected: {json.dumps(data, ensure_ascii=False)[:300]}"
+            
+            err_msg = result.get('error') or json.dumps(result.get('data', {}), ensure_ascii=False)[:300]
+            logger.info(f"Delete conversation {conversation_id} via browser: {err_msg}")
+            return False, "Browser delete returned non-success"
+        except (Exception, asyncio.CancelledError) as e:
+            err_str = str(e)
+            if "cancelled" in err_str.lower() or "cancel scope" in err_str.lower():
+                logger.info(f"Delete conversation {conversation_id} cancelled during shutdown: {err_str[:100]}")
+            else:
+                logger.warning(f"Error deleting conversation {conversation_id} via browser: {e}")
+            return False, str(e)
         finally:
             self._doubao_lock.release()
 
     async def upload_document_via_page(self, file_data: bytes, file_name: str) -> dict:
-        """通过 httpx 从 storage_state.json 读取 cookie 执行文档上传，与浏览器代理同一会话。
-        返回 attachment dict 用于 content_block (block_type 10052)。"""
+        """Upload file to doubao cloud storage via HTTP API, returns attachment dict with URI.
+        The attachment must be injected into the request body separately.
+        """
         import base64
         import binascii
-        from datetime import datetime
-        
-        # 保存上传的原始 messages 文件到 logs 目录供调试
-        try:
-            logs_dir = os.path.join(BASE_DIR, "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            saved_path = os.path.join(logs_dir, f"messages_{ts}.{file_name.rsplit('.', 1)[-1] if '.' in file_name else 'txt'}")
-            with open(saved_path, "wb") as f:
-                f.write(file_data)
-            logger.info(f"Saved agent messages to {saved_path}")
-        except Exception as e:
-            logger.warning(f"Failed to save agent messages file: {e}")
         
         cookie = _get_latest_cookie_from_storage()
         if not cookie:
@@ -909,8 +1205,7 @@ class BrowserClient:
             'user-agent': USER_AGENT,
         }
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            # Step 1: prepare_upload
+        async with httpx.AsyncClient(timeout=120) as client:
             params = "&".join([
                 "aid=497858",
                 f"device_id={device_id}",
@@ -938,7 +1233,6 @@ class BrowserClient:
             secret_key = upload_auth["secret_key"]
             session_token = upload_auth["session_token"]
 
-            # Step 2: ApplyImageUpload
             file_ext = f".{file_name.rsplit('.', 1)[-1]}" if '.' in file_name else ""
             file_size = len(file_data)
             apply_url = f"https://imagex.bytedanceapi.com/?Action=ApplyImageUpload&Version=2018-08-01&ServiceId={service_id}&NeedFallback=true&FileSize={file_size}&FileExtension={file_ext}"
@@ -964,7 +1258,6 @@ class BrowserClient:
             upload_hosts = apply_data["Result"]["UploadAddress"].get("UploadHosts", [])
             upload_host = upload_hosts[0] if upload_hosts else "tos-d-x-hl.snssdk.com"
 
-            # Step 3: Upload binary
             crc32 = format(binascii.crc32(file_data) & 0xFFFFFFFF, '08x')
             upload_headers = {
                 "authorization": store_auth,
@@ -981,7 +1274,6 @@ class BrowserClient:
             if upload_result.get("message") != "Success":
                 raise RuntimeError(f"Upload binary failed: {json.dumps(upload_result, ensure_ascii=False)[:500]}")
 
-            # Step 4: CommitImageUpload
             commit_url = f"https://imagex.bytedanceapi.com/?Action=CommitImageUpload&Version=2018-08-01&ServiceId={service_id}"
             commit_headers = {"origin": "https://www.doubao.com", "referer": "https://www.doubao.com/", "user-agent": USER_AGENT}
             commit_req = client.build_request(method="POST", url=commit_url, headers=commit_headers, json={"SessionKey": session_key})
@@ -996,7 +1288,7 @@ class BrowserClient:
             file_uri = result.get("ImageUri") or result.get("SourceUri")
             file_size_final = result.get("ImageSize", file_size)
 
-            logger.info(f"Document uploaded via browser cookie: {file_name} ({file_size_final} bytes, uri={file_uri[:60]}...)")
+            logger.info(f"Document uploaded: {file_name} ({file_size_final} bytes, uri={file_uri[:60]}...)")
 
             return {
                 "type": 3,
@@ -1014,7 +1306,7 @@ class BrowserClient:
                 "progress": 100,
                 "src": ""
             }
-    
+
     async def upload_file_via_qianwen_page(self, file_data: bytes, file_name: str) -> str:
         headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
         await self.ensure_qianwen_ready(headless=headless)

@@ -5,6 +5,37 @@ import asyncio
 import time
 from datetime import datetime
 
+
+class Colors:
+    """ANSI 颜色静态类，方便其它模块使用。"""
+    BLACK   = "\033[30m"
+    RED     = "\033[31m"
+    GREEN   = "\033[32m"
+    YELLOW  = "\033[33m"
+    BLUE    = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN    = "\033[36m"
+    WHITE   = "\033[37m"
+    BOLD_RED     = "\033[1;31m"
+    BOLD_GREEN   = "\033[1;32m"
+    BOLD_YELLOW  = "\033[1;33m"
+    RESET = "\033[0m"
+
+
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        'DEBUG':   Colors.GREEN,
+        # 'INFO':    Colors.BLUE,
+        'WARNING': Colors.YELLOW,
+        'ERROR':   Colors.RED,
+        'CRITICAL':Colors.MAGENTA,
+    }
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelname, '')
+        record.levelname = f'{color}[{record.levelname}]{Colors.RESET}'
+        return super().format(record)
+
 logger = logging.getLogger("doubao-api")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12,6 +43,45 @@ CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
 ACCOUNTS_PATH = os.path.join(BASE_DIR, 'accounts.json')
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
 CONVERSATION_DIR = os.path.join(BASE_DIR, 'conversations')
+
+def escape_md_for_json(text: str) -> str:
+    """将 Markdown 文本转义为 JSON 安全的字符串，确保 json.dumps 后不会破坏结构。"""
+    return text.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t').replace('"', '\\"')
+
+def get_webchat_task() -> str:
+    """从 request_task.md 文件读取 webchat_task 配置。"""
+    try:
+        task_path = os.path.join(BASE_DIR, "request_task.md")
+        if os.path.exists(task_path):
+            with open(task_path, 'r', encoding='utf-8') as f:
+                return escape_md_for_json(f.read().strip())
+    except Exception as e:
+        logger.warning(f"Failed to read request_task.md: {e}")
+    return ""
+
+def get_ret_format_prompt() -> str:
+    """从 ret_format_task.md 文件读取 ret_format_prompt 配置。"""
+    try:
+        task_path = os.path.join(BASE_DIR, "ret_format_task.md")
+        if os.path.exists(task_path):
+            with open(task_path, 'r', encoding='utf-8') as f:
+                return escape_md_for_json(f.read().strip())
+    except Exception as e:
+        logger.warning(f"Failed to read ret_format_task.md: {e}")
+    return ""
+
+def get_exectask_prompt() -> str:
+    """从 exectask_prompt.md 文件读取 exectask_prompt 配置。"""
+    try:
+        task_path = os.path.join(BASE_DIR, "exectask_prompt.md")
+        if os.path.exists(task_path):
+            with open(task_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                return f"[{timestamp}]\n{escape_md_for_json(content)}"
+    except Exception as e:
+        logger.warning(f"Failed to read exectask_prompt.md: {e}")
+    return ""
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
@@ -39,6 +109,30 @@ def reload_config():
     CONFIG = load_config()
     SIGN_METHOD = CONFIG.get('sign_method', 'b3')
     logger.info("Config reloaded")
+
+def setup_logging():
+    """设置全局日志格式，带颜色。"""
+    import sys
+    
+    # Windows 控制台启用 ANSI 颜色
+    if sys.platform == 'win32':
+        try:
+            from colorama import init
+            init(autoreset=True)
+        except ImportError:
+            pass
+
+    fmt = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+    date_fmt = '%Y-%m-%d %H:%M:%S'
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColorFormatter(fmt, datefmt=date_fmt))
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    # 清除默认 handler，避免重复
+    if not root.handlers:
+        root.addHandler(handler)
+
+setup_logging()
 
 def load_accounts():
     if os.path.exists(ACCOUNTS_PATH):

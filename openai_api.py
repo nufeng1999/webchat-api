@@ -943,21 +943,29 @@ async def generate_images(prompt: str, n: int = 1, size: str = "1024x1024"):
     return result
 
 
-async def delete_conversation(conversation_id: str) -> tuple[bool, str]:
+async def delete_conversation(conversation_id: str, skip_browser: bool = False) -> tuple[bool, str]:
     if not conversation_id or conversation_id == "0":
         return True, "No conversation to delete"
 
-    # 1. 先尝试浏览器代理方式（最新接口）
-    logger.warning(f"1. 先尝试浏览器代理方式（最新接口）")
-    from browser_client import browser_client
-    try:
-        success, err = await browser_client.delete_conversation_via_browser(conversation_id)
-        logger.warning(f"delete_conversation:{conversation_id} ,{success}, {err}")
-    
-        if success:
-            return True, ""
-    except Exception as e:
-        logger.warning(f"Browser delete failed, falling back: {e}")
+    # 1. 先尝试浏览器代理方式（最新接口），skip_browser=True 时跳过
+    if not skip_browser:
+        from browser_client import browser_client
+        try:
+            success, err = await browser_client.delete_conversation_via_browser(conversation_id)
+            if success:
+                return True, ""
+            if "skipped" in err.lower() or "non-critical" in err.lower():
+                logger.info(f"delete_conversation: {conversation_id} skipped (will use fallback)")
+            elif "cancelled" in err.lower():
+                logger.info(f"delete_conversation: {conversation_id} cancelled during shutdown")
+            else:
+                logger.warning(f"delete_conversation: {conversation_id} failed: {err}")
+        except Exception as e:
+            err_str = str(e)
+            if "cancelled" in err_str.lower():
+                logger.info(f"delete_conversation: browser cancelled during shutdown")
+            else:
+                logger.warning(f"Browser delete failed, falling back: {e}")
 
     # 2. 降级到旧接口 /samantha/thread/delete
     account = cookie_pool.get_next()
@@ -986,4 +994,39 @@ async def delete_conversation(conversation_id: str) -> tuple[bool, str]:
                 return True, ""
     except Exception as e:
         logger.error(f"Delete conversation exception: {e}")
+        return False, str(e)
+
+
+def delete_conversation_sync(conversation_id: str) -> tuple[bool, str]:
+    """同步版删除对话（shutdown 时使用，避免被 async cancel scope 取消）。"""
+    if not conversation_id or conversation_id == "0":
+        return True, ""
+
+    import httpx
+    from sse import build_url_params
+
+    account = cookie_pool.get_next()
+    params = build_url_params(account)
+    url = f"{CONFIG['api_base']}/samantha/thread/delete?{params}"
+
+    headers = {
+        'content-type': 'application/json',
+        'cookie': account.get('cookie', CONFIG.get('cookie', '')),
+        'origin': 'https://www.doubao.com',
+        'referer': f"https://www.doubao.com/chat/{conversation_id}",
+        'user-agent': USER_AGENT,
+        'x-flow-trace': json.dumps({"trace_id": uuid.uuid4().hex, "span_id": uuid.uuid4().hex})
+    }
+
+    body = {"conversation_id": conversation_id}
+
+    try:
+        resp = httpx.post(url, headers=headers, json=body, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"Delete conversation {conversation_id} failed: {resp.status_code} {resp.text[:200]}")
+            return False, f"HTTP {resp.status_code}"
+        logger.info(f"Deleted conversation {conversation_id} on Doubao server")
+        return True, ""
+    except Exception as e:
+        logger.error(f"Delete conversation sync exception: {e}")
         return False, str(e)
