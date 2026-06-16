@@ -1073,19 +1073,47 @@ class BrowserClient:
     async def close(self):
         # 关闭 Doubao
         try:
+            if self._doubao_page:
+                try:
+                    await self._doubao_page.close()
+                except Exception:
+                    pass
+                self._doubao_page = None
             if self._doubao_browser:
-                await self._doubao_browser.close()
+                try:
+                    await self._doubao_browser.close()
+                except Exception:
+                    pass
+                self._doubao_browser = None
             if self._doubao_pw:
-                await self._doubao_pw.stop()
+                try:
+                    await self._doubao_pw.stop()
+                except Exception:
+                    pass
+                self._doubao_pw = None
         except Exception:
             pass
 
         # 关闭 Qianwen
         try:
+            if self._qianwen_page:
+                try:
+                    await self._qianwen_page.close()
+                except Exception:
+                    pass
+                self._qianwen_page = None
             if self._qianwen_browser:
-                await self._qianwen_browser.close()
+                try:
+                    await self._qianwen_browser.close()
+                except Exception:
+                    pass
+                self._qianwen_browser = None
             if self._qianwen_pw:
-                await self._qianwen_pw.stop()
+                try:
+                    await self._qianwen_pw.stop()
+                except Exception:
+                    pass
+                self._qianwen_pw = None
         except Exception:
             pass
 

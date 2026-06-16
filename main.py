@@ -63,6 +63,21 @@ async def lifespan(app: FastAPI):
     logger.info("Browser clients will be initialized on-demand (lazy loading)")
 
     yield
+    # 设置事件循环异常处理器，静默 Playwright 关闭后残留的连接读取错误
+    loop = asyncio.get_running_loop()
+    _original_handler = getattr(loop, '_exception_handler', None)
+
+    def _silent_playwright_errors(loop, context):
+        exc = context.get('exception')
+        if exc and 'Connection closed while reading from the driver' in str(exc):
+            return
+        if _original_handler:
+            _original_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_silent_playwright_errors)
+
     if not CONFIG.get('_keep_conversations', False):
         logger.info("Cleaning up conversation history before shutdown...")
         try:
@@ -118,6 +133,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     await adapters_close_all()
+    # 恢复原始异常处理器
+    loop.set_exception_handler(_original_handler if _original_handler else None)
 
 app = FastAPI(title="Doubao Free API", version="3.3.0", lifespan=lifespan)
 
