@@ -377,12 +377,81 @@ class ConcurrencyLimiter:
         return self._total_count
 
 
+class RequestLimiter:
+    """请求限流器，按 adapter 类型提供并发控制。
+    
+    每个 adapter 可配置最大并发数，超出最大等待时间的请求返回 429。
+    """
+    
+    def __init__(self, max_wait_time: float = 180.0, max_concurrent: dict = None):
+        self.max_wait_time = max_wait_time
+        self._max_concurrent: dict[str, int] = max_concurrent or {"doubao": 2, "qianwen": 1}
+        self._semaphores: dict[str, asyncio.Semaphore] = {
+            key: asyncio.Semaphore(val) for key, val in self._max_concurrent.items()
+        }
+        self._active: dict[str, int] = {key: 0 for key in self._max_concurrent}
+        self._total: dict[str, int] = {key: 0 for key in self._max_concurrent}
+        self._rejected: dict[str, int] = {key: 0 for key in self._max_concurrent}
+    
+    def _get_queue_key(self, model: str) -> str:
+        """根据 model 名称确定队列键。"""
+        if model.startswith("qianwen-"):
+            return "qianwen"
+        return "doubao"
+    
+    async def acquire(self, model: str) -> tuple[bool, str]:
+        """尝试获取 adapter 信号量，最多等待 max_wait_time 秒。
+        
+        Returns:
+            (True, "") if acquired
+            (False, "error message") if timeout
+        """
+        queue_key = self._get_queue_key(model)
+        sem = self._semaphores.get(queue_key)
+        if not sem:
+            self._semaphores[queue_key] = asyncio.Semaphore(999)
+            sem = self._semaphores[queue_key]
+        
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=self.max_wait_time)
+            self._active[queue_key] += 1
+            self._total[queue_key] += 1
+            return True, ""
+        except asyncio.TimeoutError:
+            self._rejected[queue_key] += 1
+            return False, "Server busy, please try again later"
+    
+    def release(self, model: str):
+        """释放 adapter 信号量。"""
+        queue_key = self._get_queue_key(model)
+        sem = self._semaphores.get(queue_key)
+        if sem:
+            self._active[queue_key] = max(0, self._active[queue_key] - 1)
+            sem.release()
+    
+    def get_stats(self) -> dict:
+        """返回所有 adapter 的统计信息。"""
+        return {
+            key: {
+                "max_concurrent": self._max_concurrent[key],
+                "active": self._active[key],
+                "total_served": self._total[key],
+                "total_rejected": self._rejected[key],
+            }
+            for key in self._max_concurrent
+        }
+
+
 rate_limiter = RateLimiter(
     max_requests=CONFIG.get('rate_limit_max', 30),
     window_seconds=CONFIG.get('rate_limit_window', 60)
 )
 concurrency_limiter = ConcurrencyLimiter(
     max_concurrent=CONFIG.get('max_concurrent', 5)
+)
+request_limiter = RequestLimiter(
+    max_wait_time=CONFIG.get('request_limiter_max_wait', 180),
+    max_concurrent=CONFIG.get('request_limiter_max_concurrent', {"doubao": 2, "qianwen": 1})
 )
 
 

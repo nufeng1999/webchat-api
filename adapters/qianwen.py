@@ -293,6 +293,29 @@ class QianwenAdapter(BaseAdapter):
             "status": "complete"
         }]
 
+    def _validate_json_nested(self, obj, path=""):
+        """验证 JSON 对象中 "arguments" 字段的值是否为合法 JSON 字符串。"""
+        if isinstance(obj, dict):
+            for key in ("arguments", "args", "arguments_str"):
+                if key in obj:
+                    val = obj[key]
+                    if isinstance(val, str) and val.strip().startswith("{"):
+                        try:
+                            json.loads(val, strict=False)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Qianwen nested JSON validation failed: {path}[{key}]: {e}")
+                            return False, ""
+            for v in obj.values():
+                ok, _ = self._validate_json_nested(v, path + "." + str(list(obj.keys())))
+                if not ok:
+                    return False, ""
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                ok, _ = self._validate_json_nested(item, path + f"[{i}]")
+                if not ok:
+                    return False, ""
+        return True, ""
+
     def _parse_response(self, full_text):
         is_openai_chunk=False
         is_tool_calls=False
@@ -412,6 +435,7 @@ class QianwenAdapter(BaseAdapter):
             for attempt in range(max_retries):
                 full_text = ""
                 suppress_text = False
+                buffered_chunks = [] if is_agent else None
 
                 async for kind, value in browser_client.stream_qianwen_chat(
                     messages, self._session_id, self._topic_id
@@ -427,21 +451,59 @@ class QianwenAdapter(BaseAdapter):
                                 suppress_text = True
                                 logger.info(f"Qianwen suppress_text triggered: ft_start={ft[:100]!r}")
                         if not suppress_text:
-                            yield self._format_chunk(value, model, chat_id)
+                            if is_agent and buffered_chunks is not None:
+                                buffered_chunks.append(self._format_chunk(value, model, chat_id))
+                            else:
+                                yield self._format_chunk(value, model, chat_id)
                     if kind == "done":
                         logger.info(f"Qianwen done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview={full_text[:1000]!r}")
                         try:
                             content, tool_calls, finish_reason,is_openai_chunk,is_tool_calls = self._parse_response(full_text)
                             logger.info(f"Qianwen done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}, is_openai_chunk={is_openai_chunk}, is_tool_calls={is_tool_calls}")
 
+                            # 验证嵌套的 arguments JSON
+                            nested_validation_ok = True
+                            nested_err_msg = ""
                             if content is None and tool_calls is None and suppress_text:
+                                try:
+                                    import json as _json2
+                                    validated = _json2.loads(full_text)
+                                    nested_ok, nested_err_msg = self._validate_json_nested(validated)
+                                    if not nested_ok:
+                                        nested_validation_ok = False
+                                except Exception as ve:
+                                    nested_validation_ok = False
+                                    nested_err_msg = str(ve)
+
                                 if attempt < max_retries - 1:
-                                    logger.warning(f"Qianwen parse failed (attempt {attempt+1}/{max_retries}), retrying...")
+                                    if not nested_validation_ok:
+                                        logger.warning(f"Qianwen nested JSON validation failed: {nested_err_msg}, retrying in 5s...")
+                                    else:
+                                        logger.warning(f"Qianwen parse failed (attempt {attempt+1}/{max_retries}), retrying in 5s...")
+                                    await asyncio.sleep(5)
                                     break
                                 else:
                                     logger.error(f"Qianwen parse failed after {max_retries} attempts")
-                                    yield self._format_error(f"Parse failed after {max_retries} retries", model, chat_id)
+                                    if not nested_validation_ok:
+                                        yield self._format_error(f"服务器内部错误！嵌套JSON验证失败: {nested_err_msg}", model, chat_id)
+                                    else:
+                                        yield self._format_error("服务器内部错误！", model, chat_id)
                                     return
+
+                            if content is None and tool_calls is None and not suppress_text:
+                                if is_agent:
+                                    logger.warning(f"Qianwen agent request got non-JSON response (suppress_text=False)")
+                                    if attempt < max_retries - 1:
+                                        await asyncio.sleep(5)
+                                        break
+                                    else:
+                                        yield self._format_error("服务器内部错误！", model, chat_id)
+                                        return
+
+                            if is_agent and buffered_chunks is not None and not suppress_text:
+                                for chunk in buffered_chunks:
+                                    yield chunk
+                                buffered_chunks.clear()
 
                             if content and not tool_calls:
                                 yield self._format_chunk(content, model, chat_id)
@@ -462,9 +524,9 @@ class QianwenAdapter(BaseAdapter):
                             return
                         except Exception as e:
                             logger.error(f"Qianwen done handler error: {e}")
-                            yield self._format_error(str(e), model, chat_id)
+                            yield self._format_error("服务器内部错误！", model, chat_id)
                             return
-            yield self._format_error("Max retries exceeded for JSON parse", model, chat_id)
+            yield self._format_error("服务器内部错误！", model, chat_id)
         finally:
             try:
                 self._last_session_id = await browser_client.get_qianwen_session_id()

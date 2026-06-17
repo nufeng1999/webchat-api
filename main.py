@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import (
     BASE_DIR, CONFIG, SIGN_METHOD, signer, cookie_pool,
     load_accounts, save_accounts, load_conversation_state,
-    LOG_DIR, ACCOUNTS_PATH, rate_limiter, concurrency_limiter
+    LOG_DIR, ACCOUNTS_PATH, rate_limiter, request_limiter
 )
 from models import ChatCompletionRequest, AnthropicMessageRequest, MODEL_CONFIG
 from openai_api import stream_chat_completion, non_stream_chat_completion, generate_images, delete_conversation
@@ -161,14 +161,6 @@ async def rate_limit_middleware(request: Request, call_next):
             headers={"Retry-After": str(rate_limiter.get_status(client_ip).get("reset_at", 60))}
         )
 
-    if path in ("/v1/chat/completions", "/v1/messages", "/v1/images/generations", "/v1/podcast/generate"):
-        await concurrency_limiter.acquire()
-        try:
-            response = await call_next(request)
-            return response
-        finally:
-            concurrency_limiter.release()
-
     return await call_next(request)
 
 
@@ -208,24 +200,36 @@ async def _delete_adapter_conversation(adapter):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     adapter = get_adapter(request.model)
-    if request.stream:
-        async def stream_with_cleanup():
-            async for chunk in adapter.stream_chat(request):
-                yield chunk
-            await _delete_adapter_conversation(adapter)
-        return StreamingResponse(
-            stream_with_cleanup(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
+    
+    # 尝试获取 adapter 锁
+    acquired, error_msg = await request_limiter.acquire(request.model)
+    if not acquired:
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"message": error_msg, "type": "request_limited_error", "code": 429}}
         )
-    else:
-        result = await adapter.non_stream_chat(request)
-        await _delete_adapter_conversation(adapter)
-        return JSONResponse(content=result)
+    
+    try:
+        if request.stream:
+            async def stream_with_cleanup():
+                async for chunk in adapter.stream_chat(request):
+                    yield chunk
+                await _delete_adapter_conversation(adapter)
+            return StreamingResponse(
+                stream_with_cleanup(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+        else:
+            result = await adapter.non_stream_chat(request)
+            await _delete_adapter_conversation(adapter)
+            return JSONResponse(content=result)
+    finally:
+        request_limiter.release(request.model)
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: AnthropicMessageRequest):
@@ -512,11 +516,7 @@ async def health():
         "accounts_total": len(pool_status),
         "accounts_active": active_count,
         "accounts": pool_status,
-        "concurrency": {
-            "active": concurrency_limiter.active,
-            "max": concurrency_limiter.max_concurrent,
-            "total_served": concurrency_limiter.total
-        },
+        "request_limiter": request_limiter.get_stats(),
         "rate_limit": {
             "max_requests": rate_limiter.max_requests,
             "window_seconds": rate_limiter.window_seconds
@@ -541,6 +541,23 @@ async def health():
         result["signer_initialized"] = signer._initialized
         result["ms_token_available"] = bool(signer.ms_token)
     return result
+
+@app.get("/v1/status")
+async def status():
+    pool_status = cookie_pool.status()
+    active_count = sum(1 for a in pool_status if a["enabled"])
+    return JSONResponse(content={
+        "status": "ok" if active_count > 0 else "degraded",
+        "version": "3.3.0",
+        "request_limiter": request_limiter.get_stats(),
+        "rate_limit": {
+            "max_requests": rate_limiter.max_requests,
+            "window_seconds": rate_limiter.window_seconds
+        },
+        "accounts": pool_status,
+        "cookie_set": bool(CONFIG.get('cookie')),
+        "sign_method": SIGN_METHOD
+    })
 
 @app.post("/v1/podcast/generate")
 async def podcast_generate(request: Request):

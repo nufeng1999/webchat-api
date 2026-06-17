@@ -67,6 +67,35 @@ class DoubaoAdapter(BaseAdapter):
 
         return json.dumps(request_dict, ensure_ascii=False, indent=None, separators=(',', ':'))
 
+    def _validate_json_nested(self, obj, path=""):
+        """验证 JSON 对象中 "arguments" 字段的值是否为合法 JSON 字符串。
+        
+        递归检查所有键为 "arguments" 或 "args" 的字符串值，
+        如果疑似 JSON 则验证，否则返回 (False, error_msg)。
+        """
+        if isinstance(obj, dict):
+            for key in ("arguments", "args", "arguments_str"):
+                if key in obj:
+                    val = obj[key]
+                    if isinstance(val, str) and val.strip().startswith("{"):
+                        try:
+                            logger.debug(f'验证 JSON 对象中 "arguments" 字段的值是否为合法 JSON 字符串:\n{val}')
+                            json.loads(val, strict=False)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Doubao nested JSON validation failed: {e}")
+                            err_msg = f"{key} 字段的值 JSON 解析失败，请重新生成 {key} 字段的json内容，并确保其格式正确，结构不会错乱。"
+                            return False, err_msg
+            for v in obj.values():
+                ok, msg = self._validate_json_nested(v, path + "." + str(list(obj.keys())))
+                if not ok:
+                    return False, msg
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                ok, msg = self._validate_json_nested(item, path + f"[{i}]")
+                if not ok:
+                    return False, msg
+        return True, ""
+
     def _parse_response(self, full_text):
         is_openai_chunk = False
         is_tool_calls = False
@@ -233,6 +262,7 @@ class DoubaoAdapter(BaseAdapter):
             for attempt in range(max_retries):
                 full_text = ""
                 suppress_text = False
+                buffered_chunks = [] if is_agent else None
 
                 # 构建带错误反馈的 prompt
                 current_prompt = prompt_text
@@ -256,6 +286,7 @@ class DoubaoAdapter(BaseAdapter):
 
                 logger.info(f"[Doubao Adapter] {Colors.RED}Attempt {attempt+1}/{max_retries}{Colors.RESET}: calling stream_doubao_chat_via_type, inline_file_content={'yes' if is_agent and file_content else 'no'}")
                 got_rate_limit = False
+                parse_success = False
                 async for kind, value in browser_client.stream_doubao_chat_via_type(**kwargs):
                     if kind == "error":
                         err_str = str(value).lower()
@@ -279,65 +310,102 @@ class DoubaoAdapter(BaseAdapter):
                                 suppress_text = True
                                 logger.info(f"Doubao suppress_text triggered: ft_start={ft[:100]!r}")
                         if not suppress_text:
-                            yield self._format_chunk(value, model, chat_id)
+                            if is_agent and buffered_chunks is not None:
+                                buffered_chunks.append(self._format_chunk(value, model, chat_id))
+                            else:
+                                yield self._format_chunk(value, model, chat_id)
                     if kind == "done":
                         logger.info(f"Doubao done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview=\n{full_text[:2000]!r}")
                         try:
                             content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls = self._parse_response(full_text)
                             logger.info(f"Doubao done: content={content!r}, tool_calls=\n{tool_calls!r}, finish_reason={finish_reason!r}, is_openai_chunk={is_openai_chunk}, is_tool_calls={is_tool_calls}")
 
-                            if content is None and tool_calls is None:
+                            parse_success = False
+                            if content is None and tool_calls is not None:
                                 if suppress_text:
-                                    err_msg = ""  #"JSON parse failed"
+                                    err_msg = ""
                                     is_valid_json = False
                                     try:
                                         import json as _json
-                                        # full_text=full_text.strip().replace('}],"finish_reason"','},"finish_reason"')
                                         full_text=json.dumps(_json.loads(full_text), ensure_ascii=False, indent=4)
                                         is_valid_json = True
-                                        #err_msg = "JSON结构不匹配（缺少choices或tool_calls字段）"
                                     except Exception as parse_e:
                                         err_msg = str(parse_e)[:200]
                                         logger.warning(f"----Doubao parse failed: {err_msg}")
 
+                                    if is_valid_json:
+                                        # 验证嵌套的 arguments JSON
+                                        try:
+                                            import json as _json2
+                                            validated = _json2.loads(full_text)
+                                            logger.debug(f"Doubao 验证嵌套的 arguments JSON...")
+                                            ok, nested_err = self._validate_json_nested(validated)
+                                            if not ok:
+                                                err_msg = nested_err
+                                                is_valid_json = False
+                                        except Exception as ve:
+                                            err_msg = str(ve)[:200]
+                                            is_valid_json = False
+
                                     if is_tool_return and is_valid_json and not is_openai_chunk and not is_tool_calls:
-                                        # tool return：_parse_response 未识别出结构，使用原始 JSON 作为内容
                                         content = full_text
                                         finish_reason = "stop"
                                         logger.info(f"Doubao tool_return response: {full_text[:2000]}")
+                                        parse_success = True
                                     elif not is_valid_json:
-                                        # 重试逻辑（JSON 语法错误 或 普通请求缺少字段）
                                         logger.warning(f"Doubao parse failed (attempt {attempt+1}/{max_retries}): {err_msg}")
                                         parse_error_history.append((err_msg, full_text))
                                         if attempt < max_retries - 1:
                                             logger.info(f"Doubao retrying with parse error feedback...")
+                                            await asyncio.sleep(5)
                                             await self._delete_current_conversation()
                                             break
                                         else:
                                             logger.error(f"Doubao parse failed after {max_retries} attempts")
-                                            yield self._format_error(f"Parse failed after {max_retries} retries: {err_msg}", model, chat_id)
+                                            yield self._format_error("服务器内部错误！", model, chat_id)
                                             self._save_conversation_id(chat_id)
                                             await self._delete_current_conversation()
                                             return
+                                else:
+                                    if is_agent:
+                                        logger.warning(f"Doubao agent request got non-JSON response (suppress_text=False), content is empty")
+                                        parse_error_history.append(("Non-JSON response from agent", full_text))
+                                        if attempt < max_retries - 1:
+                                            await asyncio.sleep(5)
+                                            await self._delete_current_conversation()
+                                            break
+                                        else:
+                                            yield self._format_error("服务器内部错误！", model, chat_id)
+                                            self._save_conversation_id(chat_id)
+                                            await self._delete_current_conversation()
+                                            return
+                            elif content is not None or tool_calls is not None:
+                                parse_success = True
 
-                            if content and not tool_calls:
-                                yield self._format_chunk(content, model, chat_id)
-                            elif not tool_calls and suppress_text and full_text.strip() and not is_openai_chunk and not is_tool_calls:
-                                yield self._format_chunk(full_text, model, chat_id)
+                            if parse_success:
+                                if is_agent and buffered_chunks is not None and not suppress_text:
+                                    for chunk in buffered_chunks:
+                                        yield chunk
+                                    buffered_chunks.clear()
 
-                            if tool_calls:
-                                logger.info(f"Doubao yielding {len(tool_calls)} tool_calls")
-                                for chunk in self._yield_tool_calls(tool_calls, model, chat_id, content=content):
-                                    logger.debug(f"Doubao tool_call chunk: \n{chunk.decode(errors='replace')[:2000]}")
-                                    yield chunk
-                                fr = finish_reason or "tool_calls"
-                                yield format_openai_chunk(None, model, chat_id, "", finish_reason=fr).encode()
-                            else:
-                                yield format_openai_chunk(None, model, chat_id, "", finish_reason="stop").encode()
+                                if content and not tool_calls:
+                                    yield self._format_chunk(content, model, chat_id)
+                                elif not tool_calls and suppress_text and full_text.strip() and not is_openai_chunk and not is_tool_calls:
+                                    yield self._format_chunk(full_text, model, chat_id)
 
-                            yield format_openai_done().encode()
-                            self._save_conversation_id(chat_id)
-                            return
+                                if tool_calls:
+                                    logger.info(f"Doubao yielding {len(tool_calls)} tool_calls")
+                                    for chunk in self._yield_tool_calls(tool_calls, model, chat_id, content=content):
+                                        logger.debug(f"Doubao tool_call chunk: \n{chunk.decode(errors='replace')[:2000]}")
+                                        yield chunk
+                                    fr = finish_reason or "tool_calls"
+                                    yield format_openai_chunk(None, model, chat_id, "", finish_reason=fr).encode()
+                                else:
+                                    yield format_openai_chunk(None, model, chat_id, "", finish_reason="stop").encode()
+
+                                yield format_openai_done().encode()
+                                self._save_conversation_id(chat_id)
+                                return
                         except Exception as e:
                             logger.error(f"Doubao done handler error: {e}")
                             err_msg = str(e)[:200]
@@ -347,7 +415,7 @@ class DoubaoAdapter(BaseAdapter):
                                 await self._delete_current_conversation()
                                 break
                             else:
-                                yield self._format_error(str(e), model, chat_id)
+                                yield self._format_error("服务器内部错误！", model, chat_id)
                                 self._save_conversation_id(chat_id)
                                 await self._delete_current_conversation()
                                 return
@@ -360,7 +428,7 @@ class DoubaoAdapter(BaseAdapter):
                         continue
                     else:
                         logger.error("Doubao rate limited after max retries")
-                        yield self._format_error("Rate limited by server. Please retry later.", model, chat_id)
+                        yield self._format_error("服务器内部错误！", model, chat_id)
                         self._save_conversation_id(chat_id)
                         await self._delete_current_conversation()
                         return
@@ -371,7 +439,7 @@ class DoubaoAdapter(BaseAdapter):
                     break
             self._save_conversation_id(chat_id)
             await self._delete_current_conversation()
-            yield self._format_error("Max retries exceeded for JSON parse", model, chat_id)
+            yield self._format_error("服务器内部错误！", model, chat_id)
         except Exception as e:
             logger.error(f"[Doubao] stream_chat error: {e}")
             self._save_conversation_id(chat_id)
