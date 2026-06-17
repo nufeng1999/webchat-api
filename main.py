@@ -926,7 +926,19 @@ if __name__ == "__main__":
                         help="Show Qianwen browser window only")
     parser.add_argument("--keep-conversations", action="store_true", default=False,
                         help="Keep all conversation history after server shutdown (default: delete)")
+    parser.add_argument("-q", "--quiet", action="store_true", default=False,
+                        help="Suppress console log output (only show errors in file)")
+    parser.add_argument("--log-level", type=str, default=None,
+                        help="Set console log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
     args = parser.parse_args()
+
+    # 控制台日志控制
+    _console_filter_quiet = args.quiet
+    _console_min_level = logging.INFO
+    if args.log_level:
+        _level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}
+        _console_min_level = _level_map.get(args.log_level.upper(), logging.INFO)
+        _console_filter_quiet = False
 
     # 全局 headless 配置（旧参数兼容）
     CONFIG['_headless_browser'] = not args.show
@@ -974,4 +986,55 @@ if __name__ == "__main__":
     host = args.host or CONFIG.get('server_host', '0.0.0.0')
     port = args.port or CONFIG.get('server_port', 8765)
     import uvicorn
-    uvicorn.run(app, host=host, port=port)
+
+    # 控制台日志控制
+    if _console_filter_quiet or _console_min_level > logging.INFO:
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        for h in root.handlers[:]:
+            root.removeHandler(h)
+
+        class _CliFilter(logging.Filter):
+            def __init__(self):
+                super().__init__()
+                self.quiet = _console_filter_quiet
+                self.min_level = _console_min_level
+            def filter(self, record):
+                if self.quiet:
+                    return False
+                return record.levelno >= self.min_level
+
+        _cli_filter = _CliFilter()
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+        ch.addFilter(_cli_filter)
+        root.addHandler(ch)
+
+        uvicorn_log_config = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "handlers": {
+                "default": {
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                    "formatter": "default",
+                    "filters": ["cli_filter"],
+                },
+            },
+            "formatters": {
+                "default": {
+                    "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                },
+            },
+            "filters": {
+                "cli_filter": {"()": lambda: _cli_filter},
+            },
+            "loggers": {
+                "uvicorn": {"handlers": ["default"], "level": "DEBUG", "propagate": False},
+                "uvicorn.error": {"handlers": ["default"], "level": "DEBUG", "propagate": False},
+                "uvicorn.access": {"handlers": ["default"], "level": "DEBUG", "propagate": False},
+            },
+        }
+        uvicorn.run(app, host=host, port=port, log_config=uvicorn_log_config)
+    else:
+        uvicorn.run(app, host=host, port=port)

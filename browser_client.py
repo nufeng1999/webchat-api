@@ -384,7 +384,11 @@ class BrowserClient:
             yield ("done", "")
         finally:
             self._qianwen_queues.pop(stream_id, None)
-            await self._qianwen_page.unroute("**/api/v2/chat**", handle_route)
+            try:
+                if self._qianwen_page and not self._qianwen_page.is_closed():
+                    await self._qianwen_page.unroute("**/api/v2/chat**", handle_route)
+            except Exception:
+                pass
 
     async def get_user_info(self) -> dict:
         headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
@@ -878,7 +882,11 @@ class BrowserClient:
                 logger.warning(f"[Doubao] page reset failed: {nav_err}")
         finally:
             self._doubao_queues.pop(stream_id, None)
-            await self._doubao_page.unroute("**/chat/completion**", handle_route)
+            try:
+                if self._doubao_page and not self._doubao_page.is_closed():
+                    await self._doubao_page.unroute("**/chat/completion**", handle_route)
+            except Exception:
+                pass
 
     async def delete_all_qianwen_conversations(self):
         """删除千问网页版所有历史对话（httpx 直接调用，不依赖浏览器页面）。"""
@@ -1117,15 +1125,18 @@ class BrowserClient:
         except Exception:
             pass
 
-    async def delete_conversation_via_browser(self, conversation_id: str) -> tuple[bool, str]:
-        """通过浏览器页面调用豆包 API 删除对话，使用页面自带的认证信息。"""
-        await self._doubao_lock.acquire()
+    async def delete_conversation_via_browser(self, conversation_id: str, skip_lock: bool = False) -> tuple[bool, str]:
+        """通过浏览器页面调用豆包 API 删除对话，使用页面自带的认证信息。
+        skip_lock: 如果 True，则不会尝试获取 _doubao_lock（假设调用者已持有锁）。
+        """
+        if not skip_lock:
+            await self._doubao_lock.acquire()
         try:
             # 检查浏览器是否可用
             try:
                 browser_ok = (
-                    self._doubao_page is not None 
-                    and self._doubao_browser is not None 
+                    self._doubao_page is not None
+                    and self._doubao_browser is not None
                     and self._doubao_browser.is_connected()
                 )
             except Exception:
@@ -1137,9 +1148,8 @@ class BrowserClient:
             device_id = CONFIG.get('device_id', '')
             web_id = CONFIG.get('web_id', '')
             tea_uuid = CONFIG.get('tea_uuid', '')
-            
-            # 使用页面自带的 fetch API 删除对话（自动携带认证 cookie）
-            result = await self._doubao_page.evaluate("""
+
+            js_code = """
                 async (args) => {
                     const { conv_id, device_id, web_id, tea_uuid } = args;
                     try {
@@ -1192,12 +1202,33 @@ class BrowserClient:
                         return { success: false, error: String(e) };
                     }
                 }
-            """, {"conv_id": conversation_id, "device_id": device_id, "web_id": web_id, "tea_uuid": tea_uuid})
-            
+            """
+            js_args = {"conv_id": conversation_id, "device_id": device_id, "web_id": web_id, "tea_uuid": tea_uuid}
+
+            # run_in_executor 隔离 cancel scope，内部用 run_coroutine_threadsafe 回到 event loop
+            loop = asyncio.get_running_loop()
+            future = asyncio.ensure_future(
+                loop.run_in_executor(None, lambda: asyncio.run_coroutine_threadsafe(
+                    self._doubao_page.evaluate(js_code, js_args), loop
+                ).result())
+            )
+            try:
+                result = await asyncio.shield(future)
+            except asyncio.CancelledError:
+                logger.info(f"[Doubao] delete_conversation_via_browser: shielded from cancel, waiting for result")
+                try:
+                    result = future.result() if future.done() else await future
+                except Exception as e:
+                    logger.warning(f"[Doubao] delete_conversation_via_browser: post-cancel wait failed: {e}")
+                    return False, str(e)
+            except Exception as e:
+                logger.warning(f"[Doubao] delete_conversation_via_browser: error: {e}")
+                return False, str(e)
+
             if result.get("success"):
                 logger.info(f"Deleted conversation {conversation_id} via browser page")
                 return True, ""
-            
+
             err_msg = result.get('error') or json.dumps(result.get('data', {}), ensure_ascii=False)[:300]
             logger.info(f"Delete conversation {conversation_id} via browser: {err_msg}")
             return False, "Browser delete returned non-success"
@@ -1209,7 +1240,71 @@ class BrowserClient:
                 logger.warning(f"Error deleting conversation {conversation_id} via browser: {e}")
             return False, str(e)
         finally:
-            self._doubao_lock.release()
+            if not skip_lock:
+                self._doubao_lock.release()
+
+    async def show_doubao_for_rate_limit(self):
+        """关闭 headless 浏览器，启动 visible 浏览器供用户处理限流/验证码。"""
+        try:
+            if self._doubao_page:
+                try:
+                    if self._doubao_page.is_closed():
+                        logger.info("[Doubao] page already closed by user, skipping close")
+                    else:
+                        await self._doubao_page.close()
+                except Exception as e:
+                    logger.warning(f"[Doubao] page already closed: {e}")
+                self._doubao_page = None
+            if self._doubao_browser:
+                try:
+                    if not self._doubao_browser.is_connected():
+                        logger.info("[Doubao] browser already disconnected by user, skipping close")
+                    else:
+                        await self._doubao_browser.close()
+                except Exception as e:
+                    logger.warning(f"[Doubao] browser already disconnected: {e}")
+                self._doubao_browser = None
+            if self._doubao_pw:
+                try:
+                    await self._doubao_pw.stop()
+                except Exception as e:
+                    logger.warning(f"[Doubao] pw already stopped: {e}")
+                self._doubao_pw = None
+        except Exception as e:
+            logger.warning(f"[Doubao] error closing headless browser: {e}")
+        await self.ensure_doubao_ready(headless=False)
+        logger.info("[Doubao] visible browser started for rate limit handling")
+
+    async def hide_doubao_browser(self):
+        """关闭 visible 浏览器，恢复 headless（下次 ensure 会重建 headless）"""
+        try:
+            if self._doubao_page:
+                try:
+                    if self._doubao_page.is_closed():
+                        logger.info("[Doubao] page already closed by user, skipping close")
+                    else:
+                        await self._doubao_page.close()
+                except Exception as e:
+                    logger.warning(f"[Doubao] page already closed: {e}")
+                self._doubao_page = None
+            if self._doubao_browser:
+                try:
+                    if not self._doubao_browser.is_connected():
+                        logger.info("[Doubao] browser already disconnected by user, skipping close")
+                    else:
+                        await self._doubao_browser.close()
+                except Exception as e:
+                    logger.warning(f"[Doubao] browser already disconnected: {e}")
+                self._doubao_browser = None
+            if self._doubao_pw:
+                try:
+                    await self._doubao_pw.stop()
+                except Exception as e:
+                    logger.warning(f"[Doubao] pw already stopped: {e}")
+                self._doubao_pw = None
+            logger.info("[Doubao] visible browser closed, will restart headless on next request")
+        except Exception as e:
+            logger.warning(f"[Doubao] error closing visible browser: {e}")
 
     async def upload_document_via_page(self, file_data: bytes, file_name: str) -> dict:
         """Upload file to doubao cloud storage via HTTP API, returns attachment dict with URI.
@@ -1373,9 +1468,34 @@ class BrowserClient:
             }""")
             logger.info(f"[Qwen] file input set + events dispatched: {file_name}")
 
-            await asyncio.sleep(5)
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.5)
+            # 等待 3 秒让千问处理文件上传
+            await asyncio.sleep(3)
+
+            # 轮询检测文件状态栏是否出现（最多 60 秒）
+            # 千问上传文件后，class 包含 "statusLine" 的 div 会显示文件大小（如 "53.13 KB"）
+            attached = False
+            for i in range(60):
+                try:
+                    attached = await page.evaluate("""() => {
+                        const statusLines = document.querySelectorAll('[class*="statusLine"]');
+                        for (const el of statusLines) {
+                            const text = (el.textContent || '').trim();
+                            if (text.length > 0 && /\d/.test(text)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""")
+                    if attached:
+                        logger.info(f"[Qwen] file status line detected in DOM (attempt {i+1})")
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+            if not attached:
+                logger.warning(f"[Qwen] file status line not detected after 60s, proceeding anyway")
+
+            await asyncio.sleep(2)
             await page.evaluate("""() => {
                 const el = document.querySelector('[contenteditable]')||document.querySelector('textarea');
                 if(el) {el.focus();el.click();}
