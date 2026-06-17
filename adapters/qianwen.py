@@ -80,6 +80,17 @@ class QianwenAdapter(BaseAdapter):
     async def close(self):
         pass
 
+    async def _delete_qianwen_conversation(self):
+        """删除当前 attempt 的千问历史对话。"""
+        session_id = self._last_session_id
+        if session_id:
+            try:
+                from browser_client import browser_client
+                await browser_client.delete_qianwen_conversation(session_id)
+            except Exception:
+                pass
+        self._last_session_id = ""
+
     def _get_model_name(self, model: str) -> str:
         cfg = QIANWEN_MODELS.get(model, {})
         return cfg.get("model", "qwen-max")
@@ -343,22 +354,34 @@ class QianwenAdapter(BaseAdapter):
             pos = e.pos
             snippet = text_to_parse[max(0,pos-40):pos+40]
             logger.warning(f"Qianwen JSON decode error at char {pos}: ...{snippet!r}...")
-            brace_diff = text_to_parse.count("}") - text_to_parse.count("{")
-            if brace_diff > 0 and text_to_parse.rstrip().endswith("}"):
-                stripped = text_to_parse.rstrip()
-                while stripped.endswith("}") and stripped.count("}") > stripped.count("{"):
-                    stripped = stripped[:-1].rstrip()
-                    try:
-                        parsed = json.loads(stripped, strict=False)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-                else:
-                    logger.error(f"Qianwen JSON repair failed after brace strip, text={text_to_parse[:200]!r}")
+            repaired = False
+            for _ in range(5):
+                try:
+                    parsed = json.loads(text_to_parse, strict=False)
+                    repaired = True
+                    break
+                except json.JSONDecodeError:
+                    pass
+                try:
+                    fixed = text_to_parse.replace('\\\\\\\\', '\\\\').replace('\\\\"', '\\"').replace('\\\\n', '\\n').replace('\\\\t', '\\t').replace('\\\\/', '/')
+                    text_to_parse = fixed
+                except Exception:
+                    break
+            if not repaired:
+                brace_diff = text_to_parse.count("}") - text_to_parse.count("{")
+                if brace_diff > 0 and text_to_parse.rstrip().endswith("}"):
+                    stripped = text_to_parse.rstrip()
+                    while stripped.endswith("}") and stripped.count("}") > stripped.count("{"):
+                        stripped = stripped[:-1].rstrip()
+                        try:
+                            parsed = json.loads(stripped, strict=False)
+                            repaired = True
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                if not repaired:
+                    logger.error(f"Qianwen JSON repair failed after escape fix, text={text_to_parse[:200]!r}")
                     return None, None, None,is_openai_chunk,is_tool_calls
-            else:
-                logger.error(f"Qianwen JSON decode internal error at char {pos}, text={text_to_parse[:200]!r}")
-                return None, None, None,is_openai_chunk,is_tool_calls
         except TypeError as e:
             logger.error(f"Qianwen JSON decode TypeError: {e}")
             return None, None, None,is_openai_chunk,is_tool_calls
@@ -481,6 +504,7 @@ class QianwenAdapter(BaseAdapter):
                                     else:
                                         logger.warning(f"Qianwen parse failed (attempt {attempt+1}/{max_retries}), retrying in 5s...")
                                     await asyncio.sleep(5)
+                                    await self._delete_qianwen_conversation()
                                     break
                                 else:
                                     logger.error(f"Qianwen parse failed after {max_retries} attempts")
@@ -495,6 +519,31 @@ class QianwenAdapter(BaseAdapter):
                                     logger.warning(f"Qianwen agent request got non-JSON response (suppress_text=False)")
                                     if attempt < max_retries - 1:
                                         await asyncio.sleep(5)
+                                        await self._delete_qianwen_conversation()
+                                        break
+                                    else:
+                                        yield self._format_error("服务器内部错误！", model, chat_id)
+                                        return
+
+                            # 有 tool_calls 时验证 arguments 的 JSON 合法性
+                            if tool_calls:
+                                all_args_valid = True
+                                args_err_msg = ""
+                                for tc in tool_calls:
+                                    args_val = tc.get("function", {}).get("arguments", "")
+                                    if isinstance(args_val, str) and args_val.strip().startswith("{"):
+                                        try:
+                                            json.loads(args_val, strict=False)
+                                        except json.JSONDecodeError as ae:
+                                            all_args_valid = False
+                                            args_err_msg = str(ae)[:200]
+                                            logger.warning(f"Qianwen arguments validation failed: {args_err_msg}")
+                                            break
+                                if not all_args_valid:
+                                    logger.warning(f"Qianwen tool_calls arguments invalid (attempt {attempt+1}/{max_retries}): {args_err_msg}")
+                                    if attempt < max_retries - 1:
+                                        await asyncio.sleep(5)
+                                        await self._delete_qianwen_conversation()
                                         break
                                     else:
                                         yield self._format_error("服务器内部错误！", model, chat_id)

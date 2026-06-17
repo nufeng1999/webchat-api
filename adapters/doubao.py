@@ -131,22 +131,36 @@ class DoubaoAdapter(BaseAdapter):
                     f.write(full_text)
             except Exception:
                 pass
-            brace_diff = text_to_parse.count("}") - text_to_parse.count("{")
-            if brace_diff > 0 and text_to_parse.rstrip().endswith("}"):
-                stripped = text_to_parse.rstrip()
-                while stripped.endswith("}") and stripped.count("}") > stripped.count("{"):
-                    stripped = stripped[:-1].rstrip()
-                    try:
-                        parsed = json.loads(stripped, strict=False)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-                else:
-                    logger.error(f"Doubao JSON repair failed after brace strip, text={text_to_parse[:200]!r}")
+            # 尝试修复转义层级问题
+            repaired = False
+            for _ in range(5):
+                try:
+                    parsed = json.loads(text_to_parse, strict=False)
+                    repaired = True
+                    break
+                except json.JSONDecodeError:
+                    pass
+                # 尝试去掉一层转义
+                try:
+                    fixed = text_to_parse.replace('\\\\\\\\', '\\\\').replace('\\\\"', '\\"').replace('\\\\n', '\\n').replace('\\\\t', '\\t').replace('\\\\/', '/')
+                    text_to_parse = fixed
+                except Exception:
+                    break
+            if not repaired:
+                brace_diff = text_to_parse.count("}") - text_to_parse.count("{")
+                if brace_diff > 0 and text_to_parse.rstrip().endswith("}"):
+                    stripped = text_to_parse.rstrip()
+                    while stripped.endswith("}") and stripped.count("}") > stripped.count("{"):
+                        stripped = stripped[:-1].rstrip()
+                        try:
+                            parsed = json.loads(stripped, strict=False)
+                            repaired = True
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                if not repaired:
+                    logger.error(f"Doubao JSON repair failed after escape fix, text={text_to_parse[:200]!r}")
                     return None, None, None, is_openai_chunk, is_tool_calls
-            else:
-                logger.error(f"Doubao JSON decode internal error at char {pos}, text={text_to_parse[:200]!r}")
-                return None, None, None, is_openai_chunk, is_tool_calls
         except TypeError as e:
             logger.error(f"Doubao JSON decode TypeError: {e}")
             return None, None, None, is_openai_chunk, is_tool_calls
@@ -321,7 +335,7 @@ class DoubaoAdapter(BaseAdapter):
                             logger.info(f"Doubao done: content={content!r}, tool_calls=\n{tool_calls!r}, finish_reason={finish_reason!r}, is_openai_chunk={is_openai_chunk}, is_tool_calls={is_tool_calls}")
 
                             parse_success = False
-                            if content is None and tool_calls is not None:
+                            if content is None and tool_calls is None:
                                 if suppress_text:
                                     err_msg = ""
                                     is_valid_json = False
@@ -380,6 +394,33 @@ class DoubaoAdapter(BaseAdapter):
                                             await self._delete_current_conversation()
                                             return
                             elif content is not None or tool_calls is not None:
+                                # 有 tool_calls 时验证 arguments 的 JSON 合法性
+                                if tool_calls:
+                                    all_args_valid = True
+                                    args_err_msg = ""
+                                    for tc in tool_calls:
+                                        args_val = tc.get("function", {}).get("arguments", "")
+                                        if isinstance(args_val, str) and args_val.strip().startswith("{"):
+                                            try:
+                                                json.loads(args_val, strict=False)
+                                            except json.JSONDecodeError as ae:
+                                                all_args_valid = False
+                                                args_err_msg = str(ae)[:200]
+                                                logger.warning(f"Doubao arguments validation failed: {args_err_msg}")
+                                                break
+                                    if not all_args_valid:
+                                        logger.warning(f"Doubao tool_calls arguments invalid (attempt {attempt+1}/{max_retries}): {args_err_msg}")
+                                        parse_error_history.append((f"arguments JSON invalid: {args_err_msg}", full_text))
+                                        if attempt < max_retries - 1:
+                                            logger.info(f"Doubao retrying with arguments error feedback...")
+                                            await asyncio.sleep(5)
+                                            await self._delete_current_conversation()
+                                            break
+                                        else:
+                                            yield self._format_error("服务器内部错误！", model, chat_id)
+                                            self._save_conversation_id(chat_id)
+                                            await self._delete_current_conversation()
+                                            return
                                 parse_success = True
 
                             if parse_success:
@@ -439,7 +480,7 @@ class DoubaoAdapter(BaseAdapter):
                     break
             self._save_conversation_id(chat_id)
             await self._delete_current_conversation()
-            yield self._format_error("服务器内部错误！", model, chat_id)
+            yield self._format_error("已进行多次重试！", model, chat_id)
         except Exception as e:
             logger.error(f"[Doubao] stream_chat error: {e}")
             self._save_conversation_id(chat_id)

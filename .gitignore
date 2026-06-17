@@ -1,4 +1,4 @@
-__pycache__/
+    __pycache__/
 *.pyc
 *.pyo
 .env
@@ -85,3 +85,6 @@ exectask_prompt.md
 request_task.md
 ret_format_task.md
 config.py
+my_prompt/ret_format_task - 副本.md
+my_prompt/exectask_prompt - 副本.md
+my_prompt/request_task - 副本.md
