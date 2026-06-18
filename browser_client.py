@@ -7,7 +7,7 @@ import httpx
 
 from config import CONFIG, USER_AGENT, BASE_DIR
 
-logger = logging.getLogger("doubao-browser")
+logger = logging.getLogger("webchat-browser")
 
 STORAGE_STATE_PATH = os.path.join(BASE_DIR, "storage_state.json")
 
@@ -1476,7 +1476,7 @@ class BrowserClient:
             attached = False
             for i in range(60):
                 try:
-                    attached = await page.evaluate("""() => {
+                    attached = await page.evaluate(r"""() => {
                         const statusLines = document.querySelectorAll('[class*="statusLine"]');
                         for (const el of statusLines) {
                             const text = (el.textContent || '').trim();

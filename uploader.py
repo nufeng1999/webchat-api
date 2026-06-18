@@ -11,7 +11,7 @@ from requests_aws4auth import AWS4Auth
 from fastapi import HTTPException
 from typing import Optional
 
-logger = logging.getLogger("doubao-api.uploader")
+logger = logging.getLogger("webchat-api.uploader")
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 

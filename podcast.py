@@ -15,7 +15,7 @@ from sse import (
     parse_sse_line, extract_text_from_event, extract_conversation_id
 )
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 PODCAST_TASKS = {}
 

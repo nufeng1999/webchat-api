@@ -27,7 +27,7 @@ from storage import init_db, save_conversation, list_conversations as db_list_co
 from adapters import init_all as adapters_init_all, close_all as adapters_close_all, get_adapter, get_models as get_adapter_models
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 async def refresh_qianwen_models():
     """异步刷新千问模型列表，失败时静默处理。"""

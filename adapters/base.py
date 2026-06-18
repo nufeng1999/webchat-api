@@ -135,6 +135,11 @@ class BaseAdapter(ABC):
         if not text_to_parse:
             return None, None, None, is_openai_chunk, is_tool_calls
 
+        # 快速判断文本是否可能为 JSON，纯文字直接跳过解析
+        first_char = text_to_parse[0]
+        if first_char not in ('{', '[', '"'):
+            return None, None, None, is_openai_chunk, is_tool_calls
+
         # 尝试解析 JSON
         try:
             parsed = json.loads(text_to_parse, strict=False)
@@ -416,6 +421,17 @@ class BaseAdapter(ABC):
         """
         adapter_name = self.get_adapter_name()
 
+        if not is_agent:
+            return False, "", None, full_text
+
+        # agent 非 tool_return 请求：允许普通文本回复
+        if not is_tool_return and content is None and tool_calls is None:
+            # suppress_text=True 时：chunks 未被 yield，需要把 full_text 作为 content 输出
+            # suppress_text=False 时：chunks 已缓冲，由 _yield_final_response 从 buffered_chunks 输出
+            if suppress_text:
+                return False, "", full_text, full_text
+            return False, "", None, full_text
+
         if content is None and tool_calls is None:
             if suppress_text:
                 # 先尝试 JSON 规范化
@@ -441,6 +457,17 @@ class BaseAdapter(ABC):
 
                     # tool_return 响应：内容是 JSON 字符串且不是 OpenAI chunk/tool_calls 格式
                     if is_tool_return and not is_openai_chunk and not is_tool_calls:
+                        # 尝试从 JSON 中提取 content 字段
+                        content_val = validated.get("content")
+                        if not content_val and isinstance(validated, dict):
+                            # 搜索嵌套字段（如 import.content、choices[0].message.content）
+                            for key, val in validated.items():
+                                if isinstance(val, dict) and "content" in val:
+                                    content_val = val["content"]
+                                    break
+                        if content_val:
+                            return False, "", content_val, normalized
+                        # 没有 content 字段，返回整个 JSON 作为回复
                         return False, "", normalized, normalized
 
                     # 合法 JSON，finish_reason=stop 或非 agent → 直接放行，作为 content 输出

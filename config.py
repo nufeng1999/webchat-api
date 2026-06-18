@@ -36,7 +36,7 @@ class ColorFormatter(logging.Formatter):
         record.levelname = f'{color}[{record.levelname}]{Colors.RESET}'
         return super().format(record)
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')

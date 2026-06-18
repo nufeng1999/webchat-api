@@ -7,7 +7,7 @@ from typing import Union
 from models import ChatMessage, MODEL_CONFIG, SYSTEM_PROMPT_MAP
 from config import CONFIG, USER_AGENT, get_webchat_task
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 
 def generate_x_flow_trace():

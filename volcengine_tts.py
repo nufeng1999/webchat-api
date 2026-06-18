@@ -7,7 +7,7 @@ import logging
 import os
 from typing import Optional
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 TTS_V1_URL = "wss://openspeech.bytedance.com/api/v1/tts/ws_binary"
 

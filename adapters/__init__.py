@@ -6,7 +6,7 @@ from adapters.doubao import DoubaoAdapter
 from adapters.qianwen import QianwenAdapter
 from models import MODEL_CONFIG
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 _ADAPTER_INSTANCES: dict[str, BaseAdapter] = {}
 

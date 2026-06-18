@@ -12,7 +12,7 @@ from sse import (
 )
 from openai_api import call_doubao_api, upload_images_for_message
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 
 def anthropic_content_to_openai(content) -> tuple[str, list[str]]:

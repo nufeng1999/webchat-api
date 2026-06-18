@@ -11,7 +11,7 @@ import aiohttp
 
 from config import CONFIG, USER_AGENT, cookie_pool, BASE_DIR
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 MEDIA_DIR = os.path.join(EXPORT_DIR, "media")

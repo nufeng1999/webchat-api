@@ -17,7 +17,7 @@ from sse import (
     parse_sse_line, extract_conversation_id
 )
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 MUSIC_TASKS = {}
 

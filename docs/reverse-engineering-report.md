@@ -21,7 +21,7 @@
 | 05-13 22:20 | 深入调研方案B（直接API+伪造签名） | 关键发现：DoubaoFreeApi 使用 x-flow-trace 绕过 a_bogus |
 | 05-13 22:30 | 分析 DoubaoFreeApi 源码 | 发现第三种签名绕过路径：URL参数+请求头组合 |
 | 05-13 23:00 | 会话上下文恢复，验证报告完整性 | 确认方案B评估、时间轴、无ARK API引用均已完成 |
-| 05-13 23:05 | 创建项目目录 doubao-api/ 和 temp/ | 临时文件独立存放 |
+| 05-13 23:05 | 创建项目目录 webchat-api/ 和 temp/ | 临时文件独立存放 |
 | 05-13 23:10 | 安装依赖：pycryptodome, aiohttp, fastapi, uvicorn, httpx | Python 3.13 环境 |
 | 05-13 23:15 | 从 SQLite 提取豆包 Cookie | DPAPI 解密密钥正确，v10 AES-GCM 解密部分乱码，关键 Cookie 可提取 |
 | 05-13 23:20 | 提取 sessionid、uid_tt、device_id 等关键参数 | sessionid=<已脱敏> |
@@ -970,7 +970,7 @@ data: [DONE]
 ### 11.5 当前项目文件结构
 
 ```
-d:\_program\Doubao\doubao-api\
+d:\_program\Doubao\webchat-api\
 ├── main.py              # FastAPI 主服务（OpenAI 兼容 API）
 ├── config.json          # 会话配置（Cookie、device_id 等）
 └── temp\                # 临时文件目录

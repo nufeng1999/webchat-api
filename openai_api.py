@@ -20,7 +20,7 @@ from sse import (
 )
 from config import save_conversation_log, save_conversation_state
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 CONVERSATION_MAPPING_PATH = Path(BASE_DIR) / "conversation_mapping.json"
 

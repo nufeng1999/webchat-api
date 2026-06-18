@@ -318,13 +318,15 @@ class QianwenAdapter(BaseAdapter):
             messages = await self._prepare_messages(request, browser_client, is_agent)
             logger.info(f"Qianwen stream_chat: model={model}, messages={len(messages)}, is_agent={is_agent}")
 
-            max_retries = 3
+            max_retries = 6
             for attempt in range(max_retries):
                 full_text = ""
                 suppress_text = False
                 buffered_chunks = [] if is_agent else None
+                parse_success = False
+                is_retry_break = False
 
-                logger.info(f"[Qianwen Adapter] Attempt {attempt+1}/{max_retries}: calling stream_qianwen_chat")
+                logger.info(f"[Qianwen Adapter] Attempt {Colors.BOLD_RED}{attempt+1}/{max_retries}{Colors.RESET} to stream chat: calling stream_qianwen_chat")
 
                 async for kind, value in browser_client.stream_qianwen_chat(messages, self._session_id, self._topic_id):
                     if kind == "error":
@@ -357,44 +359,64 @@ class QianwenAdapter(BaseAdapter):
                             content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls = self._parse_response(full_text)
                             logger.info(f"Qianwen done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}, is_openai_chunk={is_openai_chunk}, is_tool_calls={is_tool_calls}")
 
-                            # 验证响应是否合法
+                            last_msg = request.messages[-1] if request.messages else None
+                            is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+
                             should_retry, err_msg, tool_return_content, full_text = self._validate_done_response(
                                 content, tool_calls, finish_reason,
                                 is_openai_chunk, is_tool_calls,
-                                suppress_text, is_agent, False, full_text
+                                suppress_text, is_agent, is_tool_return, full_text
                             )
 
-                            if should_retry:
+                            if tool_return_content is not None:
+                                content = tool_return_content
+                                finish_reason = "stop"
+                                logger.info(f"Qianwen tool_return response: {tool_return_content[:2000]}")
+                                parse_success = True
+                            elif should_retry:
                                 logger.warning(f"Qianwen retry (attempt {attempt+1}/{max_retries}): {err_msg}")
                                 if attempt < max_retries - 1:
                                     await asyncio.sleep(5)
                                     await self._delete_qianwen_conversation()
+                                    is_retry_break = True
                                     break
                                 else:
+                                    logger.error(f"Qianwen parse failed after {max_retries} attempts")
                                     yield self._format_error("服务器内部错误！", model, chat_id)
+                                    await self._delete_qianwen_conversation()
                                     return
+                            else:
+                                parse_success = True
 
-                            # 非重试路径，正常 yield 响应
-                            async for chunk in self._yield_final_response(
-                                content, tool_calls, finish_reason,
-                                suppress_text, is_agent, buffered_chunks, full_text,
-                                model, chat_id, is_openai_chunk, is_tool_calls
-                            ):
-                                yield chunk
-                            # 成功完成后也获取一次 session_id（确保最新）
-                            try:
-                                self._session_id = await browser_client.get_qianwen_session_id()
-                                if self._session_id:
-                                    logger.debug(f"[Qwen] captured session_id: {self._session_id}")
-                            except Exception:
-                                pass
-                            return
+                            if parse_success:
+                                async for chunk in self._yield_final_response(
+                                    content, tool_calls, finish_reason,
+                                    suppress_text, is_agent, buffered_chunks, full_text,
+                                    model, chat_id, is_openai_chunk, is_tool_calls
+                                ):
+                                    yield chunk
+                                try:
+                                    self._session_id = await browser_client.get_qianwen_session_id()
+                                    if self._session_id:
+                                        logger.debug(f"[Qwen] captured session_id: {self._session_id}")
+                                except Exception:
+                                    pass
+                                await self._delete_qianwen_conversation()
+                                return
                         except Exception as e:
                             logger.error(f"Qianwen done handler error: {e}")
+                            err_msg = str(e)[:200]
+                            logger.warning(f"Qianwen retrying after done handler error: {err_msg}")
+                            if attempt < max_retries - 1:
+                                await self._delete_qianwen_conversation()
+                                is_retry_break = True
+                                break
                             yield self._format_error("服务器内部错误！", model, chat_id)
+                            await self._delete_qianwen_conversation()
                             return
 
-                yield self._format_error("服务器内部错误！", model, chat_id)
+                if not is_retry_break:
+                    yield self._format_error("服务器内部错误！", model, chat_id)
         finally:
             try:
                 sid = await browser_client.get_qianwen_session_id()

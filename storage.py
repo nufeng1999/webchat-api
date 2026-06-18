@@ -5,7 +5,7 @@ import logging
 import time
 from uuid import uuid4
 
-logger = logging.getLogger("doubao-api")
+logger = logging.getLogger("webchat-api")
 
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DB_PATH = os.path.join(DB_DIR, "conversations.db")

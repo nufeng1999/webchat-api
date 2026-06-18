@@ -507,7 +507,7 @@ Web 管理面板支持：
 ## 项目结构
 
 ```
-doubao-api/
+webchat-api/
 ├── main.py                      # FastAPI 入口 + 路由
 ├── config.py                    # 配置加载 + Cookie池 + 日志
 ├── models.py                    # 数据模型 + 模型配置
