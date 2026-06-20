@@ -5,6 +5,7 @@ import asyncio
 import logging
 from typing import AsyncGenerator, Union
 from pathlib import Path
+from json_fixer import fix_llm_tool_calls
 
 import aiohttp
 from urllib.parse import urlencode
@@ -363,15 +364,10 @@ async def stream_chat_completion(request):
 
                 if event_data.get("event_type") == 2003:
                     # 检测工具调用
-                    try:
-                        tool_call_data = json.loads(full_text) if isinstance(full_text, str) else full_text
-                        is_tool_call = isinstance(tool_call_data, dict) and "tool_calls" in tool_call_data
-                    except (json.JSONDecodeError, TypeError):
-                        is_tool_call = False
-
+                    tool_calls = fix_llm_tool_calls(full_text)
+                    is_tool_call = tool_calls is not None
                     if is_tool_call:
                         # logger.info(f"Stream detected tool_calls: {full_text[:200]}")
-                        tool_calls = tool_call_data.get("tool_calls", [])
                         for i, tc in enumerate(tool_calls):
                             yield format_openai_chunk(
                                 "", request.model, chat_id, conversation_id,
@@ -414,15 +410,11 @@ async def stream_chat_completion(request):
             yield format_openai_chunk(f"[Error: {str(e)}]", request.model, chat_id, conversation_id)
 
         # 检测工具调用
-        try:
-            tool_call_data = json.loads(full_text) if isinstance(full_text, str) else full_text
-            is_tool_call = isinstance(tool_call_data, dict) and "tool_calls" in tool_call_data
-        except (json.JSONDecodeError, TypeError):
-            is_tool_call = False
+        tool_calls = fix_llm_tool_calls(full_text)
+        is_tool_call = tool_calls is not None
 
         if is_tool_call:
             # logger.info(f"Buffer completed with tool_calls: {full_text[:200]}")
-            tool_calls = tool_call_data.get("tool_calls", [])
             for i, tc in enumerate(tool_calls):
                 yield format_openai_chunk(
                     None, request.model, chat_id, conversation_id,
@@ -670,14 +662,8 @@ async def non_stream_chat_completion(request):
 
     import time
     # 检测 full_text 是否为 tool_calls 格式的工具调用响应
-    try:
-        tool_call_data = json.loads(full_text) if isinstance(full_text, str) else full_text
-        is_tool_call = isinstance(tool_call_data, dict) and "tool_calls" in tool_call_data
-        if is_tool_call:
-            # logger.info(f"Detected tool_calls response: {json.dumps(tool_call_data, ensure_ascii=False)[:200]}")
-            tool_calls = tool_call_data.get("tool_calls", [])
-    except (json.JSONDecodeError, TypeError):
-        is_tool_call = False
+    tool_calls = fix_llm_tool_calls(full_text)
+    is_tool_call = tool_calls is not None
     if is_tool_call:
         result = {
             "id": chat_id,

@@ -385,7 +385,7 @@ class RequestLimiter:
     
     def __init__(self, max_wait_time: float = 180.0, max_concurrent: dict = None):
         self.max_wait_time = max_wait_time
-        self._max_concurrent: dict[str, int] = max_concurrent or {"doubao": 2, "qianwen": 1}
+        self._max_concurrent: dict[str, int] = max_concurrent or {"doubao": 2, "qianwen": 1, "deepseek": 1}
         self._semaphores: dict[str, asyncio.Semaphore] = {
             key: asyncio.Semaphore(val) for key, val in self._max_concurrent.items()
         }
@@ -397,6 +397,12 @@ class RequestLimiter:
         """根据 model 名称确定队列键。"""
         if model.startswith("qianwen-"):
             return "qianwen"
+        if model.startswith("deepseek-"):
+            return "deepseek"
+        if model.startswith("zai-"):
+            return "zai"
+        if model.startswith("mimo-"):
+            return "mimo"
         return "doubao"
     
     async def acquire(self, model: str) -> tuple[bool, str]:
@@ -451,7 +457,7 @@ concurrency_limiter = ConcurrencyLimiter(
 )
 request_limiter = RequestLimiter(
     max_wait_time=CONFIG.get('request_limiter_max_wait', 180),
-    max_concurrent=CONFIG.get('request_limiter_max_concurrent', {"doubao": 2, "qianwen": 1})
+    max_concurrent=CONFIG.get('request_limiter_max_concurrent', {"doubao": 2, "qianwen": 1, "deepseek": 1, "zai": 1, "mimo": 1})
 )
 
 

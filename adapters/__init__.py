@@ -4,18 +4,21 @@ from typing import Optional
 from adapters.base import BaseAdapter
 from adapters.doubao import DoubaoAdapter
 from adapters.qianwen import QianwenAdapter
+from adapters.deepseek import DeepseekAdapter
+from adapters.zai import ZaiAdapter
+from adapters.mimo import MimoAdapter
 from models import MODEL_CONFIG
 
 logger = logging.getLogger("webchat-api")
 
 _ADAPTER_INSTANCES: dict[str, BaseAdapter] = {}
 
-# 模型名到适配器的映射规则：doubao-* → doubao, qianwen-* → qianwen
-# 优先级：精确匹配 > 前缀匹配 > 默认适配器
 _MODEL_ADAPTER_MAP: dict[str, str] = {
-    # 前缀匹配规则
     "doubao-": "doubao",
     "qianwen-": "qianwen",
+    "deepseek-": "deepseek",
+    "zai-": "zai",
+    "mimo-": "mimo",
     # Anthropic 兼容模型映射到 doubao
     "claude-3-5-sonnet": "doubao",
     "claude-3-5-haiku": "doubao",
@@ -36,6 +39,15 @@ def _init_adapters():
 
     qianwen = QianwenAdapter()
     _ADAPTER_INSTANCES["qianwen"] = qianwen
+
+    deepseek = DeepseekAdapter()
+    _ADAPTER_INSTANCES["deepseek"] = deepseek
+
+    zai = ZaiAdapter()
+    _ADAPTER_INSTANCES["zai"] = zai
+
+    mimo = MimoAdapter()
+    _ADAPTER_INSTANCES["mimo"] = mimo
 
     for name, adapter in _ADAPTER_INSTANCES.items():
         logger.info(f"Adapter registered: {name} ({len(adapter.get_models())} models)")

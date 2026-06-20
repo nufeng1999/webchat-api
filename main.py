@@ -123,6 +123,27 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to delete Qianwen conversations: {e}")
 
+        try:
+            from browser_client import browser_client
+            await browser_client.delete_all_deepseek_conversations()
+            logger.info("DeepSeek conversations deleted from server")
+        except Exception as e:
+            logger.warning(f"Failed to delete DeepSeek conversations: {e}")
+
+        try:
+            from browser_client import browser_client
+            await browser_client.delete_all_zai_conversations()
+            logger.info("Zai conversations deleted from server")
+        except Exception as e:
+            logger.warning(f"Failed to delete Zai conversations: {e}")
+
+        try:
+            from browser_client import browser_client
+            await browser_client.delete_all_mimo_conversations()
+            logger.info("MiMo conversations deleted from server")
+        except Exception as e:
+            logger.warning(f"Failed to delete MiMo conversations: {e}")
+
     if _cleanup_task:
         _cleanup_task.cancel()
     if signer:
@@ -192,6 +213,27 @@ async def _delete_adapter_conversation(adapter):
                 from browser_client import browser_client
                 await browser_client.delete_qianwen_conversation(session_id)
                 logger.info(f"[Cleanup] deleted qianwen session {session_id}")
+            adapter._last_session_id = ""
+        elif adapter_name == 'deepseek':
+            session_id = getattr(adapter, '_last_session_id', '')
+            if session_id:
+                from browser_client import browser_client
+                await browser_client.delete_deepseek_conversation(session_id)
+                logger.info(f"[Cleanup] deleted deepseek session {session_id}")
+            adapter._last_session_id = ""
+        elif adapter_name == 'zai':
+            session_id = getattr(adapter, '_last_session_id', '')
+            if session_id:
+                from browser_client import browser_client
+                await browser_client.delete_zai_conversation(session_id)
+                logger.info(f"[Cleanup] deleted zai session {session_id}")
+            adapter._last_session_id = ""
+        elif adapter_name == 'mimo':
+            session_id = getattr(adapter, '_last_session_id', '')
+            if session_id:
+                from browser_client import browser_client
+                await browser_client.delete_mimo_conversation(session_id)
+                logger.info(f"[Cleanup] deleted mimo session {session_id}")
             adapter._last_session_id = ""
     except Exception as e:
         logger.warning(f"[Cleanup] failed to delete conversation: {e}")
@@ -913,7 +955,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Doubao Free API")
     parser.add_argument("--login", type=str, nargs='?', const='doubao', default=None,
-                        help="Open browser for login and save credentials. Specify 'doubao' or 'qianwen' (default: doubao)")
+                        help="Open browser for login and save credentials. Specify 'doubao', 'qianwen', or 'deepseek' (default: doubao)")
     parser.add_argument("--host", default=None,
                         help="Server host (default: from config.json)")
     parser.add_argument("--port", type=int, default=None,
@@ -924,6 +966,12 @@ if __name__ == "__main__":
                         help="Show Doubao browser window only")
     parser.add_argument("--show-qianwen", action="store_true", default=False,
                         help="Show Qianwen browser window only")
+    parser.add_argument("--show-deepseek", action="store_true", default=False,
+                        help="Show DeepSeek browser window only")
+    parser.add_argument("--show-zai", action="store_true", default=False,
+                        help="Show Zai browser window only")
+    parser.add_argument("--show-mimo", action="store_true", default=False,
+                        help="Show MiMo browser window only")
     parser.add_argument("--keep-conversations", action="store_true", default=False,
                         help="Keep all conversation history after server shutdown (default: delete)")
     parser.add_argument("-q", "--quiet", action="store_true", default=False,
@@ -945,40 +993,78 @@ if __name__ == "__main__":
     # 各站点独立配置（优先级：--show-xxx > --show > 默认 headless）
     CONFIG['_doubao_headless'] = not (args.show or args.show_doubao)
     CONFIG['_qianwen_headless'] = not (args.show or args.show_qianwen)
+    CONFIG['_deepseek_headless'] = not (args.show or args.show_deepseek)
+    CONFIG['_zai_headless'] = not (args.show or args.show_zai)
+    CONFIG['_mimo_headless'] = not (args.show or args.show_mimo)
     CONFIG['_keep_conversations'] = args.keep_conversations
 
     if args.login:
         target = args.login.lower()
-        if target not in ("doubao", "qianwen"):
-            print(f"Unknown login target: {target}. Use 'doubao' or 'qianwen'", file=sys.stderr)
+        if target not in ("doubao", "qianwen", "deepseek", "zai", "mimo"):
+            if not _console_filter_quiet:
+                print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', or 'mimo'", file=sys.stderr)
             os._exit(1)
         if target == "doubao":
             from login import do_login
             result = asyncio.run(do_login(show_browser=True))
             if result.get("success"):
+                if not _console_filter_quiet:
+                    print("=" * 50)
+                    print("豆包登录成功！")
+                    print("注意：豆包使用的是会话 cookie，每次启动服务器时")
+                    print("如果检测到未登录，会自动打开浏览器让你登录。")
+                    print("请保持浏览器窗口打开直到服务器关闭。")
+                    print("=" * 50)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(0)
             else:
-                print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
+                if not _console_filter_quiet:
+                    print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(1)
+        elif target == "deepseek":
+            from deepseek_login import login_and_save
+            asyncio.run(login_and_save())
+            if not _console_filter_quiet:
+                print("DeepSeek login completed")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        elif target == "zai":
+            from zai_login import login_and_save
+            asyncio.run(login_and_save())
+            if not _console_filter_quiet:
+                print("Zai login completed")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        elif target == "mimo":
+            from mimo_login import login_and_save
+            asyncio.run(login_and_save())
+            if not _console_filter_quiet:
+                print("MiMo login completed")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         else:
             from qianwen_login import do_qianwen_login
             result = asyncio.run(do_qianwen_login(show_browser=True))
             if result.get("success"):
-                print("=" * 50)
-                print("千问登录成功！")
-                print("注意：千问使用的是会话 cookie，每次启动服务器时")
-                print("如果检测到未登录，会自动打开浏览器让你登录。")
-                print("请保持浏览器窗口打开直到服务器关闭。")
-                print("=" * 50)
+                if not _console_filter_quiet:
+                    print("=" * 50)
+                    print("千问登录成功！")
+                    print("注意：千问使用的是会话 cookie，每次启动服务器时")
+                    print("如果检测到未登录，会自动打开浏览器让你登录。")
+                    print("请保持浏览器窗口打开直到服务器关闭。")
+                    print("=" * 50)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(0)
             else:
-                print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
+                if not _console_filter_quiet:
+                    print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(1)

@@ -18,6 +18,30 @@ MODEL_CONFIG = {
     "doubao-music": {"bot_id": "7338286299411103781", "use_deep_think": False, "use_auto_cot": False, "desc": "AI音乐生成", "is_music_model": True},
 }
 
+DEEPSEEK_MODEL_CONFIG = {
+    "deepseek-normal": {"model_type": "default", "desc": "快速模式 (适合日常对话)", "use_deep_think": False, "use_search": True, "supports_file": True},
+    "deepseek-thinking": {"model_type": "default", "desc": "深度思考模式", "use_deep_think": True, "use_search": True, "supports_file": True},
+    "deepseek-search": {"model_type": "default", "desc": "智能搜索模式", "use_deep_think": False, "use_search": True, "supports_file": True},
+    "deepseek-expert": {"model_type": "expert", "desc": "专家模式 (复杂问题)", "use_deep_think": True, "use_search": False, "supports_file": False},
+    "deepseek-vision": {"model_type": "vision", "desc": "识图模式", "use_deep_think": False, "use_search": False, "supports_file": True},
+}
+
+ZAI_MODEL_CONFIG = {
+    "zai-glm-5.2": {"model_type": "glm-5.2", "desc": "GLM-5.2 (NEW - 旗舰模型，擅长编程与长程任务)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "GLM-5.2"},
+    "zai-glm-5.1": {"model_type": "glm-5.1", "desc": "GLM-5.1 (上一代旗舰模型)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "GLM-5.1"},
+    "zai-glm-5-turbo": {"model_type": "glm-5-turbo", "desc": "GLM-5-Turbo (最新日常任务处理，编程与智能体模型)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "GLM-5-Turbo"},
+    "zai-glm-5v-turbo": {"model_type": "glm-5v-turbo", "desc": "GLM-5V-Turbo (新一代视觉模型，视觉理解全面升级)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "GLM-5V-Turbo"},
+    "zai-glm-4.7": {"model_type": "glm-4.7", "desc": "GLM-4.7 (经典强大模型)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "GLM-4.7"},
+}
+
+MIMO_MODEL_CONFIG = {
+    "mimo-v2.5-pro": {"model_type": "default", "desc": "MiMo-V2.5-Pro (资源密集型旗舰)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "MiMo-V2.5-Pro"},
+    "mimo-v2.5": {"model_type": "default", "desc": "MiMo-V2.5 (全模态基础模型)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "MiMo-V2.5"},
+    "mimo-v2.5-tts": {"model_type": "default", "desc": "MiMo-V2.5-TTS (语音合成模型)", "use_deep_think": False, "use_search": False, "supports_file": False, "display_name": "MiMo-V2.5-TTS"},
+    "mimo-v2.5-tts-voicedesign": {"model_type": "default", "desc": "MiMo-V2.5-TTS-VoiceDesign (音色合成模型)", "use_deep_think": False, "use_search": False, "supports_file": False, "display_name": "MiMo-V2.5-TTS-VoiceDesign"},
+    "mimo-v2.5-tts-voiceclone": {"model_type": "default", "desc": "MiMo-V2.5-TTS-VoiceClone (音色克隆模型)", "use_deep_think": False, "use_search": False, "supports_file": False, "display_name": "MiMo-V2.5-TTS-VoiceClone"},
+}
+
 SYSTEM_PROMPT_MAP = {
     "doubao-coding": "你是一个专业的编程助手，擅长多种编程语言，能够编写、调试、优化代码，并解释技术概念。请用代码块格式输出代码。",
     "doubao-writing": "你是一个专业的写作助手，擅长各类文体写作，包括公文、邮件、文案、小说、论文等。请根据用户需求生成高质量的结构化文本。",

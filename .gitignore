@@ -1,6 +1,12 @@
     __pycache__/
 *.pyc
 *.pyo
+*.png
+*.txt
+*login*.*
+*test*.*
+explore*.*
+*backup*.*
 .env
 
 config.json
@@ -89,3 +95,15 @@ my_prompt/ret_format_task - 副本.md
 my_prompt/exectask_prompt - 副本.md
 my_prompt/request_task - 副本.md
 /my_prompt/backup
+deepseek_storage_state.json
+deepseek_api_results.json
+deepseek_profile/
+deepseek_profile/
+zai_profile/
+mimo_profile/
+probe_mimo*.py
+mimo_*.png
+mimo_*.html
+mimo_*.txt
+mimo_*.md
+tmp/zai_01_home.png

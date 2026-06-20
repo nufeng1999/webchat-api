@@ -37,9 +37,7 @@ QIANWEN_MODELS.update(DEFAULT_MODELS)
 
 
 async def refresh_qianwen_models():
-    """从千问页面刷新模型列表，更新 QIANWEN_MODELS。"""
     from browser_client import browser_client
-
     try:
         models = await browser_client.fetch_qianwen_models()
         if models:
@@ -60,13 +58,14 @@ async def refresh_qianwen_models():
 
 
 class QianwenAdapter(BaseAdapter):
-    """千问 (qianwen.com) 适配器。"""
+    """千问 (qianwen.com) 适配器，使用模板模式。"""
 
     def __init__(self):
         self._session_id = ""
         self._topic_id = ""
         self._qianwen_lock = asyncio.Lock()
         self._last_model = None
+        self._pending_messages: list = []
 
     def get_adapter_name(self) -> str:
         return "qianwen"
@@ -81,136 +80,13 @@ class QianwenAdapter(BaseAdapter):
         pass
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Qianwen 专有方法
+    # Hook 方法（模板调用）
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _delete_qianwen_conversation(self):
-        """删除当前 attempt 的千问历史对话。"""
-        session_id = self._session_id
-        if session_id:
-            try:
-                from browser_client import browser_client
-                await browser_client.delete_qianwen_conversation(session_id)
-                logger.info(f"[Qianwen] deleted session {session_id}")
-            except Exception as e:
-                logger.warning(f"[Qianwen] delete session {session_id} exception: {e}")
-        else:
-            logger.debug("[Qianwen] no session to delete (session_id empty)")
-        self._session_id = ""
+    def _get_lock(self):
+        return self._qianwen_lock
 
-    def _get_model_name(self, model: str) -> str:
-        cfg = QIANWEN_MODELS.get(model, {})
-        return cfg.get("model", "qwen-max")
-
-    def _build_messages(self, request: ChatCompletionRequest) -> list:
-        qianwen_messages = []
-        for msg in request.messages:
-            role = getattr(msg, 'role', 'user')
-            content = getattr(msg, 'content', '')
-            if isinstance(content, list):
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif item.get("type") == "image_url":
-                            url = item.get("image_url", {}).get("url", "")
-                            if url:
-                                text_parts.append(f"[image: {url[:80]}]")
-                        elif item.get("type") == "file":
-                            fname = item.get("file", {}).get("filename", "file")
-                            text_parts.append(f"[file: {fname}]")
-                content = "\n".join(text_parts)
-            qianwen_messages.append({
-                "mime_type": "text/plain",
-                "content": content,
-                "meta_data": {"ori_query": content},
-                "status": "complete"
-            })
-        return qianwen_messages
-
-    def _extract_file_items(self, request: ChatCompletionRequest) -> list[dict]:
-        file_items = []
-        for msg in request.messages:
-            content = getattr(msg, 'content', '')
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "image_url":
-                            url = item.get("image_url", {}).get("url", "")
-                            if url:
-                                file_items.append({"kind": "image", "url": url})
-                        elif item.get("type") == "file":
-                            file_data_b64 = item.get("file", {}).get("file_data", "")
-                            fname = item.get("file", {}).get("filename", "upload.bin")
-                            if file_data_b64:
-                                file_items.append({"kind": "file", "data": base64.b64decode(file_data_b64), "name": fname})
-        return file_items
-
-    async def upload_file(self, file_data: bytes, file_name: str) -> str:
-        from browser_client import browser_client
-        return await browser_client.upload_file_via_qianwen_page(file_data, file_name)
-
-    async def _download_url(self, url: str) -> bytes:
-        if url.startswith("data:"):
-            _, b64 = url.split(",", 1)
-            return base64.b64decode(b64)
-        import httpx
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.content
-
-    def _render_messages_as_text(self, messages: list) -> str:
-        parts = []
-        for i, m in enumerate(messages):
-            role = getattr(m, 'role', '') or ''
-            name = getattr(m, 'name', None)
-            tool_call_id = getattr(m, 'tool_call_id', None)
-            tool_calls = getattr(m, 'tool_calls', None)
-            content = getattr(m, 'content', None)
-
-            header = f"[{i}] role={role}"
-            if name:
-                header += f" name={name}"
-            if tool_call_id:
-                header += f" tool_call_id={tool_call_id}"
-            parts.append(header)
-
-            if tool_calls:
-                try:
-                    parts.append("tool_calls:")
-                    parts.append(json.dumps(tool_calls, ensure_ascii=False, indent=2))
-                except Exception:
-                    parts.append(f"tool_calls: {tool_calls}")
-
-            if isinstance(content, str):
-                parts.append("content:")
-                parts.append(content)
-            elif isinstance(content, list):
-                parts.append("content:")
-                try:
-                    parts.append(json.dumps(content, ensure_ascii=False, indent=2))
-                except Exception:
-                    parts.append(str(content))
-            elif content is None:
-                parts.append("content:")
-                parts.append("<null>")
-            else:
-                parts.append("content:")
-                try:
-                    parts.append(json.dumps(content, ensure_ascii=False, indent=2))
-                except Exception:
-                    parts.append(str(content))
-
-            parts.append("")
-        return "\n".join(parts)
-
-    def _extract_last_text(self, message) -> str:
-        return extract_text_from_content(getattr(message, 'content', ''))
-
-    async def _prepare_messages(self, request, browser_client, is_agent, file_content=""):
-        """准备千问的消息列表。对于非 agent 请求，需要处理文件上传；对于 agent 请求，直接返回提示词。"""
+    async def _prepare_messages(self, request, browser_client, is_agent: bool):
         if not is_agent:
             file_items = self._extract_file_items(request)
             if file_items:
@@ -230,12 +106,13 @@ class QianwenAdapter(BaseAdapter):
             last_text = self._extract_last_text(last_msg) if last_msg else ""
             last_text = last_text.replace('\n', ' ').replace('\r', ' ')
             logger.info(f"Qianwen stream_chat: model={request.model}, last_text={len(last_text)} chars")
-            return [{
+            self._pending_messages = [{
                 "mime_type": "text/plain",
                 "content": last_text,
                 "meta_data": {"ori_query": last_text},
                 "status": "complete"
             }]
+            return last_text, None
 
         last_msg = request.messages[-1] if request.messages else None
         last_role = getattr(last_msg, 'role', '') if last_msg else ''
@@ -287,176 +164,122 @@ class QianwenAdapter(BaseAdapter):
                 raise
             logger.info(f"Qianwen agent request: model={request.model}, exectask_prompt ({len(prompt_text)} chars)")
 
-        return [{
+        self._pending_messages = [{
             "mime_type": "text/plain",
             "content": prompt_text,
             "meta_data": {"ori_query": prompt_text},
             "status": "complete"
         }]
+        return prompt_text, None
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # 核心方法：stream_chat
-    # ═══════════════════════════════════════════════════════════════════════
+    def _build_stream_kwargs(self, prompt_text: str, file_content, is_agent: bool, current_prompt: str) -> dict:
+        return {
+            "messages": self._pending_messages,
+            "session_id": self._session_id,
+            "topic_id": self._topic_id,
+        }
+
+    async def _call_stream(self, **kwargs):
+        from browser_client import browser_client
+        messages = kwargs.get("messages", [])
+        session_id = kwargs.get("session_id", "")
+        topic_id = kwargs.get("topic_id", "")
+        async for kind, value in browser_client.stream_qianwen_chat(messages, session_id, topic_id):
+            yield kind, value
+
+    async def _on_session_id(self, value):
+        self._session_id = value
+        logger.info(f"[Qwen] session_id: {value}")
+
+    async def _delete_conversation(self):
+        await self._delete_qianwen_conversation()
+
+    def _use_parse_error_history(self) -> bool:
+        return False
+
+    def _stream_error_no_delete(self) -> bool:
+        return True
+
+    async def _on_done_extra(self):
+        """done 后重新捕获 session_id。"""
+        try:
+            from browser_client import browser_client
+            sid = await browser_client.get_qianwen_session_id()
+            if sid:
+                self._session_id = sid
+                logger.info(f"[Qwen] captured session_id after done: {sid}")
+        except Exception:
+            pass
+
+    async def _on_finally_extra(self):
+        """finally 中捕获 session_id。"""
+        try:
+            from browser_client import browser_client
+            sid = await browser_client.get_qianwen_session_id()
+            if sid:
+                self._session_id = sid
+                logger.debug(f"[Qwen] captured session_id in finally: {sid}")
+        except Exception:
+            pass
 
     async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
-        from browser_client import browser_client
-        logger.debug(f"{Colors.BOLD_GREEN}[Doubao] -------------------new request---------------------{Colors.RESET}")
-        chat_id = self._generate_chat_id()
-        model = request.model
-        is_agent = self._is_agent_request(request)
         self._session_id = ""
+        if request.model != self._last_model:
+            from browser_client import browser_client
+            model_id = self._get_model_name(request.model)
+            await browser_client.select_qianwen_model(model_id)
+            self._last_model = request.model
+        async for chunk in self._stream_chat_template(request):
+            yield chunk
 
-        await self._qianwen_lock.acquire()
-        try:
-            # 如果模型发生变化，在页面上切换模型
-            if model != self._last_model:
-                model_id = self._get_model_name(model)
-                await browser_client.select_qianwen_model(model_id)
-                self._last_model = model
+    # ═══════════════════════════════════════════════════════════════════════
+    # 辅助方法
+    # ═══════════════════════════════════════════════════════════════════════
 
-            # 准备消息
-            messages = await self._prepare_messages(request, browser_client, is_agent)
-            logger.info(f"Qianwen stream_chat: model={model}, messages={len(messages)}, is_agent={is_agent}")
+    def _get_model_name(self, model: str) -> str:
+        cfg = QIANWEN_MODELS.get(model, {})
+        return cfg.get("model", "qwen-max")
 
-            max_retries = 6
-            for attempt in range(max_retries):
-                full_text = ""
-                suppress_text = False
-                buffered_chunks = [] if is_agent else None
-                parse_success = False
-                is_retry_break = False
+    def _extract_file_items(self, request: ChatCompletionRequest) -> list[dict]:
+        file_items = []
+        for msg in request.messages:
+            content = getattr(msg, 'content', '')
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "image_url":
+                            url = item.get("image_url", {}).get("url", "")
+                            if url:
+                                file_items.append({"kind": "image", "url": url})
+                        elif item.get("type") == "file":
+                            file_data_b64 = item.get("file", {}).get("file_data", "")
+                            fname = item.get("file", {}).get("filename", "upload.bin")
+                            if file_data_b64:
+                                file_items.append({"kind": "file", "data": base64.b64decode(file_data_b64), "name": fname})
+        return file_items
 
-                logger.info(f"[Qianwen Adapter] Attempt {Colors.BOLD_RED}{attempt+1}/{max_retries}{Colors.RESET} to stream chat: calling stream_qianwen_chat")
+    async def _download_url(self, url: str) -> bytes:
+        if url.startswith("data:"):
+            _, b64 = url.split(",", 1)
+            return base64.b64decode(b64)
+        import httpx
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.content
 
-                async for kind, value in browser_client.stream_qianwen_chat(messages, self._session_id, self._topic_id):
-                    if kind == "error":
-                        yield self._format_error(str(value), model, chat_id)
-                        return
-                    processed = await self._handle_chunk_streaming(
-                        kind, value,
-                        model=model,
-                        chat_id=chat_id,
-                        is_agent=is_agent,
-                        full_text=full_text,
-                        suppress_text=suppress_text,
-                        buffered_chunks=buffered_chunks
-                    )
-                    full_text, suppress_text, buffered_chunks, should_return, return_value = processed
-                    if should_return and return_value is not None:
-                        yield return_value
-                        if kind == "error":
-                            return
-                    if kind == "done":
-                        logger.debug(f"Qianwen done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview=\n{full_text[:1000]!r}")
-                        # 重要：done 意味着流结束，立即获取 session_id（用于可能的删除）
-                        try:
-                            self._session_id = await browser_client.get_qianwen_session_id()
-                            if self._session_id:
-                                logger.info(f"[Qwen] got session_id after done: {self._session_id}")
-                        except Exception:
-                            pass
-                        try:
-                            content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls = self._parse_response(full_text)
-                            logger.info(f"Qianwen done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}, is_openai_chunk={is_openai_chunk}, is_tool_calls={is_tool_calls}")
+    def _extract_last_text(self, message) -> str:
+        return extract_text_from_content(getattr(message, 'content', ''))
 
-                            last_msg = request.messages[-1] if request.messages else None
-                            is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
-
-                            should_retry, err_msg, tool_return_content, full_text = self._validate_done_response(
-                                content, tool_calls, finish_reason,
-                                is_openai_chunk, is_tool_calls,
-                                suppress_text, is_agent, is_tool_return, full_text
-                            )
-
-                            if tool_return_content is not None:
-                                content = tool_return_content
-                                finish_reason = "stop"
-                                logger.info(f"Qianwen tool_return response: {tool_return_content[:2000]}")
-                                parse_success = True
-                            elif should_retry:
-                                logger.warning(f"Qianwen retry (attempt {attempt+1}/{max_retries}): {err_msg}")
-                                if attempt < max_retries - 1:
-                                    await asyncio.sleep(5)
-                                    await self._delete_qianwen_conversation()
-                                    is_retry_break = True
-                                    break
-                                else:
-                                    logger.error(f"Qianwen parse failed after {max_retries} attempts")
-                                    yield self._format_error("服务器内部错误！", model, chat_id)
-                                    await self._delete_qianwen_conversation()
-                                    return
-                            else:
-                                parse_success = True
-
-                            if parse_success:
-                                async for chunk in self._yield_final_response(
-                                    content, tool_calls, finish_reason,
-                                    suppress_text, is_agent, buffered_chunks, full_text,
-                                    model, chat_id, is_openai_chunk, is_tool_calls
-                                ):
-                                    yield chunk
-                                try:
-                                    self._session_id = await browser_client.get_qianwen_session_id()
-                                    if self._session_id:
-                                        logger.debug(f"[Qwen] captured session_id: {self._session_id}")
-                                except Exception:
-                                    pass
-                                await self._delete_qianwen_conversation()
-                                return
-                        except Exception as e:
-                            logger.error(f"Qianwen done handler error: {e}")
-                            err_msg = str(e)[:200]
-                            logger.warning(f"Qianwen retrying after done handler error: {err_msg}")
-                            if attempt < max_retries - 1:
-                                await self._delete_qianwen_conversation()
-                                is_retry_break = True
-                                break
-                            yield self._format_error("服务器内部错误！", model, chat_id)
-                            await self._delete_qianwen_conversation()
-                            return
-
-                if not is_retry_break:
-                    yield self._format_error("服务器内部错误！", model, chat_id)
-        finally:
+    async def _delete_qianwen_conversation(self):
+        session_id = self._session_id
+        if session_id:
             try:
-                sid = await browser_client.get_qianwen_session_id()
-                if sid:
-                    self._session_id = sid
-                    logger.debug(f"[Qwen] captured session_id: {sid}")
-            except Exception:
-                pass
-            self._qianwen_lock.release()
-
-    async def non_stream_chat(self, request: ChatCompletionRequest) -> dict:
-        chat_id = self._generate_chat_id()
-        full_text = ""
-        try:
-            async for chunk in self.stream_chat(request):
-                try:
-                    text = chunk.decode('utf-8', errors='replace')
-                    if text.startswith("data: ") and not text.startswith("data: [DONE]"):
-                        data_str = text[6:].strip()
-                        if data_str:
-                            data = json.loads(data_str)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_text += content
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error(f"[Qianwen] non_stream_chat error: {e}")
-            return {"error": str(e)}
-
-        return {
-            "id": chat_id,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": full_text},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        }
+                from browser_client import browser_client
+                await browser_client.delete_qianwen_conversation(session_id)
+                logger.info(f"[Qianwen] deleted session {session_id}")
+            except Exception as e:
+                logger.warning(f"[Qianwen] delete session {session_id} exception: {e}")
+        else:
+            logger.debug("[Qianwen] no session to delete (session_id empty)")
+        self._session_id = ""

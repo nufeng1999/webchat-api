@@ -3,6 +3,8 @@ import time
 import uuid
 import logging
 import asyncio
+from json_fixer import JsonFixer
+from config import Colors
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Optional
 from models import ChatCompletionRequest
@@ -73,10 +75,10 @@ class BaseAdapter(ABC):
                     val = obj[key]
                     if isinstance(val, str) and val.strip().startswith("{"):
                         try:
-                            json.loads(val, strict=False)
-                        except json.JSONDecodeError as e:
+                            JsonFixer().fix(val)
+                        except ValueError as e:
                             logger.warning(f"{adapter_name} nested JSON validation failed: {path}[{key}]: {e}")
-                            return False, f"{key} 字段的值 JSON 解析失败，请重新生成 {key} 字段的json内容，并确保其格式正确，结构不会错乱。"
+                            return False, f"{e}"
             for v in obj.values():
                 ok, msg = self._validate_json_nested(v, path + "." + str(list(obj.keys())))
                 if not ok:
@@ -99,8 +101,8 @@ class BaseAdapter(ABC):
             args_val = tc.get("function", {}).get("arguments", "")
             if isinstance(args_val, str) and args_val.strip().startswith("{"):
                 try:
-                    json.loads(args_val, strict=False)
-                except json.JSONDecodeError as ae:
+                    JsonFixer().fix(args_val)
+                except ValueError as ae:
                     err_msg = str(ae)[:200]
                     logger.warning(f"{adapter_name} arguments validation failed: {err_msg}")
                     return False, err_msg
@@ -116,6 +118,9 @@ class BaseAdapter(ABC):
         is_openai_chunk = False
         is_tool_calls = False
         text_to_parse = full_text.strip()
+
+        # 清除空字节
+        text_to_parse = text_to_parse.replace('\x00', '')
 
         # 去掉 markdown 代码块
         if text_to_parse.startswith("```"):
@@ -140,11 +145,12 @@ class BaseAdapter(ABC):
         if first_char not in ('{', '[', '"'):
             return None, None, None, is_openai_chunk, is_tool_calls
 
-        # 尝试解析 JSON
+        # 尝试解析 JSON（使用 JsonFixer 一站式修复：markdown 去除、arguments 修复、转义层级、括号平衡、json_repair 兜底）
         try:
-            parsed = json.loads(text_to_parse, strict=False)
-        except json.JSONDecodeError as e:
-            pos = e.pos
+            parsed = JsonFixer().fix(text_to_parse)
+        except ValueError as e:
+            pos = getattr(e, 'pos', 0) or 0
+            msg = getattr(e, 'msg', str(e))
             snippet = text_to_parse[max(0, pos - 40):pos + 40]
             logger.warning(f"{adapter_name} JSON decode error at char {pos}: ...{snippet!r}...")
             try:
@@ -156,37 +162,8 @@ class BaseAdapter(ABC):
                     f.write(full_text)
             except Exception:
                 pass
-
-            # 尝试修复转义层级问题
-            repaired = False
-            for _ in range(5):
-                try:
-                    parsed = json.loads(text_to_parse, strict=False)
-                    repaired = True
-                    break
-                except json.JSONDecodeError:
-                    pass
-                try:
-                    fixed = text_to_parse.replace('\\\\\\\\', '\\\\').replace('\\\\"', '\\"').replace('\\\\n', '\\n').replace('\\\\t', '\\t').replace('\\\\/', '/')
-                    text_to_parse = fixed
-                except Exception:
-                    break
-
-            if not repaired:
-                brace_diff = text_to_parse.count("}") - text_to_parse.count("{")
-                if brace_diff > 0 and text_to_parse.rstrip().endswith("}"):
-                    stripped = text_to_parse.rstrip()
-                    while stripped.endswith("}") and stripped.count("}") > stripped.count("{"):
-                        stripped = stripped[:-1].rstrip()
-                        try:
-                            parsed = json.loads(stripped, strict=False)
-                            repaired = True
-                            break
-                        except json.JSONDecodeError:
-                            continue
-                if not repaired:
-                    logger.error(f"{adapter_name} JSON repair failed after escape fix, text={text_to_parse[:200]!r}")
-                    return None, None, None, is_openai_chunk, is_tool_calls
+            logger.error(f"{adapter_name} JSON repair failed: {msg}")
+            return None, None, None, is_openai_chunk, is_tool_calls
         except TypeError as e:
             logger.error(f"{adapter_name} JSON decode TypeError: {e}")
             return None, None, None, is_openai_chunk, is_tool_calls
@@ -319,6 +296,15 @@ class BaseAdapter(ABC):
         return f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
     # ═══════════════════════════════════════════════════════════════════════
+    # 公共工具方法：_strip_think_tags
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _strip_think_tags(self, text: str) -> str:
+        """去除 AI 回复中的 <think>...</think> 标签及其内容。"""
+        import re
+        return re.sub(r'<think>[\s\S]*?</think>', '', text).strip()
+
+    # ═══════════════════════════════════════════════════════════════════════
     # 公共工具方法：non_stream_chat
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -372,15 +358,19 @@ class BaseAdapter(ABC):
         full_text: str,
         suppress_text: bool,
         buffered_chunks: Optional[list],
-    ) -> tuple[str, bool, Optional[list], bool, Optional[bytes]]:
+        _think_buf: str = "",
+    ) -> tuple[str, bool, Optional[list], bool, Optional[bytes], str]:
         """
         处理一个 kind+value 增量。
-        返回: (new_full_text, new_suppress_text, new_buffered_chunks, should_return, return_value_or_None)
+        返回: (new_full_text, new_suppress_text, new_buffered_chunks, should_return, return_value_or_None, new_think_buf)
         """
         if kind == "error":
-            return full_text, suppress_text, buffered_chunks, True, self._format_error(str(value), model, chat_id)
+            return full_text, suppress_text, buffered_chunks, True, self._format_error(str(value), model, chat_id), _think_buf
 
         if kind == "chunk":
+            value = value.replace('\x00', '')
+            if not value:
+                return full_text, suppress_text, buffered_chunks, False, None, _think_buf
             full_text += value
             if not suppress_text:
                 ft = full_text.lstrip()
@@ -389,12 +379,65 @@ class BaseAdapter(ABC):
                     adapter_name = self.get_adapter_name()
                     logger.info(f"{adapter_name} suppress_text triggered: ft_start={ft[:100]!r}")
             if not suppress_text:
+                # 合并 _think_buf + value 做跨 chunk think 标签过滤
+                combined = _think_buf + value
+                cleaned, _think_buf = self._strip_think_tags_with_buf(combined)
                 if is_agent and buffered_chunks is not None:
-                    buffered_chunks.append(self._format_chunk(value, model, chat_id))
+                    if cleaned:
+                        buffered_chunks.append(self._format_chunk(cleaned, model, chat_id))
                 else:
-                    return full_text, suppress_text, buffered_chunks, True, self._format_chunk(value, model, chat_id)
+                    if cleaned:
+                        return full_text, suppress_text, buffered_chunks, True, self._format_chunk(cleaned, model, chat_id), _think_buf
+                    elif _think_buf:
+                        # 缓冲区有内容但不输出，等待闭合
+                        return full_text, suppress_text, buffered_chunks, False, None, _think_buf
+                    else:
+                        # 清空缓冲区（可能是空 chunk）
+                        return full_text, suppress_text, buffered_chunks, False, None, ""
 
-        return full_text, suppress_text, buffered_chunks, False, None
+        return full_text, suppress_text, buffered_chunks, False, None, _think_buf
+
+    def _strip_think_tags_with_buf(self, text: str) -> tuple[str, str]:
+        """
+        去除 think 标签，支持跨 chunk 的缓冲区。
+        返回: (cleaned_output, remaining_buf)
+        - 如果检测到完整的 ...`` 标签，直接去除并返回空 buf
+        - 如果检测到未闭合的 ``，将剩余内容暂存到 buf 中
+        - 如果 buf 中有残留的 `` 且当前文本包含闭合的 ``，则组合后去除
+        """
+        import re
+        OPEN_TAG = '<think>'
+        CLOSE_TAG = '</think>'
+
+        buf = ""
+        result = []
+
+        # 如果缓冲区有未闭合的 ``，先追加到当前文本开头
+        if buf:
+            text = buf + text
+
+        while text:
+            open_pos = text.find(OPEN_TAG)
+            if open_pos == -1:
+                # 没有更多 `` 了，剩余全部输出
+                result.append(text)
+                break
+
+            # 输出 `` 之前的内容
+            if open_pos > 0:
+                result.append(text[:open_pos])
+
+            # 找到闭合标签
+            close_pos = text.find(CLOSE_TAG, open_pos)
+            if close_pos == -1:
+                # 未闭合，将 `` 及之后内容暂存到缓冲区
+                buf = text[open_pos:]
+                break
+            else:
+                # 完整标签，跳过 ...`` 之间的内容
+                text = text[close_pos + len(CLOSE_TAG):]
+
+        return "".join(result), buf
 
     # ═══════════════════════════════════════════════════════════════════════
     # 公共工具方法：_validate_done_response（验证 done 后的响应是否合法）
@@ -421,33 +464,52 @@ class BaseAdapter(ABC):
         """
         adapter_name = self.get_adapter_name()
 
-        if not is_agent:
-            return False, "", None, full_text
+        if not is_agent and not suppress_text and tool_calls is None:
+            cleaned = self._strip_think_tags(full_text)
+            if cleaned != full_text:
+                logger.info(f"{adapter_name} stripped think tags from non-agent response")
+            return False, "", None, cleaned
 
-        # agent 非 tool_return 请求：允许普通文本回复
+        # agent 非 tool_return 请求：允许普通文本回复，但也验证嵌套 JSON
         if not is_tool_return and content is None and tool_calls is None:
             # suppress_text=True 时：chunks 未被 yield，需要把 full_text 作为 content 输出
             # suppress_text=False 时：chunks 已缓冲，由 _yield_final_response 从 buffered_chunks 输出
             if suppress_text:
-                return False, "", full_text, full_text
-            return False, "", None, full_text
+                # 先剥离 think 标签，再做 JSON 验证
+                cleaned = self._strip_think_tags(full_text)
+                ft = cleaned.strip()
+                if ft and ft[0] in ('{', '['):
+                    try:
+                        parsed = JsonFixer().fix(cleaned)
+                        ok, nested_err = self._validate_json_nested(parsed)
+                        if not ok:
+                            logger.warning(f"{adapter_name} nested JSON validation failed (non-tool-return): {nested_err}")
+                            return True, nested_err, None, cleaned
+                    except ValueError as e:
+                        logger.warning(f"{adapter_name} JSON parse failed in validate: {e}")
+                        return True, f"Invalid JSON: {e}", None, cleaned
+                    return False, "", cleaned, cleaned
+            # suppress_text=False: chunks 已缓冲，但 full_text 仍可能含 think 标签
+            cleaned = self._strip_think_tags(full_text)
+            return False, "", None, cleaned
 
         if content is None and tool_calls is None:
             if suppress_text:
-                # 先尝试 JSON 规范化
-                normalized = full_text
+                # 先剥离 think 标签，再尝试 JSON 规范化
+                cleaned = self._strip_think_tags(full_text)
+                normalized = cleaned
                 is_valid_json = False
                 try:
-                    normalized = json.dumps(json.loads(full_text, strict=False), ensure_ascii=False, indent=4)
+                    parsed = JsonFixer().fix(cleaned)
+                    normalized = json.dumps(parsed, ensure_ascii=False, indent=4)
                     is_valid_json = True
-                except Exception:
+                except ValueError:
                     pass
 
                 if is_valid_json:
                     # JSON 嵌套验证
                     try:
-                        validated = json.loads(normalized, strict=False)
-                        ok, nested_err = self._validate_json_nested(validated)
+                        ok, nested_err = self._validate_json_nested(parsed)
                         if not ok:
                             logger.warning(f"{adapter_name} nested JSON validation failed: {nested_err}")
                             return True, nested_err, None, normalized
@@ -458,10 +520,10 @@ class BaseAdapter(ABC):
                     # tool_return 响应：内容是 JSON 字符串且不是 OpenAI chunk/tool_calls 格式
                     if is_tool_return and not is_openai_chunk and not is_tool_calls:
                         # 尝试从 JSON 中提取 content 字段
-                        content_val = validated.get("content")
-                        if not content_val and isinstance(validated, dict):
+                        content_val = parsed.get("content")
+                        if not content_val and isinstance(parsed, dict):
                             # 搜索嵌套字段（如 import.content、choices[0].message.content）
-                            for key, val in validated.items():
+                            for key, val in parsed.items():
                                 if isinstance(val, dict) and "content" in val:
                                     content_val = val["content"]
                                     break
@@ -488,13 +550,35 @@ class BaseAdapter(ABC):
                     logger.warning(f"{adapter_name} agent request got non-JSON response (suppress_text=False)")
                     return True, "Non-JSON response from agent", None, full_text
                 else:
-                    return False, "", None, full_text
+                    # 非 JSON 内容：去除 think 标签
+                    cleaned = self._strip_think_tags(full_text)
+                    if cleaned != full_text:
+                        logger.info(f"{adapter_name} stripped think tags from non-JSON response")
+                    return False, "", None, cleaned
 
         # content/tool_calls 不为 None，验证 arguments
         if tool_calls:
             all_valid, args_err = self._validate_tool_calls_arguments(tool_calls)
             if not all_valid:
                 return True, f"arguments JSON invalid: {args_err}", None, full_text
+
+        # 对 content 中的 JSON 和 tool_calls.arguments 中的嵌套 JSON 进行深层验证
+        json_to_validate = None
+        if content and isinstance(content, str) and content.strip().startswith("{"):
+            try:
+                json_to_validate = JsonFixer().fix(content)
+            except Exception as e:
+                logger.warning(f"nested JSON validation failed: {e}")
+        if json_to_validate is None and suppress_text and full_text.strip().startswith("{"):
+            try:
+                json_to_validate = JsonFixer().fix(full_text)
+            except Exception as e:
+                logger.warning(f"nested JSON validation failed: {e}")
+        if json_to_validate is not None:
+            ok, nested_err = self._validate_json_nested(json_to_validate)
+            if not ok:
+                logger.warning(f"{adapter_name} nested JSON validation failed: {nested_err}")
+                return True, nested_err, None, full_text
 
         return False, "", None, full_text
 
@@ -543,3 +627,233 @@ class BaseAdapter(ABC):
             yield format_openai_chunk(None, model, chat_id, "", finish_reason="stop").encode()
 
         yield self._format_done()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 公共工具方法：_stream_chat_template（流式对话统一模板）
+    # ═══════════════════════════════════════════════════════════════════════
+    #
+    # 适配器只需覆盖以下 hook 方法即可实现差异化：
+    #   _get_lock()                      → 返回 asyncio.Lock
+    #   _prepare_messages(req, bc, agent) → 返回 (prompt_text, file_content)
+    #   _build_stream_kwargs(prompt, file_content, is_agent) → dict
+    #   _call_stream(**kwargs)            → AsyncGenerator[kind, value]
+    #   _on_session_id(value)             → 处理 session_id 事件
+    #   _delete_conversation()            → 删除当前对话
+    #   _handle_rate_limit()              → (doubao 专用) 限流处理
+    #   _on_error_yield(chat_id)          → (doubao 专用) 额外错误处理
+    #   _on_success(chat_id)              → (doubao 专用) 成功后回调
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _get_lock(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    async def _prepare_messages(self, request, browser_client, is_agent: bool):
+        """返回 (prompt_text, file_content)。file_content 非 agent 时为 None。"""
+        ...
+
+    def _build_stream_kwargs(self, prompt_text: str, file_content, is_agent: bool, current_prompt: str) -> dict:
+        """构建传给 _call_stream 的 kwargs。默认实现适合 mimo/zai/deepseek 风格。"""
+        kwargs = {"prompt": current_prompt}
+        extra = getattr(self, '_stream_extra_kwargs', {})
+        if extra:
+            kwargs.update(extra)
+        if is_agent and file_content:
+            kwargs["inline_file_content"] = file_content
+        return kwargs
+
+    @abstractmethod
+    async def _call_stream(self, **kwargs):
+        """调用浏览器客户端的流式方法，返回 AsyncGenerator[kind, value]。"""
+        ...
+
+    async def _on_session_id(self, value):
+        """处理流中收到的 session_id/conversation_id 事件。"""
+        pass
+
+    @abstractmethod
+    async def _delete_conversation(self):
+        """删除当前对话/会话。"""
+        ...
+
+    async def _handle_rate_limit(self, attempt: int, max_retries: int):
+        """处理限流。返回 True 表示已处理可继续重试，False 表示无法处理。"""
+        return False
+
+    async def _on_error_yield(self, chat_id: str):
+        """流错误 yield 后的额外处理。"""
+        pass
+
+    async def _on_success(self, chat_id: str):
+        """成功完成后的额外处理。"""
+        pass
+
+    async def _on_done_extra(self):
+        """done 处理完成后、_delete_conversation 前的额外处理（如 qianwen 重捕获 session_id）。"""
+        pass
+
+    async def _on_finally_extra(self):
+        """finally 块中 lock.release() 前的额外清理。"""
+        pass
+
+    def _session_id_kind(self) -> str:
+        """流事件中携带 session ID 的 kind 值。"""
+        return "session_id"
+
+    def _stream_error_no_delete(self) -> bool:
+        """流 error 事件后不删除对话（qianwen 用）。"""
+        return False
+
+    def _use_parse_error_history(self) -> bool:
+        """是否使用 parse_error_history 构建 retry prompt（qianwen 不用）。"""
+        return True
+
+    async def _stream_chat_template(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
+        from browser_client import browser_client
+        adapter_name = self.get_adapter_name()
+        logger.debug(f"{Colors.BOLD_GREEN}[{adapter_name}] -------------------new request---------------------{Colors.RESET}")
+        chat_id = self._generate_chat_id()
+        model = request.model
+        is_agent = self._is_agent_request(request)
+        max_retries = 6
+        use_peh = self._use_parse_error_history()
+        parse_error_history = [] if use_peh else None
+
+        lock = self._get_lock()
+        await lock.acquire()
+        try:
+            prompt_text, file_content = await self._prepare_messages(request, browser_client, is_agent)
+            is_tool_return = getattr(request.messages[-1], 'role', None) == 'tool' if (is_agent and request.messages) else False
+            self._last_is_tool_return = is_tool_return
+
+            for attempt in range(max_retries):
+                full_text = ""
+                suppress_text = False
+                buffered_chunks = [] if is_agent else None
+                think_buf = ""
+                got_rate_limit = False
+                parse_success = False
+                is_retry_break = False
+
+                if use_peh and parse_error_history is not None:
+                    current_prompt = self._build_retry_prompt(prompt_text, is_tool_return, parse_error_history)
+                    if parse_error_history:
+                        logger.info(f"{adapter_name} retry with parse error feedback: {parse_error_history[-1][0][:200]}")
+                else:
+                    current_prompt = prompt_text
+
+                stream_kwargs = self._build_stream_kwargs(prompt_text, file_content, is_agent, current_prompt)
+
+                logger.info(f"[{adapter_name} Adapter] {Colors.RED}Attempt {attempt+1}/{max_retries}{Colors.RESET}")
+
+                async for kind, value in self._call_stream(**stream_kwargs):
+                    if kind == "error":
+                        err_str = str(value).lower()
+                        if "rate" in err_str and "limit" in err_str:
+                            got_rate_limit = True
+                            logger.warning(f"{adapter_name} rate limited (attempt {attempt+1}/{max_retries})")
+                            await self._delete_conversation()
+                            break
+                        yield self._format_error(str(value), model, chat_id)
+                        if not self._stream_error_no_delete():
+                            await self._delete_conversation()
+                        await self._on_error_yield(chat_id)
+                        return
+
+                    if kind == self._session_id_kind():
+                        await self._on_session_id(value)
+                        continue
+
+                    processed = await self._handle_chunk_streaming(
+                        kind, value,
+                        model=model, chat_id=chat_id, is_agent=is_agent,
+                        full_text=full_text, suppress_text=suppress_text,
+                        buffered_chunks=buffered_chunks,
+                        _think_buf=think_buf,
+                    )
+                    full_text, suppress_text, buffered_chunks, should_return, return_value, think_buf = processed
+                    if should_return and return_value is not None:
+                        yield return_value
+                        if kind == "error":
+                            await self._delete_conversation()
+                            return
+
+                    if kind == "done":
+                        logger.debug(f"{adapter_name} done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview=\n{full_text[:2000]!r}")
+                        try:
+                            content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls = self._parse_response(full_text)
+                            logger.info(f"{adapter_name} done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}")
+
+                            should_retry, err_msg, tool_return_content, full_text = self._validate_done_response(
+                                content, tool_calls, finish_reason,
+                                is_openai_chunk, is_tool_calls,
+                                suppress_text, is_agent, is_tool_return, full_text
+                            )
+
+                            if tool_return_content is not None:
+                                content = tool_return_content
+                                finish_reason = "stop"
+                                logger.info(f"{adapter_name} tool_return response: {tool_return_content[:2000]}")
+                                parse_success = True
+                            elif should_retry:
+                                if use_peh and parse_error_history is not None:
+                                    parse_error_history.append((err_msg, full_text))
+                                if attempt < max_retries - 1:
+                                    logger.info(f"{adapter_name} retrying (attempt {attempt+1}/{max_retries}): {err_msg[:200]}")
+                                    await asyncio.sleep(5)
+                                    await self._delete_conversation()
+                                    is_retry_break = True
+                                    break
+                                else:
+                                    logger.error(f"{adapter_name} parse failed after {max_retries} attempts")
+                                    yield self._format_error("服务器内部错误！", model, chat_id)
+                                    await self._delete_conversation()
+                                    return
+                            else:
+                                parse_success = True
+
+                            if parse_success:
+                                async for chunk in self._yield_final_response(
+                                    content, tool_calls, finish_reason,
+                                    suppress_text, is_agent, buffered_chunks, full_text,
+                                    model, chat_id, is_openai_chunk, is_tool_calls
+                                ):
+                                    yield chunk
+                                await self._on_success(chat_id)
+                                await self._on_done_extra()
+                                await self._delete_conversation()
+                                return
+                        except Exception as e:
+                            logger.error(f"{adapter_name} done handler error: {e}")
+                            err_msg = str(e)[:200]
+                            if use_peh and parse_error_history is not None:
+                                parse_error_history.append((err_msg, full_text))
+                            if attempt < max_retries - 1:
+                                logger.info(f"{adapter_name} retrying after done handler error: {err_msg}")
+                                await self._delete_conversation()
+                                is_retry_break = True
+                                break
+                            else:
+                                yield self._format_error("服务器内部错误！", model, chat_id)
+                                await self._delete_conversation()
+                                return
+
+                if got_rate_limit:
+                    handled = await self._handle_rate_limit(attempt, max_retries)
+                    if handled:
+                        continue
+                    if attempt < max_retries - 1:
+                        continue
+                    break
+
+                if attempt < max_retries - 1 and not parse_success:
+                    continue
+                break
+
+            yield self._format_error("已进行多次重试！", model, chat_id)
+        except Exception as e:
+            logger.error(f"[{adapter_name}] stream_chat error: {e}")
+            yield self._format_error(str(e), model, chat_id)
+        finally:
+            await self._on_finally_extra()
+            lock.release()
