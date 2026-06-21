@@ -75,6 +75,7 @@ class BaseAdapter(ABC):
                     val = obj[key]
                     if isinstance(val, str) and val.strip().startswith("{"):
                         try:
+                            # logger.debug(f"----------------1")
                             JsonFixer().fix(val)
                         except ValueError as e:
                             logger.warning(f"{adapter_name} nested JSON validation failed: {path}[{key}]: {e}")
@@ -101,6 +102,7 @@ class BaseAdapter(ABC):
             args_val = tc.get("function", {}).get("arguments", "")
             if isinstance(args_val, str) and args_val.strip().startswith("{"):
                 try:
+                    # logger.debug(f"----------------2")
                     JsonFixer().fix(args_val)
                 except ValueError as ae:
                     err_msg = str(ae)[:200]
@@ -147,6 +149,7 @@ class BaseAdapter(ABC):
 
         # 尝试解析 JSON（使用 JsonFixer 一站式修复：markdown 去除、arguments 修复、转义层级、括号平衡、json_repair 兜底）
         try:
+            # logger.debug(f"----------------3")
             parsed = JsonFixer().fix(text_to_parse)
         except ValueError as e:
             pos = getattr(e, 'pos', 0) or 0
@@ -480,6 +483,7 @@ class BaseAdapter(ABC):
                 ft = cleaned.strip()
                 if ft and ft[0] in ('{', '['):
                     try:
+                        # logger.debug(f"----------------4")
                         parsed = JsonFixer().fix(cleaned)
                         ok, nested_err = self._validate_json_nested(parsed)
                         if not ok:
@@ -500,6 +504,7 @@ class BaseAdapter(ABC):
                 normalized = cleaned
                 is_valid_json = False
                 try:
+                    # logger.debug(f"----------------5")
                     parsed = JsonFixer().fix(cleaned)
                     normalized = json.dumps(parsed, ensure_ascii=False, indent=4)
                     is_valid_json = True
@@ -566,11 +571,13 @@ class BaseAdapter(ABC):
         json_to_validate = None
         if content and isinstance(content, str) and content.strip().startswith("{"):
             try:
+                # logger.debug(f"----------------6")
                 json_to_validate = JsonFixer().fix(content)
             except Exception as e:
                 logger.warning(f"nested JSON validation failed: {e}")
         if json_to_validate is None and suppress_text and full_text.strip().startswith("{"):
             try:
+                # logger.debug(f"----------------7")
                 json_to_validate = JsonFixer().fix(full_text)
             except Exception as e:
                 logger.warning(f"nested JSON validation failed: {e}")
@@ -789,6 +796,7 @@ class BaseAdapter(ABC):
                                 is_openai_chunk, is_tool_calls,
                                 suppress_text, is_agent, is_tool_return, full_text
                             )
+                            logger.debug(f"{adapter_name} done: should_retry={should_retry}, err_msg={err_msg!r}, tool_return_content={tool_return_content!r}")
 
                             if tool_return_content is not None:
                                 content = tool_return_content
