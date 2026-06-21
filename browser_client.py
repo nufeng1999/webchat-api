@@ -1203,6 +1203,189 @@ class BrowserClient:
             )
             self._deepseek_page = self._deepseek_browser.pages[0] if self._deepseek_browser.pages else await self._deepseek_browser.new_page()
             await self._deepseek_page.expose_function("__sse_push", self._on_deepseek_push)
+            await self._deepseek_page.add_init_script("""
+            // DeepSeek fetch interceptor — intercepts chat/completion and file upload APIs
+            if (!window.__ds_fetch_patched) {
+                window.__ds_fetch_patched = true;
+                const origFetch = window.fetch;
+                const origXHROpen = XMLHttpRequest.prototype.open;
+                const origXHRSend = XMLHttpRequest.prototype.send;
+                
+                // Patch fetch
+                window.fetch = async function(input, init) {
+                    const url = typeof input === 'string' ? input : (input?.url || '');
+                    const method = (init || {}).method || 'GET';
+                    const body = (init || {}).body || '';
+                    
+                    if (url.includes('/api/v0/chat/completion')) {
+                        try {
+                            // Capture auth token
+                            const headers = (init || {}).headers || {};
+                            const authHeader = headers['Authorization'] || headers['authorization'] || '';
+                            if (authHeader) {
+                                window.__deepseek_auth_token = authHeader.replace('Bearer ', '').replace(/'/g, "\\\\'");
+                            }
+                            
+                            // Read params from window
+                            const params = window.__deepseek_request_params || {};
+                            let bodyDict = {};
+                            if (body) {
+                                try { bodyDict = JSON.parse(body); } catch(e) {}
+                            }
+                            
+                            if (params.model_type) bodyDict.model_type = params.model_type;
+                            if (params.thinking_enabled !== undefined) bodyDict.thinking_enabled = params.thinking_enabled;
+                            if (params.search_enabled !== undefined) bodyDict.search_enabled = params.search_enabled;
+                            if (params.ref_file_ids) bodyDict.ref_file_ids = params.ref_file_ids;
+                            
+                            const modifiedBody = JSON.stringify(bodyDict);
+                            
+                            // Forward request
+                            const resp = await origFetch.call(this, input, {...init, body: modifiedBody});
+                            const cloned = resp.clone();
+                            const streamId = params.stream_id || '';
+                            
+                            // Read SSE stream
+                            (async () => {
+                                try {
+                                    const reader = cloned.body.getReader();
+                                    const decoder = new TextDecoder();
+                                    let buf = '';
+                                    
+                                    while (true) {
+                                        const {value, done} = await reader.read();
+                                        if (done) {
+                                            // 不在这里 push done，由 Python 端 event:close 触发
+                                            break;
+                                        }
+                                        
+                                        buf += decoder.decode(value, {stream: true});
+                                        const blocks = buf.split('\\n\\n');
+                                        buf = blocks.pop() || '';
+                                        
+                                        for (const block of blocks) {
+                                            const trimmed = block.trim();
+                                            if (trimmed && window.__sse_push) {
+                                                window.__sse_push(streamId, 'raw_sse', trimmed);
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Flush remaining buffer
+                                    if (buf.trim() && window.__sse_push) {
+                                        window.__sse_push(streamId, 'raw_sse', buf.trim());
+                                    }
+                                } catch(e) {
+                                    console.error('[ds-sse-read]', e);
+                                    if (window.__sse_push) {
+                                        window.__sse_push(streamId, 'error', String(e));
+                                        window.__sse_push(streamId, 'done', '');
+                                    }
+                                }
+                            })();
+                            
+                            return resp;
+                        } catch(e) {
+                            console.error('[ds-fetch-intercept]', e);
+                            return origFetch.apply(this, [input, init]);
+                        }
+                    }
+                    
+                    if (url.includes('/api/v0/file/upload_file')) {
+                        try {
+                            const resp = await origFetch.call(this, input, init);
+                            const cloned = resp.clone();
+                            const streamId = (window.__deepseek_request_params || {}).stream_id || '';
+                            
+                            (async () => {
+                                try {
+                                    const text = await cloned.text();
+                                    if (window.__sse_push) {
+                                        window.__sse_push(streamId, 'upload_response', text);
+                                    }
+                                } catch(e) {}
+                            })();
+                            
+                            return resp;
+                        } catch(e) {
+                            return origFetch.apply(this, [input, init]);
+                        }
+                    }
+                    
+                    return origFetch.apply(this, [input, init]);
+                };
+                
+                // Patch XMLHttpRequest for upload
+                XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                    this.__ds_xhr_url = url;
+                    this.__ds_xhr_method = method;
+                    return origXHROpen.apply(this, [method, url, ...rest]);
+                };
+                
+                XMLHttpRequest.prototype.send = function(body) {
+                    const url = this.__ds_xhr_url || '';
+                    if (url.includes('/api/v0/chat/completion')) {
+                        try {
+                            const params = window.__deepseek_request_params || {};
+                            let bodyDict = {};
+                            if (body) {
+                                try { bodyDict = JSON.parse(body); } catch(e) {}
+                            }
+                            
+                            if (params.model_type) bodyDict.model_type = params.model_type;
+                            if (params.thinking_enabled !== undefined) bodyDict.thinking_enabled = params.thinking_enabled;
+                            if (params.search_enabled !== undefined) bodyDict.search_enabled = params.search_enabled;
+                            if (params.ref_file_ids) bodyDict.ref_file_ids = params.ref_file_ids;
+                            
+                            body = JSON.stringify(bodyDict);
+                            
+                            // Capture auth token
+                            const headers = this.getAllResponseHeaders() || '';
+                            const authHeader = headers.match(/authorization:\\s*(.+)/i);
+                            if (authHeader) {
+                                window.__deepseek_auth_token = authHeader[1].replace('Bearer ', '').replace(/'/g, "\\\\'");
+                            }
+                            
+                            const streamId = params.stream_id || '';
+                            
+                            let __xhr_lastLen2 = 0;
+                            this.addEventListener('readystatechange', function() {
+                                if (this.readyState === 3) {
+                                    try {
+                                        const partialText = this.responseText || '';
+                                        if (partialText.length > __xhr_lastLen2) {
+                                            const newPart = partialText.substring(__xhr_lastLen2);
+                                            __xhr_lastLen2 = partialText.length;
+                                            const blocks = newPart.split('\\n\\n');
+                                            blocks.pop();
+                                            for (const block of blocks) {
+                                                const trimmed = block.trim();
+                                                if (trimmed && window.__sse_push) {
+                                                    window.__sse_push(streamId, 'raw_sse', trimmed);
+                                                }
+                                            }
+                                        }
+                                    } catch(e) {}
+                                }
+                                if (this.readyState === 4) {
+                                    try {
+                                        const fullText = this.responseText || '';
+                                        if (fullText.length > __xhr_lastLen2) {
+                                            const remaining = fullText.substring(__xhr_lastLen2).trim();
+                                            if (remaining && window.__sse_push) {
+                                                window.__sse_push(streamId, 'raw_sse', remaining);
+                                            }
+                                        }
+                                        // 不在这里 push done，由 Python 端 event:close 触发
+                                    } catch(e) {}
+                                }
+                            });
+                        } catch(e) {}
+                    }
+                    return origXHRSend.apply(this, [body]);
+                };
+            }
+            """)
 
             logger.info("DeepSeek: navigating to chat.deepseek.com/...")
             await self._deepseek_page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=60000)
@@ -1291,7 +1474,184 @@ class BrowserClient:
             )
             self._deepseek_page = self._deepseek_browser.pages[0] if self._deepseek_browser.pages else await self._deepseek_browser.new_page()
             await self._deepseek_page.expose_function("__sse_push", self._on_deepseek_push)
-            await self._deepseek_page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=60000)
+            await self._deepseek_page.add_init_script("""
+            if (!window.__ds_fetch_patched) {
+                window.__ds_fetch_patched = true;
+                const origFetch = window.fetch;
+                const origXHROpen = XMLHttpRequest.prototype.open;
+                const origXHRSend = XMLHttpRequest.prototype.send;
+                
+                window.fetch = async function(input, init) {
+                    const url = typeof input === 'string' ? input : (input?.url || '');
+                    const method = (init || {}).method || 'GET';
+                    const body = (init || {}).body || '';
+                    
+                    if (url.includes('/api/v0/chat/completion')) {
+                        try {
+                            const headers = (init || {}).headers || {};
+                            const authHeader = headers['Authorization'] || headers['authorization'] || '';
+                            if (authHeader) {
+                                window.__deepseek_auth_token = authHeader.replace('Bearer ', '').replace(/'/g, "\\\\'");
+                            }
+                            
+                            const params = window.__deepseek_request_params || {};
+                            let bodyDict = {};
+                            if (body) {
+                                try { bodyDict = JSON.parse(body); } catch(e) {}
+                            }
+                            
+                            if (params.model_type) bodyDict.model_type = params.model_type;
+                            if (params.thinking_enabled !== undefined) bodyDict.thinking_enabled = params.thinking_enabled;
+                            if (params.search_enabled !== undefined) bodyDict.search_enabled = params.search_enabled;
+                            if (params.ref_file_ids) bodyDict.ref_file_ids = params.ref_file_ids;
+                            
+                            const modifiedBody = JSON.stringify(bodyDict);
+                            
+                            const resp = await origFetch.call(this, input, {...init, body: modifiedBody});
+                            const cloned = resp.clone();
+                            const streamId = params.stream_id || '';
+                            
+                            (async () => {
+                                try {
+                                    const reader = cloned.body.getReader();
+                                    const decoder = new TextDecoder();
+                                    let buf = '';
+                                    
+                                    while (true) {
+                                        const {value, done} = await reader.read();
+                                        if (done) {
+                                            // 不在这里 push done，由 Python 端 event:close 触发
+                                            break;
+                                        }
+                                        
+                                        buf += decoder.decode(value, {stream: true});
+                                        const blocks = buf.split('\\n\\n');
+                                        buf = blocks.pop() || '';
+                                        
+                                        for (const block of blocks) {
+                                            const trimmed = block.trim();
+                                            if (trimmed && window.__sse_push) {
+                                                window.__sse_push(streamId, 'raw_sse', trimmed);
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (buf.trim() && window.__sse_push) {
+                                        window.__sse_push(streamId, 'raw_sse', buf.trim());
+                                    }
+                                } catch(e) {
+                                    console.error('[ds-sse-read]', e);
+                                    if (window.__sse_push) {
+                                        window.__sse_push(streamId, 'error', String(e));
+                                        window.__sse_push(streamId, 'done', '');
+                                    }
+                                }
+                            })();
+                            
+                            return resp;
+                        } catch(e) {
+                            console.error('[ds-fetch-intercept]', e);
+                            return origFetch.apply(this, [input, init]);
+                        }
+                    }
+                    
+                    if (url.includes('/api/v0/file/upload_file')) {
+                        try {
+                            const resp = await origFetch.call(this, input, init);
+                            const cloned = resp.clone();
+                            const streamId = (window.__deepseek_request_params || {}).stream_id || '';
+                            
+                            (async () => {
+                                try {
+                                    const text = await cloned.text();
+                                    if (window.__sse_push) {
+                                        window.__sse_push(streamId, 'upload_response', text);
+                                    }
+                                } catch(e) {}
+                            })();
+                            
+                            return resp;
+                        } catch(e) {
+                            return origFetch.apply(this, [input, init]);
+                        }
+                    }
+                    
+                    return origFetch.apply(this, [input, init]);
+                };
+                
+                XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                    this.__ds_xhr_url = url;
+                    this.__ds_xhr_method = method;
+                    return origXHROpen.apply(this, [method, url, ...rest]);
+                };
+                
+                XMLHttpRequest.prototype.send = function(body) {
+                    const url = this.__ds_xhr_url || '';
+                    if (url.includes('/api/v0/chat/completion')) {
+                        try {
+                            const params = window.__deepseek_request_params || {};
+                            let bodyDict = {};
+                            if (body) {
+                                try { bodyDict = JSON.parse(body); } catch(e) {}
+                            }
+                            
+                            if (params.model_type) bodyDict.model_type = params.model_type;
+                            if (params.thinking_enabled !== undefined) bodyDict.thinking_enabled = params.thinking_enabled;
+                            if (params.search_enabled !== undefined) bodyDict.search_enabled = params.search_enabled;
+                            if (params.ref_file_ids) bodyDict.ref_file_ids = params.ref_file_ids;
+                            
+                            body = JSON.stringify(bodyDict);
+                            
+                            // Capture auth token from response headers via intercepted response
+                            let __xhr_lastLen = 0;
+                            this.addEventListener('readystatechange', function() {
+                                if (this.readyState === 2) { // HEADERS_RECEIVED
+                                    try {
+                                        const authHeader = this.getResponseHeader('Authorization');
+                                        if (authHeader) {
+                                            window.__deepseek_auth_token = authHeader.replace('Bearer ', '').replace(/'/g, "\\\\'");
+                                        }
+                                    } catch(e) {}
+                                }
+                                if (this.readyState === 3) { // LOADING
+                                    try {
+                                        const partialText = this.responseText || '';
+                                        if (partialText.length > __xhr_lastLen) {
+                                            const newPart = partialText.substring(__xhr_lastLen);
+                                            __xhr_lastLen = partialText.length;
+                                            const blocks = newPart.split('\\n\\n');
+                                            blocks.pop(); // last element may be incomplete
+                                            for (const block of blocks) {
+                                                const trimmed = block.trim();
+                                                if (trimmed && window.__sse_push) {
+                                                    window.__sse_push(params.stream_id || '', 'raw_sse', trimmed);
+                                                }
+                                            }
+                                        }
+                                    } catch(e) {}
+                                }
+                                if (this.readyState === 4) { // DONE
+                                    try {
+                                        // Flush remaining buffer
+                                        const fullText = this.responseText || '';
+                                        if (fullText.length > __xhr_lastLen) {
+                                            const remaining = fullText.substring(__xhr_lastLen).trim();
+                                            if (remaining && window.__sse_push) {
+                                                window.__sse_push(params.stream_id || '', 'raw_sse', remaining);
+                                            }
+                                        }
+                                        // 不在这里 push done，由 Python 端 event:close 触发
+                                    } catch(e) {}
+                                }
+                            });
+                        } catch(e) {}
+                    }
+                    return origXHRSend.apply(this, [body]);
+                };
+            }
+            """)
+
+            logger.info("DeepSeek: navigating to chat.deepseek.com/...")
             await asyncio.sleep(3)
 
             logger.info("DeepSeek: login recovery completed, browser ready")
@@ -1303,7 +1663,68 @@ class BrowserClient:
         q = self._deepseek_queues.get(stream_id)
         if q is None:
             return
-        q.put_nowait((kind, value))
+        if kind == "raw_sse":
+            self._parse_deepseek_sse_block(q, value)
+        elif kind == "done":
+            q.put_nowait(("done", ""))
+        else:
+            q.put_nowait((kind, value))
+
+    def _parse_deepseek_sse_block(self, q: asyncio.Queue, block: str):
+        """解析原始 SSE 块，可能包含多个 SSE 事件，按 \\n\\n 分割后逐个处理。"""
+        # 一个 raw_sse block 可能包含多个 SSE 事件
+        sub_events = block.split("\n\n")
+        for sub in sub_events:
+            sub = sub.strip()
+            if not sub:
+                continue
+            event_type = ""
+            data_lines = []
+            for line in sub.split("\n"):
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:].strip())
+            data_str = "\n".join(data_lines)
+
+            if event_type == "close":
+                q.put_nowait(("done", ""))
+                return
+
+            if not data_str:
+                continue
+
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            # 1. v.response.fragments（初始化 fragment）
+            if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
+                resp_data = data["v"]["response"]
+                fragments = resp_data.get("fragments", [])
+                for frag in fragments:
+                    if frag.get("type") == "RESPONSE":
+                        content = frag.get("content", "")
+                        if content:
+                            q.put_nowait(("chunk", content))
+
+            # 2. APPEND patch（追加内容到 fragment）
+            if "p" in data and "o" in data and "v" in data and data["o"] == "APPEND":
+                p = data["p"]
+                val = data["v"]
+                if p == "response/fragments/-1/content" and isinstance(val, str):
+                    q.put_nowait(("chunk", val))
+                elif p == "response/fragments" and isinstance(val, list):
+                    for frag in val:
+                        if frag.get("type") == "RESPONSE":
+                            content = frag.get("content", "")
+                            if content:
+                                q.put_nowait(("chunk", content))
+
+            # 3. 裸 v 字符串
+            if "v" in data and isinstance(data["v"], str) and "p" not in data and data["v"]:
+                q.put_nowait(("chunk", data["v"]))
 
     async def stream_deepseek_chat(self, prompt: str, model_type: str = "default", thinking_enabled: bool = False, search_enabled: bool = True, inline_file_content: str | None = None):
         """Route interception for deepseek chat API, convert custom SSE to OpenAI SSE chunks."""
@@ -1316,52 +1737,217 @@ class BrowserClient:
         session_id = ""
 
         async def ensure_deepseek_model_selected():
+            """DeepSeek 页面模型匹配：先检测当前模型，不匹配则打开模型选择器并切换到目标模型。"""
             try:
                 page = self._deepseek_page
                 if not page:
                     return False
 
-                current_model = await page.evaluate("""() => {
-                    const text = document.body ? (document.body.innerText || '') : '';
-                    if (text.includes('DeepSeek-R1') || text.includes('深度思考')) return 'expert';
-                    if (text.includes('DeepSeek-VL') || text.includes('识图')) return 'vision';
-                    return 'default';
+                # 诊断：记录页面顶部所有按钮和可交互元素
+                try:
+                    buttons_info = await page.evaluate("""() => {
+                        const results = [];
+                        const btns = document.querySelectorAll('button, [role="button"], [role="combobox"], [aria-haspopup], a[class*="model"], div[class*="model"], span[class*="model"]');
+                        for (const el of btns) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.top > 100) continue; // 只看顶部区域
+                            if (rect.width <= 0 || rect.height <= 0) continue;
+                            const txt = (el.textContent || '').trim().substring(0, 60);
+                            const cls = (el.className || '').substring(0, 80);
+                            const tag = el.tagName;
+                            const role = el.getAttribute('role') || '';
+                            const ariaLabel = el.getAttribute('aria-label') || '';
+                            if (txt || cls || role || ariaLabel) {
+                                results.push({ tag, txt, cls: cls.substring(0, 60), role, ariaLabel, top: Math.round(rect.top), h: Math.round(rect.height) });
+                            }
+                        }
+                        return results.slice(0, 30);
+                    }""")
+                except Exception as e:
+                    logger.debug(f"[DeepSeek] button scan failed: {e}")
+
+                # 1. 读取当前选中的模型 - 使用多种定位策略
+                current = await page.evaluate("""() => {
+                    const selectors = [
+                        'button[class*="model"]',
+                        'button[class*="Model"]',
+                        '[aria-label*="model"]',
+                        '[aria-label*="Model"]',
+                        '[data-testid*="model"]',
+                        '.model-selector',
+                        '.model-select',
+                        '[class*="model-select"]',
+                        '[class*="ModelSelect"]',
+                        '[class*="modelSelect"]',
+                        '[role="combobox"]',
+                        '[aria-haspopup="listbox"]',
+                        '[aria-haspopup="menu"]',
+                        'nav button',
+                        'header button',
+                        '[class*="header"] button',
+                        '[class*="topbar"] button',
+                        '[class*="navbar"] button',
+                    ];
+
+                    for (const sel of selectors) {
+                        try {
+                            const el = document.querySelector(sel);
+                            if (el) {
+                                const txt = (el.textContent || el.innerText || '').trim();
+                                const rect = el.getBoundingClientRect();
+                                if (txt && rect.width > 0 && rect.height > 0 && rect.height < 60 && txt.length < 60) {
+                                    return { text: txt, class: el.className || '', tag: el.tagName, selector: sel };
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    return null;
                 }""")
-                logger.info(f"[DeepSeek] current page model={current_model}, target={model_type}")
-                if current_model == model_type:
+
+                if not current:
+                    # DeepSeek 模型通过 API body 的 model_type 参数控制，没有独立的 UI 选择器
+                    # 直接返回 True，由 handle_route 拦截器注入正确的 model_type
                     return True
 
-                switched = await page.evaluate(f"""() => {{
-                    const target = {json.dumps(model_type)};
-                    const textMatchers = target === 'expert'
-                        ? ['DeepSeek-R1', 'R1', '深度思考', '专家']
-                        : target === 'vision'
-                            ? ['DeepSeek-VL', 'VL', '识图', '视觉']
-                            : ['DeepSeek-V3', 'V3', '默认', '普通'];
+                current_text = current['text']
+                logger.info(f"[DeepSeek] Current model selector text: '{current_text}' (selector: {current.get('selector', 'unknown')})")
 
-                    const clickable = Array.from(document.querySelectorAll('button, [role="button"], div, span'))
-                        .filter(el => {
-                            const text = (el.innerText || el.textContent || '').trim();
+                # 2. 判断当前模型是否匹配目标
+                def text_to_model_type(txt):
+                    txt_lower = txt.lower()
+                    if 'r1' in txt_lower or 'expert' in txt_lower or '深度思考' in txt or '专家' in txt:
+                        return 'expert'
+                    elif 'vl' in txt_lower or 'vision' in txt_lower or '识图' in txt or '视觉' in txt:
+                        return 'vision'
+                    else:
+                        return 'default'
+
+                current_type = text_to_model_type(current_text)
+                logger.info(f"[DeepSeek] Parsed current model_type={current_type}, target={model_type}")
+
+                if current_type == model_type:
+                    logger.info(f"[DeepSeek] Model already matches: {current_text}")
+                    return True
+
+                # 3. 打开模型选择器
+                logger.info(f"[DeepSeek] Opening model selector to switch to {model_type}")
+                open_result = await page.evaluate("""() => {
+                    const selectors = [
+                        'button[class*="model"]',
+                        'button[class*="Model"]',
+                        '[aria-label*="model"]',
+                        '[aria-label*="Model"]',
+                        '[data-testid*="model"]',
+                        '.model-selector',
+                        '.model-select',
+                        '[class*="model-select"]',
+                        '[class*="ModelSelect"]',
+                        'nav button',
+                        'header button',
+                        '[class*="header"] button',
+                        '[class*="topbar"] button',
+                        '[class*="navbar"] button',
+                    ];
+
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const txt = (el.textContent || el.innerText || '').trim();
                             const rect = el.getBoundingClientRect();
-                            if (!text || rect.width <= 0 || rect.height <= 0) return false;
-                            return textMatchers.some(t => text.includes(t));
-                        });
-
-                    for (const el of clickable) {
-                        try {
-                            el.click();
-                            return true;
-                        } catch {}
+                            if (txt && rect.width > 0 && rect.height > 0 && rect.height < 50 && txt.length < 50) {
+                                el.click();
+                                return true;
+                            }
+                        }
                     }
                     return false;
-                }}""")
+                }""")
 
-                if not switched:
-                    logger.warning(f"[DeepSeek] failed to switch page model to {model_type}")
+                if not open_result:
+                    logger.warning("[DeepSeek] Failed to open model selector")
                     return False
 
                 await asyncio.sleep(1.5)
-                return True
+
+                # 4. 在模型下拉面板中查找并点击目标模型
+                target_keywords = {
+                    'expert': ['R1', '深度思考', '专家', 'Expert', 'DeepSeek-R1'],
+                    'vision': ['VL', '识图', '视觉', 'Vision', 'DeepSeek-VL'],
+                    'default': ['V3', '默认', '普通', 'Default', 'Fast', 'DeepSeek-V3'],
+                }
+                keywords = target_keywords.get(model_type, [])
+
+                clicked = await page.evaluate(f"""() => {{
+                    const keywords = {json.dumps(keywords)};
+
+                    // 策略1: 查找下拉面板中的选项
+                    const dropdownSelectors = [
+                        '[class*="dropdown"]', '[class*="Dropdown"]',
+                        '[class*="popover"]', '[class*="Popover"]',
+                        '[class*="menu"]', '[class*="Menu"]',
+                        '[role="menu"]', '[role="listbox"]',
+                        '[class*="popup"]', '[class*="Popup"]',
+                    ];
+
+                    let panel = null;
+                    for (const sel of dropdownSelectors) {{
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {{
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 200 && rect.height > 50) {{
+                                panel = el;
+                                break;
+                            }}
+                        }}
+                        if (panel) break;
+                    }}
+
+                    const options = panel
+                        ? panel.querySelectorAll('[role="option"], button, div[class*="cursor-pointer"]')
+                        : document.querySelectorAll('[role="option"], button, div[class*="cursor-pointer"]');
+
+                    for (const opt of options) {{
+                        const txt = (opt.textContent || opt.innerText || '').trim();
+                        const rect = opt.getBoundingClientRect();
+                        if (!txt || rect.width <= 0 || rect.height <= 0) continue;
+                        if (txt.length > 50) continue;
+
+                        for (const kw of keywords) {{
+                            if (txt.includes(kw)) {{
+                                opt.click();
+                                return txt;
+                            }}
+                        }}
+                    }}
+
+                    // 策略2: 查找 body 中所有可见的、包含关键词的可点击元素
+                    const allBtns = document.querySelectorAll('button, [role="button"], div, span');
+                    for (const btn of allBtns) {{
+                        const txt = (btn.textContent || btn.innerText || '').trim();
+                        const rect = btn.getBoundingClientRect();
+                        if (!txt || rect.width <= 0 || rect.height <= 0) continue;
+                        if (txt.length > 50) continue;
+
+                        for (const kw of keywords) {{
+                            if (txt.includes(kw)) {{
+                                btn.click();
+                                return txt;
+                            }}
+                        }}
+                    }}
+
+                    return null;
+                }}""")
+
+                if clicked:
+                    logger.info(f"[DeepSeek] Model switched to: {clicked}")
+                    await asyncio.sleep(1)
+                    return True
+                else:
+                    logger.warning(f"[DeepSeek] Target model with keywords {keywords} not found in selector")
+                    await page.keyboard.press("Escape")
+                    return False
+
             except Exception as e:
                 logger.warning(f"[DeepSeek] ensure model selected failed: {e}")
                 return False
@@ -1494,132 +2080,17 @@ class BrowserClient:
             except asyncio.TimeoutError:
                 logger.warning("[DeepSeek] file upload timeout")
 
-        async def handle_route(route):
-            request = route.request
-            if 'chat.deepseek.com/api/v0/chat/completion' not in request.url:
-                await route.continue_()
-                return
+        # 不拦截 completion 请求，SSE 完全由 JS fetch 拦截器处理
+        # 只用 request 事件捕获 auth token
+        def on_auth_capture(request):
+            if 'chat.deepseek.com/api/v0/chat/completion' in request.url:
+                auth = request.headers.get('authorization', '')
+                if auth:
+                    token_value = auth.replace('Bearer ', '').replace('\\', '\\\\').replace("'", "\\'")
+                    asyncio.ensure_future(self._deepseek_page.evaluate(f"window.__deepseek_auth_token = '{token_value}';"))
+                    logger.info(f"[DeepSeek] auth token captured from request")
 
-            logger.info(f"[DeepSeek] Intercepting completion request")
-            try:
-                # Capture Bearer token for later use in delete API
-                auth_header = request.headers.get('authorization', '')
-                if auth_header:
-                    token_value = auth_header.replace('Bearer ', '').replace('\\', '\\\\').replace("'", "\\'")
-                    await self._deepseek_page.evaluate(f"window.__deepseek_auth_token = '{token_value}';")
-
-                orig_body = request.post_data or ""
-                body_dict = json.loads(orig_body) if orig_body else {}
-
-                if 'model_type' not in body_dict:
-                    body_dict['model_type'] = model_type
-                if 'thinking_enabled' not in body_dict:
-                    body_dict['thinking_enabled'] = thinking_enabled
-                if 'search_enabled' not in body_dict:
-                    body_dict['search_enabled'] = search_enabled
-
-                # 注入上传的文件ID
-                if uploaded_file_id:
-                    body_dict['ref_file_ids'] = [uploaded_file_id]
-                    logger.info(f"[DeepSeek] injected ref_file_ids={uploaded_file_id}")
-
-                modified_body = json.dumps(body_dict, ensure_ascii=False)
-
-                resp = await route.fetch(timeout=180000, post_data=modified_body)
-                raw_text = await resp.text()
-                logger.info(f"[DeepSeek] API responded: {len(raw_text)} bytes")
-
-                full_content = ""
-                last_fragment_type = None  # 跟踪最后一个 fragment 的类型（"THINK" 或 "RESPONSE"）
-
-                for block in raw_text.split("\n\n"):
-                    block = block.strip()
-                    if not block:
-                        continue
-
-                    event_type = ""
-                    data_str = ""
-                    for line in block.split("\n"):
-                        if line.startswith("event:"):
-                            event_type = line[6:].strip()
-                        elif line.startswith("data:"):
-                            data_str = line[5:].strip()
-
-                    if not data_str:
-                        continue
-
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if event_type == "close":
-                        logger.info(f"[DeepSeek] close event")
-                        q.put_nowait(("done", ""))
-                        await route.fulfill(response=resp)
-                        return
-
-                    # 1. 处理 v.response.fragments（包含 THINK 或 RESPONSE fragment 的初始化）
-                    if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
-                        resp_data = data["v"]["response"]
-                        fragments = resp_data.get("fragments", [])
-                        for frag in fragments:
-                            ftype = frag.get("type")
-                            if ftype == "RESPONSE":
-                                content = frag.get("content", "")
-                                if content:
-                                    full_content += content
-                                    q.put_nowait(("chunk", content))
-                            # 更新最后的 fragment 类型（包括 THINK 和 RESPONSE，用于 APPEND 判断）
-                            if ftype:
-                                last_fragment_type = ftype
-
-                    # 2. 处理 APPEND patch（追加内容到 fragment）
-                    if "p" in data and "o" in data and "v" in data and data["o"] == "APPEND":
-                        p = data["p"]
-                        val = data["v"]
-                        if p == "response/fragments/-1/content" and isinstance(val, str):
-                            # 仅当最后一个 fragment 是 RESPONSE 时才追加输出
-                            if last_fragment_type == "RESPONSE":
-                                full_content += val
-                                q.put_nowait(("chunk", val))
-                        elif p == "response/fragments" and isinstance(val, list):
-                            # 追加新 fragment 到 fragments 数组（如思考模式下的 RESPONSE fragment）
-                            for frag in val:
-                                ftype = frag.get("type")
-                                if ftype:
-                                    last_fragment_type = ftype
-                                if ftype == "RESPONSE":
-                                    content = frag.get("content", "")
-                                    if content:
-                                        full_content += content
-                                        q.put_nowait(("chunk", content))
-
-                    # 3. 处理裸 v 字符串（如 {"v": " text"}）— 仅在 RESPONSE 模式下追加，排除含 p 键的 patch
-                    if "v" in data and isinstance(data["v"], str) and "p" not in data:
-                        if last_fragment_type == "RESPONSE":
-                            full_content += data["v"]
-                            q.put_nowait(("chunk", data["v"]))
-                        # 修复：即使没有 initial fragment，只要直接收到 RESPONSE 的裸 v 字符串也应该作为文本输出
-                        # 有些响应可能直接以裸 v 字符串形式出现（例如非流式的 JSON 响应）
-                        elif last_fragment_type is None and data["v"]:
-                            # 尝试将裸v内容作为chunk输出（可能是一段完整文本或JSON的一部分）
-                            full_content += data["v"]
-                            q.put_nowait(("chunk", data["v"]))
-
-                q.put_nowait(("done", ""))
-                await route.fulfill(response=resp)
-                logger.info(f"[DeepSeek] stream completed, total content length: {len(full_content)}")
-            except Exception as e:
-                logger.error(f"[DeepSeek] route handler error: {e}")
-                q.put_nowait(("error", str(e)))
-                q.put_nowait(("done", ""))
-                try:
-                    await route.continue_()
-                except:
-                    pass
-
-        await self._deepseek_page.route("**/api/v0/chat/completion**", handle_route)
+        self._deepseek_page.on("request", on_auth_capture)
 
         try:
             # 1. 确保页面模型匹配请求 (fail fast if mismatch)
@@ -1667,25 +2138,90 @@ class BrowserClient:
                     yield ("done", "")
                     return
                 logger.info("[DeepSeek] file uploaded successfully, injecting ref_file_ids")
+                # 文件上传后等待页面稳定
+                await asyncio.sleep(2)
 
             # 4. 查找 textarea 并输入 prompt
             textarea = await self._deepseek_page.query_selector('textarea')
             if not textarea:
-                # 尝试 contenteditable
                 editor = await self._deepseek_page.query_selector('[contenteditable="true"]')
                 if editor:
+                    logger.info("[DeepSeek] found contenteditable editor")
                     await editor.click()
                     await asyncio.sleep(0.3)
-                    await editor.evaluate(f"element => element.innerText = {json.dumps(prompt)}")
-                    await asyncio.sleep(0.2)
+                    await self._deepseek_page.evaluate("""(text) => {
+                        const el = document.querySelector('[contenteditable="true"]');
+                        if (el) {
+                            el.focus();
+                            el.innerText = text;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }""", prompt)
+                    await asyncio.sleep(0.3)
                     await self._deepseek_page.keyboard.press("Enter")
+                    logger.info("[DeepSeek] contenteditable + Enter pressed")
+                else:
+                    logger.warning("[DeepSeek] no textarea or contenteditable found!")
             else:
+                logger.info("[DeepSeek] found textarea, setting value...")
                 await textarea.focus()
                 await asyncio.sleep(0.3)
-                await self._deepseek_page.fill('textarea', prompt)
-                await asyncio.sleep(0.3)
+                # 使用 nativeSetter + input 事件确保 React state 同步
+                await self._deepseek_page.evaluate("""(text) => {
+                    const ta = document.querySelector('textarea');
+                    if (!ta) return;
+                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLTextAreaElement.prototype, 'value'
+                    ).set;
+                    nativeSetter.call(ta, text);
+                    ta.dispatchEvent(new Event('input', {bubbles: true}));
+                    ta.dispatchEvent(new Event('change', {bubbles: true}));
+                }""", prompt)
+                await asyncio.sleep(1)
+                # 确认值已写入
+                val = await self._deepseek_page.evaluate("() => document.querySelector('textarea')?.value || ''")
+                logger.debug(f"[DeepSeek] textarea value length: {len(val)}")
+                # 设置 JS 拦截器参数（在发送前）
+                await self._deepseek_page.evaluate("""(params) => {
+                    window.__deepseek_request_params = params;
+                }""", {"model_type": model_type, "thinking_enabled": thinking_enabled,
+                        "search_enabled": search_enabled,
+                        "ref_file_ids": [uploaded_file_id] if uploaded_file_id else [],
+                        "stream_id": stream_id})
+                logger.debug(f"[DeepSeek] JS request params set: model_type={model_type}, thinking={thinking_enabled}, search={search_enabled}")
+                # 发送前重新获取 textarea（文件上传后可能被替换）
+                textarea = await self._deepseek_page.query_selector('textarea')
+                if not textarea:
+                    logger.warning("[DeepSeek] textarea not found before send")
+                    yield ("error", "textarea not found")
+                    yield ("done", "")
+                    return
+                # 点击 textarea 中心确保聚焦（文件上传后 focus 可能丢失）
+                ta_box = await textarea.bounding_box()
+                if ta_box:
+                    cx = ta_box['x'] + ta_box['width'] / 2
+                    cy = ta_box['y'] + ta_box['height'] / 2
+                    await self._deepseek_page.mouse.click(cx, cy)
+                    await asyncio.sleep(0.3)
+                await textarea.focus()
+                await asyncio.sleep(0.2)
+                await self._deepseek_page.keyboard.press("End")
                 await self._deepseek_page.keyboard.press("Enter")
-            logger.info("[DeepSeek] prompt typed and Enter pressed")
+                logger.debug("[DeepSeek] pressed End+Enter to send")
+                await asyncio.sleep(1)
+                # 验证：如果 textarea 还有内容，尝试点击发送按钮
+                remaining = await self._deepseek_page.evaluate("() => document.querySelector('textarea')?.value || ''")
+                if remaining:
+                    logger.debug(f"[DeepSeek] Enter did not send ({len(remaining)} chars), trying button click")
+                    btn = await self._deepseek_page.query_selector('[class*="ds-button--primary"][class*="ds-button--filled"][class*="ds-button--circle"]')
+                    if btn:
+                        await btn.click(force=True)
+                        logger.debug("[DeepSeek] clicked send button")
+                await asyncio.sleep(1)
+                # 验证：检查 textarea 是否已清空（发送成功会清空）
+                remaining = await self._deepseek_page.evaluate("() => document.querySelector('textarea')?.value || ''")
+                logger.debug(f"[DeepSeek] textarea after send: {len(remaining)} chars")
             await asyncio.sleep(1)
 
             # 4. 在发送后从 URL 再次捕获 session_id（可能已更新）
@@ -1719,11 +2255,6 @@ class BrowserClient:
             yield ("done", "")
         finally:
             self._deepseek_queues.pop(stream_id, None)
-            try:
-                if self._deepseek_page and not self._deepseek_page.is_closed():
-                    await self._deepseek_page.unroute("**/api/v0/chat/completion**", handle_route)
-            except Exception:
-                pass
             try:
                 if self._deepseek_page and not self._deepseek_page.is_closed():
                     await self._deepseek_page.unroute("**/api/v0/file/upload_file**", handle_upload_route)
