@@ -38,20 +38,22 @@ def _bring_window_to_front():
         logger.debug(f"[Zai] Win32 bring to front failed: {e}")
 
 STORAGE_STATE_PATH = os.path.join(BASE_DIR, "storage_state.json")
+DOUBAO_USER_DATA_DIR = os.path.join(BASE_DIR, "doubao_profile")
 
 
 def _get_latest_cookie_from_storage() -> str:
-    """从 storage_state.json 读取最新 cookie 字符串"""
+    """从 storage_state.json 或 doubao_profile 读取最新 cookie 字符串"""
     try:
-        if not os.path.exists(STORAGE_STATE_PATH):
-            return CONFIG.get('cookie', '')
-        with open(STORAGE_STATE_PATH, 'r', encoding='utf-8') as f:
-            state = json.load(f)
-        cookies = state.get('cookies', [])
-        cookie_str = '; '.join(f"{c['name']}={c['value']}" for c in cookies if 'doubao.com' in c.get('domain', ''))
-        return cookie_str if cookie_str else CONFIG.get('cookie', '')
+        if os.path.exists(STORAGE_STATE_PATH):
+            with open(STORAGE_STATE_PATH, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            cookies = state.get('cookies', [])
+            cookie_str = '; '.join(f"{c['name']}={c['value']}" for c in cookies if 'doubao.com' in c.get('domain', ''))
+            if cookie_str:
+                return cookie_str
     except Exception:
-        return CONFIG.get('cookie', '')
+        pass
+    return CONFIG.get('cookie', '')
 COMPLETION_URL_BASE = "https://www.doubao.com/chat/completion"
 
 
@@ -84,18 +86,18 @@ class BrowserClient:
         # Doubao 专属
         self._doubao_pw = None
         self._doubao_browser = None
-        self._doubao_context = None
         self._doubao_page = None
         self._doubao_lock = asyncio.Lock()
         self._doubao_queues = {}
+        self._doubao_user_data_dir = DOUBAO_USER_DATA_DIR
 
         # Qianwen 专属
         self._qianwen_pw = None
         self._qianwen_browser = None
-        self._qianwen_context = None
         self._qianwen_page = None
         self._qianwen_lock = asyncio.Lock()
         self._qianwen_queues = {}
+        self._qianwen_user_data_dir = os.path.join(BASE_DIR, "qianwen_profile")
 
         # DeepSeek 专属
         self._deepseek_pw = None
@@ -134,31 +136,41 @@ class BrowserClient:
         q.put_nowait((kind, value))
 
     async def ensure_doubao_ready(self, headless=True):
-        """确保 Doubao 浏览器就绪，按需启动独立浏览器实例。"""
-        if self._doubao_page and self._doubao_browser and self._doubao_browser.is_connected():
+        """确保 Doubao 浏览器就绪，使用持久化 user_data_dir 保留登录状态。"""
+        if self._doubao_page and self._doubao_browser and self._doubao_browser.pages:
             return True
         async with self._doubao_lock:
-            if self._doubao_page and self._doubao_browser and self._doubao_browser.is_connected():
+            if self._doubao_page and self._doubao_browser and self._doubao_browser.pages:
                 return True
 
-            if not os.path.exists(STORAGE_STATE_PATH):
-                raise RuntimeError("storage_state.json 不存在，请先运行 python main.py --login doubao 登录")
+            if not os.path.exists(self._doubao_user_data_dir):
+                os.makedirs(self._doubao_user_data_dir, exist_ok=True)
 
             from playwright.async_api import async_playwright
             self._doubao_pw = await async_playwright().start()
-            self._doubao_browser = await self._doubao_pw.chromium.launch(
+            self._doubao_browser = await self._doubao_pw.chromium.launch_persistent_context(
+                user_data_dir=self._doubao_user_data_dir,
                 headless=headless,
                 channel="msedge",
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
-            )
-
-            self._doubao_context = await self._doubao_browser.new_context(
-                storage_state=STORAGE_STATE_PATH,
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
-            self._doubao_page = await self._doubao_context.new_page()
+            self._doubao_page = self._doubao_browser.pages[0] if self._doubao_browser.pages else await self._doubao_browser.new_page()
             await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
+
+            # 优先从旧 storage_state.json 恢复完整 cookie 集合，兼容旧登录流程
+            try:
+                if os.path.exists(STORAGE_STATE_PATH):
+                    with open(STORAGE_STATE_PATH, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                    cookies = state.get('cookies', [])
+                    doubao_cookies = [c for c in cookies if 'doubao.com' in c.get('domain', '')]
+                    if doubao_cookies:
+                        await self._doubao_browser.add_cookies(doubao_cookies)
+                        logger.info(f"Doubao: restored {len(doubao_cookies)} cookies from storage_state.json")
+            except Exception as e:
+                logger.warning(f"Doubao: storage_state restore failed: {e}")
 
             logger.info("Doubao: navigating to doubao.com/chat/ ...")
             await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
@@ -174,57 +186,105 @@ class BrowserClient:
                 logger.warning(f"Doubao: bdms.frontierSign not available: {e}")
 
             body_text = await self._doubao_page.text_content("body") or ""
-            if any(kw in body_text for kw in ["登录", "请先登录", "扫码登录"]):
-                logger.warning("Doubao: login required - session cookies expired. Opening visible browser...")
+            if any(kw in body_text for kw in ["登录", "请先登录", "扫码登录", "验证", "人机验证", "需要验证", "安全验证", "captcha", "verify"]):
+                logger.warning("Doubao: login required - session expired. Opening visible browser...")
                 await self._doubao_login_recovery()
+            else:
+                # 检查 session cookie；如果 persistent context 恢复的 cookies 不包含有效会话，从 config.json 补充注入
+                try:
+                    cks = await self._doubao_browser.cookies()
+                    names = {c["name"] for c in cks if c.get("value")}
+                    if not (names & {"sessionid", "sessionid_ss", "sid_guard", "sid_tt"}):
+                        cookie_str = CONFIG.get('cookie', '')
+                        if cookie_str and 'sessionid' in cookie_str:
+                            logger.info("Doubao: session cookie missing, restoring from config.json...")
+                            cookies_to_add = []
+                            for part in cookie_str.split(';'):
+                                part = part.strip()
+                                if '=' in part:
+                                    name, value = part.split('=', 1)
+                                    if not any(c.get("name") == name for c in cks):
+                                        cookies_to_add.append({
+                                            'name': name.strip(),
+                                            'value': value.strip(),
+                                            'domain': '.doubao.com',
+                                            'path': '/'
+                                        })
+                            if cookies_to_add:
+                                await self._doubao_browser.add_cookies(cookies_to_add)
+                                logger.info(f"Doubao: added {len(cookies_to_add)} cookies from config.json")
+                                # 重新导航使新 cookie 生效
+                                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
+                                await asyncio.sleep(2)
+                except Exception as e:
+                    logger.warning(f"Doubao: cookie restore failed: {e}")
 
             logger.info("Doubao browser ready")
             return True
 
     async def _doubao_login_recovery(self):
-        """打开可见浏览器让用户手动登录 Doubao，然后保存 cookies。"""
+        """打开可见浏览器让用户手动登录 Doubao，使用 user_data_dir 持久化状态。"""
         from playwright.async_api import async_playwright
         try:
+            # 关闭当前 headless 实例
+            if self._doubao_page:
+                try:
+                    await self._doubao_page.close()
+                except Exception:
+                    pass
+                self._doubao_page = None
+            if self._doubao_browser:
+                try:
+                    await self._doubao_browser.close()
+                except Exception:
+                    pass
+                self._doubao_browser = None
+            if self._doubao_pw:
+                try:
+                    await self._doubao_pw.stop()
+                except Exception:
+                    pass
+                self._doubao_pw = None
+
             pw = await async_playwright().start()
-            login_browser = await pw.chromium.launch(
+            login_browser = await pw.chromium.launch_persistent_context(
+                user_data_dir=self._doubao_user_data_dir,
                 headless=False,
                 channel="msedge",
-                args=["--no-sandbox", "--disable-setuid-sandbox"]
-            )
-            login_context = await login_browser.new_context(
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
-            login_page = await login_context.new_page()
+            login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
             await login_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
             logger.info("Doubao: visible browser opened for manual login. Please log in...")
 
             while True:
                 await asyncio.sleep(1)
-                if not login_browser.is_connected():
+                if not login_browser.pages:
                     break
                 try:
                     body = await login_page.text_content("body") or ""
                     if "登录" not in body and "请先登录" not in body:
-                        logger.info("Doubao: login detected, capturing cookies...")
+                        logger.info("Doubao: login detected")
                         break
-                except:
+                except Exception:
                     pass
-
-            await login_context.storage_state(path=STORAGE_STATE_PATH)
-            logger.info(f"Doubao: storage_state saved to {STORAGE_STATE_PATH}")
 
             await login_browser.close()
             await pw.stop()
 
-            await self._doubao_page.close()
-            await self._doubao_context.close()
-            self._doubao_context = await self._doubao_browser.new_context(
-                storage_state=STORAGE_STATE_PATH,
+            # 重新创建 headless 上下文（复用已保存的 user_data_dir）
+            self._doubao_pw = await async_playwright().start()
+            self._doubao_browser = await self._doubao_pw.chromium.launch_persistent_context(
+                user_data_dir=self._doubao_user_data_dir,
+                headless=True,
+                channel="msedge",
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
-            self._doubao_page = await self._doubao_context.new_page()
+            self._doubao_page = self._doubao_browser.pages[0] if self._doubao_browser.pages else await self._doubao_browser.new_page()
             await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
             await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
             await asyncio.sleep(2)
@@ -233,46 +293,27 @@ class BrowserClient:
             raise
 
     async def ensure_qianwen_ready(self, headless=True):
-        """确保 Qianwen 浏览器就绪，按需启动独立浏览器实例。"""
-        if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.is_connected():
+        """确保 Qianwen 浏览器就绪，使用持久化 user_data_dir 保留登录状态。"""
+        if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.pages:
             return True
         async with self._qianwen_lock:
-            if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.is_connected():
+            if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.pages:
                 return True
 
-            qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
-            ctx_kwargs = {
-                "user_agent": USER_AGENT,
-                "viewport": {"width": 1280, "height": 900},
-            }
-            if os.path.exists(qianwen_state):
-                try:
-                    ctx_kwargs["storage_state"] = qianwen_state
-                    logger.info("Qianwen: loading saved storage_state")
-                except Exception as e:
-                    logger.warning(f"Failed to load qianwen storage_state: {e}")
-            else:
-                qianwen_cookie = CONFIG.get("qianwen_cookie", "")
-                if qianwen_cookie and "qianwen" in qianwen_cookie.lower():
-                    logger.info("Qianwen: will inject cookies from config")
+            if not os.path.exists(self._qianwen_user_data_dir):
+                os.makedirs(self._qianwen_user_data_dir, exist_ok=True)
 
             from playwright.async_api import async_playwright
             self._qianwen_pw = await async_playwright().start()
-            self._qianwen_browser = await self._qianwen_pw.chromium.launch(
+            self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
+                user_data_dir=self._qianwen_user_data_dir,
                 headless=headless,
                 channel="msedge",
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900},
             )
-
-            try:
-                self._qianwen_context = await self._qianwen_browser.new_context(**ctx_kwargs)
-            except Exception as e:
-                logger.warning(f"Failed to create qianwen context: {e}")
-                self._qianwen_context = await self._qianwen_browser.new_context(
-                    user_agent=USER_AGENT,
-                    viewport={"width": 1280, "height": 900},
-                )
-            self._qianwen_page = await self._qianwen_context.new_page()
+            self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
             await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
             logger.info("Qianwen: navigating to qianwen.com ...")
             await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
@@ -280,60 +321,67 @@ class BrowserClient:
 
             body_text = await self._qianwen_page.text_content("body") or ""
             if any(kw in body_text for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
-                logger.warning("Qianwen: login required - session cookies expired. Opening visible browser...")
+                logger.warning("Qianwen: login required - session expired. Opening visible browser...")
                 try:
+                    # 关闭当前 headless 实例
+                    if self._qianwen_page:
+                        try:
+                            await self._qianwen_page.close()
+                        except Exception:
+                            pass
+                        self._qianwen_page = None
+                    if self._qianwen_browser:
+                        try:
+                            await self._qianwen_browser.close()
+                        except Exception:
+                            pass
+                        self._qianwen_browser = None
+                    if self._qianwen_pw:
+                        try:
+                            await self._qianwen_pw.stop()
+                        except Exception:
+                            pass
+                        self._qianwen_pw = None
+
                     pw = await async_playwright().start()
-                    login_browser = await pw.chromium.launch(
+                    login_browser = await pw.chromium.launch_persistent_context(
+                        user_data_dir=self._qianwen_user_data_dir,
                         headless=False,
                         channel="msedge",
-                        args=["--no-sandbox", "--disable-setuid-sandbox"]
-                    )
-                    login_context = await login_browser.new_context(
+                        args=["--no-sandbox", "--disable-setuid-sandbox"],
                         user_agent=USER_AGENT,
                         viewport={"width": 1280, "height": 900},
                     )
-                    login_page = await login_context.new_page()
+                    login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
                     await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
                     logger.info("Qianwen: visible browser opened for manual login. Please log in...")
 
                     while True:
                         await asyncio.sleep(1)
-                        if not login_browser.is_connected():
+                        if not login_browser.pages:
                             break
                         try:
                             body = await login_page.text_content("body") or ""
                             if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
-                                logger.info("Qianwen: login detected, capturing cookies...")
+                                logger.info("Qianwen: login detected")
                                 break
-                        except:
+                        except Exception:
                             pass
-
-                    cookies = await login_context.cookies()
-                    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                    config = CONFIG.copy()
-                    config["qianwen_cookie"] = cookie_str
-                    from config import CONFIG_PATH
-                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                        json.dump(config, f, ensure_ascii=False, indent=4)
-
-                    try:
-                        await login_context.storage_state(path=qianwen_state)
-                        logger.info(f"Storage state saved to {qianwen_state}")
-                    except:
-                        pass
 
                     await login_browser.close()
                     await pw.stop()
-                    logger.info("Qianwen: login browser closed, server will use the captured cookies")
 
-                    await self._qianwen_page.close()
-                    await self._qianwen_context.close()
-                    self._qianwen_context = await self._qianwen_browser.new_context(
+                    # 重新创建 headless 上下文
+                    self._qianwen_pw = await async_playwright().start()
+                    self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
+                        user_data_dir=self._qianwen_user_data_dir,
+                        headless=True,
+                        channel="msedge",
+                        args=["--no-sandbox", "--disable-setuid-sandbox"],
                         user_agent=USER_AGENT,
                         viewport={"width": 1280, "height": 900},
-                        storage_state=qianwen_state,
                     )
-                    self._qianwen_page = await self._qianwen_context.new_page()
+                    self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
                     await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
                     await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
                     await asyncio.sleep(3)
@@ -396,7 +444,26 @@ class BrowserClient:
         await self._qianwen_page.route("**/api/v2/chat**", handle_route)
 
         try:
-            ok = await self._qianwen_page.evaluate("""() => {
+            # 定位编辑器所在的 frame（可能在 iframe 中）
+            edit_frame = self._qianwen_page
+            try:
+                iframe_elements = await self._qianwen_page.query_selector_all("iframe")
+                for iframe_el in iframe_elements:
+                    try:
+                        box = await iframe_el.bounding_box()
+                        if box and box['width'] > 0 and box['height'] > 0:
+                            candidate_frame = await iframe_el.content_frame()
+                            if candidate_frame:
+                                ed = await candidate_frame.query_selector("[contenteditable], textarea")
+                                if ed:
+                                    edit_frame = candidate_frame
+                                    break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            ok = await edit_frame.evaluate("""() => {
                 const ed = document.querySelector('[contenteditable]') || document.querySelector('textarea');
                 if (ed) { ed.focus(); ed.click(); return true; }
                 return false;
@@ -944,9 +1011,9 @@ class BrowserClient:
         """删除千问网页版所有历史对话（httpx 直接调用，不依赖浏览器页面）。"""
         try:
             qianwen_cookie = ""
-            if self._qianwen_context:
+            if self._qianwen_browser:
                 try:
-                    cookies = await self._qianwen_context.cookies()
+                    cookies = await self._qianwen_browser.cookies()
                     qianwen_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
                 except Exception:
                     pass
@@ -962,17 +1029,6 @@ class BrowserClient:
                 if part.startswith("b-user-id="):
                     ut = part.split("=", 1)[1].strip()
                     break
-            if not ut:
-                qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
-                if os.path.exists(qianwen_state):
-                    try:
-                        with open(qianwen_state, 'r', encoding='utf-8') as f:
-                            for c in json.load(f).get("cookies", []):
-                                if c.get("name") == "b-user-id":
-                                    ut = c.get("value", "")
-                                    break
-                    except Exception:
-                        pass
             if not ut:
                 logger.warning("[Qwen] cannot extract ut (b-user-id) from cookie, skip delete")
                 return
@@ -1044,9 +1100,9 @@ class BrowserClient:
             return
         try:
             qianwen_cookie = ""
-            if self._qianwen_context:
+            if self._qianwen_browser:
                 try:
-                    cookies = await self._qianwen_context.cookies()
+                    cookies = await self._qianwen_browser.cookies()
                     qianwen_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
                 except Exception:
                     pass
@@ -1062,17 +1118,6 @@ class BrowserClient:
                 if part.startswith("b-user-id="):
                     ut = part.split("=", 1)[1].strip()
                     break
-            if not ut:
-                qianwen_state = os.path.join(BASE_DIR, "qianwen_storage_state.json")
-                if os.path.exists(qianwen_state):
-                    try:
-                        with open(qianwen_state, 'r', encoding='utf-8') as f:
-                            for c in json.load(f).get("cookies", []):
-                                if c.get("name") == "b-user-id":
-                                    ut = c.get("value", "")
-                                    break
-                    except Exception:
-                        pass
             if not ut:
                 logger.warning("[Qwen] cannot extract ut (b-user-id) from cookie, skip delete")
                 return
@@ -1220,7 +1265,7 @@ class BrowserClient:
 
             while True:
                 await asyncio.sleep(1)
-                if not login_browser.is_connected():
+                if not login_browser.pages:
                     break
                 try:
                     textarea = await login_page.query_selector('textarea, [contenteditable="true"]')
@@ -1269,6 +1314,57 @@ class BrowserClient:
         q = asyncio.Queue()
         self._deepseek_queues[stream_id] = q
         session_id = ""
+
+        async def ensure_deepseek_model_selected():
+            try:
+                page = self._deepseek_page
+                if not page:
+                    return False
+
+                current_model = await page.evaluate("""() => {
+                    const text = document.body ? (document.body.innerText || '') : '';
+                    if (text.includes('DeepSeek-R1') || text.includes('深度思考')) return 'expert';
+                    if (text.includes('DeepSeek-VL') || text.includes('识图')) return 'vision';
+                    return 'default';
+                }""")
+                logger.info(f"[DeepSeek] current page model={current_model}, target={model_type}")
+                if current_model == model_type:
+                    return True
+
+                switched = await page.evaluate(f"""() => {{
+                    const target = {json.dumps(model_type)};
+                    const textMatchers = target === 'expert'
+                        ? ['DeepSeek-R1', 'R1', '深度思考', '专家']
+                        : target === 'vision'
+                            ? ['DeepSeek-VL', 'VL', '识图', '视觉']
+                            : ['DeepSeek-V3', 'V3', '默认', '普通'];
+
+                    const clickable = Array.from(document.querySelectorAll('button, [role="button"], div, span'))
+                        .filter(el => {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            const rect = el.getBoundingClientRect();
+                            if (!text || rect.width <= 0 || rect.height <= 0) return false;
+                            return textMatchers.some(t => text.includes(t));
+                        });
+
+                    for (const el of clickable) {
+                        try {
+                            el.click();
+                            return true;
+                        } catch {}
+                    }
+                    return false;
+                }}""")
+
+                if not switched:
+                    logger.warning(f"[DeepSeek] failed to switch page model to {model_type}")
+                    return False
+
+                await asyncio.sleep(1.5)
+                return True
+            except Exception as e:
+                logger.warning(f"[DeepSeek] ensure model selected failed: {e}")
+                return False
 
         # 1. Ensure we have a chat session (create if needed)
         try:
@@ -1526,7 +1622,13 @@ class BrowserClient:
         await self._deepseek_page.route("**/api/v0/chat/completion**", handle_route)
 
         try:
-            # 1. 切换思考和搜索开关
+            # 1. 确保页面模型匹配请求 (fail fast if mismatch)
+            if not await ensure_deepseek_model_selected():
+                yield ("error", f"页面模型切换失败，无法匹配请求的 model_type={model_type}")
+                yield ("done", "")
+                return
+
+            # 2. 切换思考和搜索开关
             toggles = await self._deepseek_page.query_selector_all('.ds-toggle-button')
             if toggles:
                 # 思考模式开关（第一个）
@@ -1557,7 +1659,7 @@ class BrowserClient:
                     except Exception as e:
                         logger.warning(f"[DeepSeek] 搜索开关设置失败: {e}")
 
-            # 2. 上传文件（如果有）
+            # 3. 上传文件（如果有）
             if inline_file_content:
                 await upload_file()
                 if not uploaded_file_id:
@@ -1566,7 +1668,7 @@ class BrowserClient:
                     return
                 logger.info("[DeepSeek] file uploaded successfully, injecting ref_file_ids")
 
-            # 3. 查找 textarea 并输入 prompt
+            # 4. 查找 textarea 并输入 prompt
             textarea = await self._deepseek_page.query_selector('textarea')
             if not textarea:
                 # 尝试 contenteditable
@@ -1810,7 +1912,7 @@ class BrowserClient:
                 browser_ok = (
                     self._doubao_page is not None
                     and self._doubao_browser is not None
-                    and self._doubao_browser.is_connected()
+                    and self._doubao_browser.pages
                 )
             except Exception:
                 browser_ok = False
@@ -1930,7 +2032,7 @@ class BrowserClient:
                 self._doubao_page = None
             if self._doubao_browser:
                 try:
-                    if not self._doubao_browser.is_connected():
+                    if not self._doubao_browser.pages:
                         logger.info("[Doubao] browser already disconnected by user, skipping close")
                     else:
                         await self._doubao_browser.close()
@@ -1962,7 +2064,7 @@ class BrowserClient:
                 self._doubao_page = None
             if self._doubao_browser:
                 try:
-                    if not self._doubao_browser.is_connected():
+                    if not self._doubao_browser.pages:
                         logger.info("[Doubao] browser already disconnected by user, skipping close")
                     else:
                         await self._doubao_browser.close()
@@ -1988,7 +2090,7 @@ class BrowserClient:
         
         cookie = _get_latest_cookie_from_storage()
         if not cookie:
-            raise RuntimeError("Cannot read cookie from storage_state.json")
+            raise RuntimeError("Cannot read cookie from doubao_profile")
 
         device_id = CONFIG.get('device_id', '')
         tea_uuid = CONFIG.get('tea_uuid', '')
@@ -2106,7 +2208,7 @@ class BrowserClient:
     async def upload_file_via_qianwen_page(self, file_data: bytes, file_name: str) -> str:
         headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
         await self.ensure_qianwen_ready(headless=headless)
-        import tempfile, os
+        import tempfile
         tmp = None
         try:
             ext = f".{file_name.rsplit('.', 1)[-1]}" if '.' in file_name else ""
@@ -2114,73 +2216,101 @@ class BrowserClient:
             with os.fdopen(fd, 'wb') as f:
                 f.write(file_data)
         except Exception as e:
-            logger.error(f"[Qwen] tmp: {e}"); raise
+            logger.error(f"[Qwen] tmp error: {e}")
+            raise
+
+        page = self._qianwen_page
+
         try:
-            page = self._qianwen_page
-            fi = await page.query_selector("input[type='file']")
-            if not fi:
-                await page.evaluate("""() => {
-                    const i = document.createElement('input');
-                    i.type = 'file'; i.id = '__qfu';
-                    i.style = 'position:fixed;top:0;left:0;opacity:0;z-index:99999';
-                    document.body.appendChild(i);
-                }""")
-                await asyncio.sleep(0.3)
-                fi = await page.query_selector("#__qfu")
+            # 监听 filechooser
+            file_chooser_event = asyncio.Event()
+            file_chooser_result = [None]
 
-            if not fi:
-                raise RuntimeError("No file input")
+            def on_fc(fc):
+                file_chooser_result[0] = fc
+                file_chooser_event.set()
 
-            await fi.set_input_files(tmp)
-            await page.evaluate("""() => {
-                const i = document.getElementById('__qfu') || document.querySelector('input[type=file]');
-                if(i) {
-                    i.dispatchEvent(new Event('input', {bubbles:true}));
-                    i.dispatchEvent(new Event('change', {bubbles:true}));
+            page.on('filechooser', on_fc)
+
+            # 点击“添加附件”按钮，打开菜单
+            await page.click('[aria-label="添加附件"]')
+            await asyncio.sleep(1)
+
+            # 点击“上传文档”菜单项
+            clicked = await page.evaluate("""() => {
+                const items = document.querySelectorAll('[role="menuitem"]');
+                for (const item of items) {
+                    const text = (item.textContent || '').trim();
+                    if (text.includes('文档') || text.includes('上传文档')) {
+                        item.click();
+                        return text;
+                    }
                 }
+                return null;
             }""")
-            logger.info(f"[Qwen] file input set + events dispatched: {file_name}")
+            if not clicked:
+                raise RuntimeError("[Qwen] 上传文档 menuitem not found")
+            logger.info(f"[Qwen] clicked menu item: {clicked}")
 
-            # 等待 3 秒让千问处理文件上传
-            await asyncio.sleep(3)
+            # 等待 filechooser
+            try:
+                await asyncio.wait_for(file_chooser_event.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                raise RuntimeError("[Qwen] filechooser timeout")
 
-            # 轮询检测文件状态栏是否出现（最多 60 秒）
-            # 千问上传文件后，class 包含 "statusLine" 的 div 会显示文件大小（如 "53.13 KB"）
+            fc = file_chooser_result[0]
+            if not fc:
+                raise RuntimeError("[Qwen] filechooser event but fc is None")
+
+            await fc.set_files(tmp)
+            logger.info(f"[Qwen] file chooser set: {file_name}")
+
+            # 等待上传处理
+            await asyncio.sleep(5)
+
+            # 验证附件出现在编辑器中
             attached = False
             for i in range(60):
                 try:
-                    attached = await page.evaluate(r"""() => {
-                        const statusLines = document.querySelectorAll('[class*="statusLine"]');
-                        for (const el of statusLines) {
+                    attached = await page.evaluate("""(fn) => {
+                        const wrappers = document.querySelectorAll('[class*="fileWrap"], [class*="fileBox"], [class*="statusLine"]');
+                        for (const el of wrappers) {
                             const text = (el.textContent || '').trim();
-                            if (text.length > 0 && /\d/.test(text)) {
+                            if (text.includes(fn) || /\\d/.test(text)) {
                                 return true;
                             }
                         }
+                        const editor = document.querySelector('[contenteditable]');
+                        if (editor) {
+                            return (editor.innerHTML || '').includes(fn) || editor.textContent.includes(fn);
+                        }
                         return false;
-                    }""")
+                    }""", file_name)
                     if attached:
-                        logger.info(f"[Qwen] file status line detected in DOM (attempt {i+1})")
+                        logger.info(f"[Qwen] attachment detected in DOM (attempt {i+1})")
                         break
                 except Exception:
                     pass
                 await asyncio.sleep(1)
             if not attached:
-                logger.warning(f"[Qwen] file status line not detected after 60s, proceeding anyway")
+                logger.warning(f"[Qwen] attachment not detected in editor after 60s, proceeding anyway")
 
-            await asyncio.sleep(2)
+            # 聚焦编辑器以便后续输入
             await page.evaluate("""() => {
-                const el = document.querySelector('[contenteditable]')||document.querySelector('textarea');
-                if(el) {el.focus();el.click();}
+                const el = document.querySelector('[contenteditable]') || document.querySelector('textarea');
+                if (el) { el.focus(); el.click(); }
             }""")
             return file_name
+
         except Exception as e:
             logger.error(f"[Qwen] upload fail: {e}")
             raise
         finally:
             if tmp and os.path.exists(tmp):
-                try: os.remove(tmp)
-                except: pass
+                try:
+                    os.remove(tmp)
+                except:
+                    pass
 
     async def fetch_qianwen_models(self) -> list[dict]:
         """从千问页面模型选择弹窗中获取可用模型列表。"""

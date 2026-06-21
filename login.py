@@ -8,12 +8,13 @@ from config import CONFIG, CONFIG_PATH, BASE_DIR, USER_AGENT
 
 logger = logging.getLogger("doubao-login")
 
-STORAGE_STATE_PATH = os.path.join(BASE_DIR, "storage_state.json")
+USER_DATA_DIR = os.path.join(BASE_DIR, "doubao_profile")
 
 
 async def do_login(show_browser: bool = True) -> dict:
     """
-    启动浏览器让用户登录豆包，登录成功后提取 cookie 和设备参数，持久化到 config.json。
+    启动持久化浏览器让用户登录豆包，登录成功后提取 cookie 和设备参数，持久化到 config.json。
+    使用 launch_persistent_context 保持登录状态到 doubao_profile 目录。
 
     Args:
         show_browser: 是否显示浏览器窗口（headless=False）
@@ -27,38 +28,30 @@ async def do_login(show_browser: bool = True) -> dict:
         logger.error("playwright not installed. Run: pip install playwright && playwright install chromium")
         return {"success": False, "message": "playwright not installed"}
 
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.error("playwright not installed")
+        return {"success": False, "message": "playwright not installed"}
+
+    if not os.path.exists(USER_DATA_DIR):
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        logger.info(f"Created user data directory: {USER_DATA_DIR}")
+
     pw = None
     browser = None
     try:
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
+        browser = await pw.chromium.launch_persistent_context(
+            user_data_dir=USER_DATA_DIR,
             headless=not show_browser,
             channel="msedge",
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
-
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            args=["--no-sandbox", "--disable-setuid-sandbox"],
             user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900},
         )
 
-        # 如果有 storage_state，尝试加载已有登录态
-        if os.path.exists(STORAGE_STATE_PATH):
-            try:
-                await context.close()
-                context = await browser.new_context(
-                    storage_state=STORAGE_STATE_PATH,
-                    viewport={"width": 1280, "height": 900},
-                    user_agent=USER_AGENT,
-                )
-                logger.info("Loaded existing storage_state")
-            except Exception:
-                context = await browser.new_context(
-                    viewport={"width": 1280, "height": 900},
-                    user_agent=USER_AGENT,
-                )
-
-        page = await context.new_page()
+        page = browser.pages[0] if browser.pages else await browser.new_page()
 
         # 拦截浏览器真实 API 请求，捕获浏览器默认的 device_id/web_id/tea_uuid/fp
         captured_params = {"device_id": "", "web_id": "", "tea_uuid": "", "fp": ""}
@@ -97,9 +90,9 @@ async def do_login(show_browser: bool = True) -> dict:
         await page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
         await asyncio.sleep(2)
 
-        # 检查 session cookie；如果 storage_state 恢复的 cookies 不包含有效会话，尝试从 config.json 补充注入
+        # 检查 session cookie；如果 persistent context 恢复的 cookies 不包含有效会话，尝试从 config.json 补充注入
         async def _is_logged_in() -> bool:
-            cks = await context.cookies()
+            cks = await browser.cookies()
             names = {c["name"] for c in cks if c.get("value")}
             return bool(names & {"sessionid", "sessionid_ss", "sid_guard", "sid_tt"})
 
@@ -113,7 +106,7 @@ async def do_login(show_browser: bool = True) -> dict:
                     if '=' in part:
                         name, value = part.split('=', 1)
                         # 检查是否已存在同名 cookie
-                        if not any(c.get("name") == name for c in await context.cookies()):
+                        if not any(c.get("name") == name for c in await browser.cookies()):
                             cookies_to_add.append({
                                 'name': name.strip(),
                                 'value': value.strip(),
@@ -121,9 +114,8 @@ async def do_login(show_browser: bool = True) -> dict:
                                 'path': '/'
                             })
                 if cookies_to_add:
-                    await context.add_cookies(cookies_to_add)
+                    await browser.add_cookies(cookies_to_add)
                     logger.info(f"Added {len(cookies_to_add)} missing cookies from config.json")
-                    # 再次检查
                     if await _is_logged_in():
                         logger.info("Login state restored from config.json cookies")
 
@@ -142,7 +134,7 @@ async def do_login(show_browser: bool = True) -> dict:
             login_ok = False
             for _ in range(600):
                 await asyncio.sleep(0.5)
-                if not browser.is_connected():
+                if not browser.pages:
                     await pw.stop()
                     return {"success": False, "message": "浏览器被关闭，登录取消"}
                 try:
@@ -164,7 +156,7 @@ async def do_login(show_browser: bool = True) -> dict:
             logger.info("Login detected, extracting credentials...")
 
         # 提取 cookie
-        cookies = await context.cookies()
+        cookies = await browser.cookies()
         cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
         if not cookie_str:
@@ -208,13 +200,6 @@ async def do_login(show_browser: bool = True) -> dict:
             except Exception:
                 pass
 
-        # 保存 storage_state（Playwright 原生持久化）
-        try:
-            await context.storage_state(path=STORAGE_STATE_PATH)
-            logger.info(f"Storage state saved to {STORAGE_STATE_PATH}")
-        except Exception as e:
-            logger.warning(f"Failed to save storage_state: {e}")
-
         # 更新 config.json
         _update_config(cookie_str, device_id, web_id, tea_uuid)
 
@@ -230,10 +215,8 @@ async def do_login(show_browser: bool = True) -> dict:
         # 轮询检测浏览器是否被用户关闭
         while True:
             await asyncio.sleep(0.5)
-            if not browser.is_connected():
-                break
             try:
-                if not context.pages:
+                if not browser.pages:
                     break
             except Exception:
                 break

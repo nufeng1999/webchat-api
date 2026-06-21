@@ -98,7 +98,8 @@ my_prompt/request_task - 副本.md
 deepseek_storage_state.json
 deepseek_api_results.json
 deepseek_profile/
-deepseek_profile/
+doubao_profile/
+qianwen_profile/
 zai_profile/
 mimo_profile/
 probe_mimo*.py
@@ -107,3 +108,4 @@ mimo_*.html
 mimo_*.txt
 mimo_*.md
 tmp/zai_01_home.png
+out.json

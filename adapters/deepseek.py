@@ -164,33 +164,32 @@ class DeepseekAdapter(BaseAdapter):
                 logger.info(f"[DeepSeek Adapter] {Colors.RED}Attempt {attempt+1}/{max_retries}{Colors.RESET}: model_type={model_type}, thinking={thinking_enabled}, search={search_enabled}")
 
                 parse_success = False
-
-            think_buf = ""
-            async for kind, value in browser_client.stream_deepseek_chat(
-                prompt=current_prompt,
-                model_type=model_type,
-                thinking_enabled=thinking_enabled,
-                search_enabled=search_enabled,
-                inline_file_content=file_content if is_agent else None,
-            ):
-                if kind == "session_id":
-                    self._last_session_id = value
-                    logger.info(f"[DeepSeek] session_id: {value}")
-                    continue
-                processed = await self._handle_chunk_streaming(
-                    kind, value,
-                    model=model, chat_id=chat_id, is_agent=is_agent,
-                    full_text=full_text, suppress_text=suppress_text,
-                    buffered_chunks=buffered_chunks,
-                    _think_buf=think_buf,
-                )
-                full_text, suppress_text, buffered_chunks, should_return, return_value, think_buf = processed
-                if should_return and return_value is not None:
-                    yield return_value
-                    if kind == "error":
-                        await self._delete_deepseek_conversation()
-                        return
-                if kind == "done":
+                think_buf = ""
+                async for kind, value in browser_client.stream_deepseek_chat(
+                    prompt=current_prompt,
+                    model_type=model_type,
+                    thinking_enabled=thinking_enabled,
+                    search_enabled=search_enabled,
+                    inline_file_content=file_content if is_agent else None,
+                ):
+                    if kind == "session_id":
+                        self._last_session_id = value
+                        logger.info(f"[DeepSeek] session_id: {value}")
+                        continue
+                    processed = await self._handle_chunk_streaming(
+                        kind, value,
+                        model=model, chat_id=chat_id, is_agent=is_agent,
+                        full_text=full_text, suppress_text=suppress_text,
+                        buffered_chunks=buffered_chunks,
+                        _think_buf=think_buf,
+                    )
+                    full_text, suppress_text, buffered_chunks, should_return, return_value, think_buf = processed
+                    if should_return and return_value is not None:
+                        yield return_value
+                        if kind == "error":
+                            await self._delete_deepseek_conversation()
+                            return
+                    if kind == "done":
                         logger.debug(f"DeepSeek done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview=\n{full_text[:2000]!r}")
                         try:
                             content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls = self._parse_response(full_text)

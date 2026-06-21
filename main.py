@@ -1010,10 +1010,8 @@ if __name__ == "__main__":
             if result.get("success"):
                 if not _console_filter_quiet:
                     print("=" * 50)
-                    print("豆包登录成功！")
-                    print("注意：豆包使用的是会话 cookie，每次启动服务器时")
-                    print("如果检测到未登录，会自动打开浏览器让你登录。")
-                    print("请保持浏览器窗口打开直到服务器关闭。")
+                    print("豆包登录成功！登录状态已保存到 doubao_profile 目录。")
+                    print("如需重新登录，删除 doubao_profile 目录后运行 python main.py --login doubao")
                     print("=" * 50)
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -1054,10 +1052,8 @@ if __name__ == "__main__":
             if result.get("success"):
                 if not _console_filter_quiet:
                     print("=" * 50)
-                    print("千问登录成功！")
-                    print("注意：千问使用的是会话 cookie，每次启动服务器时")
-                    print("如果检测到未登录，会自动打开浏览器让你登录。")
-                    print("请保持浏览器窗口打开直到服务器关闭。")
+                    print("千问登录成功！登录状态已保存到 qianwen_profile 目录。")
+                    print("如需重新登录，删除 qianwen_profile 目录后运行 python main.py --login qianwen")
                     print("=" * 50)
                 sys.stdout.flush()
                 sys.stderr.flush()

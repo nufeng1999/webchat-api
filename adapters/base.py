@@ -587,6 +587,17 @@ class BaseAdapter(ABC):
                 logger.warning(f"{adapter_name} nested JSON validation failed: {nested_err}")
                 return True, nested_err, None, full_text
 
+            # 如果 content 是嵌套 JSON（如 {"finish_reason":"stop","content":"..."}），提取 inner content
+            tool_return_content = None
+            if content and isinstance(content, str) and content.strip().startswith("{"):
+                if isinstance(json_to_validate, dict) and "content" in json_to_validate:
+                    inner_content = json_to_validate.get("content")
+                    if inner_content is not None:
+                        tool_return_content = inner_content if isinstance(inner_content, str) else json.dumps(inner_content, ensure_ascii=False)
+                        logger.info(f"{adapter_name} extracted inner content from nested JSON")
+
+            return False, "", tool_return_content, full_text
+
         return False, "", None, full_text
 
     # ═══════════════════════════════════════════════════════════════════════
