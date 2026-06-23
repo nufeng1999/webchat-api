@@ -1,17 +1,23 @@
 import os
+import sys
 import json
 import asyncio
 import logging
 import uuid
 import httpx
 import ctypes
+import time
+import hashlib
+import urllib.parse
 
 from config import CONFIG, USER_AGENT, BASE_DIR
 
 logger = logging.getLogger("webchat-browser")
 
 def _bring_window_to_front():
-    """用 Win32 API 查找 Edge 窗口并强制置顶显示。"""
+    """用 Win32 API 查找 Edge 窗口并强制置顶显示。仅 Windows 有效。"""
+    if not sys.platform.startswith("win"):
+        return
     try:
         import ctypes
         user32 = ctypes.windll.user32
@@ -81,6 +87,25 @@ def _build_completion_url():
     return COMPLETION_URL_BASE + "?" + "&".join(params)
 
 
+def _browser_channel():
+    """获取 Playwright channel 参数。未配置时 Windows 默认 msedge，其他系统默认 None（内置 Chromium）。"""
+    ch = CONFIG.get("_browser_channel")
+    if ch is not None:
+        return ch
+    return "msedge" if sys.platform.startswith("win") else None
+
+
+def _browser_launch_kwargs(**kwargs):
+    """构建 Playwright chromium.launch_persistent_context 的参数。
+    自动处理 channel 参数：如果 CONFIG 中未指定（None），则省略 channel，
+    让 Playwright 使用内置 Chromium（跨平台安全）。
+    """
+    channel = _browser_channel()
+    if channel:
+        kwargs["channel"] = channel
+    return kwargs
+
+
 class BrowserClient:
     def __init__(self):
         # Doubao 专属
@@ -123,6 +148,18 @@ class BrowserClient:
         self._mimo_queues = {}
         self._mimo_user_data_dir = os.path.join(BASE_DIR, "mimo_profile")
 
+        self._minimax_pw = None
+        self._minimax_browser = None
+        self._minimax_page = None
+        self._minimax_lock = asyncio.Lock()
+        self._minimax_user_data_dir = os.path.join(BASE_DIR, "minimax_profile")
+
+        self._xinghuo_pw = None
+        self._xinghuo_browser = None
+        self._xinghuo_page = None
+        self._xinghuo_lock = asyncio.Lock()
+        self._xinghuo_user_data_dir = os.path.join(BASE_DIR, "spark_user_data")
+
     def _on_doubao_push(self, stream_id: str, kind: str, value):
         q = self._doubao_queues.get(stream_id)
         if q is None:
@@ -151,7 +188,7 @@ class BrowserClient:
             self._doubao_browser = await self._doubao_pw.chromium.launch_persistent_context(
                 user_data_dir=self._doubao_user_data_dir,
                 headless=headless,
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
@@ -250,7 +287,7 @@ class BrowserClient:
             login_browser = await pw.chromium.launch_persistent_context(
                 user_data_dir=self._doubao_user_data_dir,
                 headless=False,
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
@@ -279,7 +316,7 @@ class BrowserClient:
             self._doubao_browser = await self._doubao_pw.chromium.launch_persistent_context(
                 user_data_dir=self._doubao_user_data_dir,
                 headless=True,
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
@@ -308,7 +345,7 @@ class BrowserClient:
             self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
                 user_data_dir=self._qianwen_user_data_dir,
                 headless=headless,
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
@@ -347,7 +384,7 @@ class BrowserClient:
                     login_browser = await pw.chromium.launch_persistent_context(
                         user_data_dir=self._qianwen_user_data_dir,
                         headless=False,
-                        channel="msedge",
+                        channel=_browser_channel(),
                         args=["--no-sandbox", "--disable-setuid-sandbox"],
                         user_agent=USER_AGENT,
                         viewport={"width": 1280, "height": 900},
@@ -376,7 +413,7 @@ class BrowserClient:
                     self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
                         user_data_dir=self._qianwen_user_data_dir,
                         headless=True,
-                        channel="msedge",
+                        channel=_browser_channel(),
                         args=["--no-sandbox", "--disable-setuid-sandbox"],
                         user_agent=USER_AGENT,
                         viewport={"width": 1280, "height": 900},
@@ -1008,91 +1045,66 @@ class BrowserClient:
                 pass
 
     async def delete_all_qianwen_conversations(self):
-        """删除千问网页版所有历史对话（httpx 直接调用，不依赖浏览器页面）。"""
+        """删除千问网页版所有历史对话（通过浏览器页面 fetch 调用 API）。"""
         try:
-            qianwen_cookie = ""
-            if self._qianwen_browser:
-                try:
-                    cookies = await self._qianwen_browser.cookies()
-                    qianwen_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                except Exception:
-                    pass
-            if not qianwen_cookie:
-                qianwen_cookie = CONFIG.get("qianwen_cookie", "")
-            if not qianwen_cookie:
-                logger.warning("[Qwen] no cookie for delete API, skip")
+            if not self._qianwen_page or self._qianwen_page.is_closed():
+                logger.warning("[Qwen] no page, skip batch delete")
                 return
 
-            import httpx
-            ut = ""
-            for part in qianwen_cookie.split("; "):
-                if part.startswith("b-user-id="):
-                    ut = part.split("=", 1)[1].strip()
-                    break
-            if not ut:
-                logger.warning("[Qwen] cannot extract ut (b-user-id) from cookie, skip delete")
-                return
+            result = await self._qianwen_page.evaluate("""async () => {
+                try {
+                    const utMatch = document.cookie.match(/b-user-id=([^;]+)/);
+                    const ut = utMatch ? utMatch[1] : '';
+                    if (!ut) return { error: 'no b-user-id cookie' };
 
-            query_params = {
-                "biz_id": "ai_qwen", "chat_client": "h5", "device": "pc",
-                "fr": "pc", "pr": "qwen", "la": "zh-CN",
-                "tz": "Asia/Shanghai", "wv": "2.11.9", "ve": "2.11.9", "ut": ut,
-            }
-            headers = {
-                "content-type": "application/json",
-                "cookie": qianwen_cookie,
-                "origin": "https://www.qianwen.com",
-                "referer": "https://www.qianwen.com/",
-                "user-agent": USER_AGENT,
-            }
+                    const params = 'biz_id=ai_qwen&chat_client=h5&device=pc&fr=pc&pr=qwen&la=zh-CN&tz=Asia%2FShanghai&wv=2.11.9&ve=2.11.9&ut=' + ut;
 
-            session_ids = []
-            next_token = ""
-            async with httpx.AsyncClient(timeout=30) as client:
-                while True:
-                    resp = await client.post(
-                        "https://chat2-api.qianwen.com/api/v2/session/page/list",
-                        headers=headers, params=query_params,
-                        json={"next_token": next_token} if next_token else {},
-                    )
-                    data = resp.json()
-                    items = data.get("data", {}).get("list", [])
-                    for s in items:
-                        sid = s.get("session_id", "")
-                        if sid:
-                            session_ids.append(sid)
-                    if not data.get("data", {}).get("have_next_page", False):
-                        break
-                    next_token = data.get("data", {}).get("next_token", "")
-                    if not next_token:
-                        break
+                    // 列出所有会话（分页）
+                    let sessionIds = [];
+                    let nextToken = '';
+                    while (true) {
+                        const body = nextToken ? JSON.stringify({next_token: nextToken}) : '{}';
+                        const listResp = await fetch('https://chat2-api.qianwen.com/api/v2/session/page/list?' + params, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            credentials: 'include',
+                            body: body
+                        });
+                        const data = await listResp.json();
+                        const items = data?.data?.list || [];
+                        for (const s of items) {
+                            if (s.session_id) sessionIds.push(s.session_id);
+                        }
+                        if (!data?.data?.have_next_page) break;
+                        nextToken = data?.data?.next_token || '';
+                        if (!nextToken) break;
+                    }
 
-            if not session_ids:
-                logger.info("[Qwen] no conversations to delete")
-                return
+                    if (sessionIds.length === 0) return { deleted: 0, total: 0 };
 
-            logger.info(f"[Qwen] deleting {len(session_ids)} conversations ...")
-            async with httpx.AsyncClient(timeout=30) as client:
-                batch_size = 20
-                for i in range(0, len(session_ids), batch_size):
-                    batch = session_ids[i:i + batch_size]
-                    try:
-                        resp = await client.post(
-                            "https://chat2-api.qianwen.com/api/v1/session/delete/batch",
-                            headers=headers, params=query_params,
-                            json={"session_ids": batch},
-                        )
-                        result = resp.json()
-                        if result.get("data", {}).get("delete_success"):
-                            logger.info(f"[Qwen] deleted batch {i // batch_size + 1}: {len(batch)} sessions")
-                        else:
-                            logger.warning(f"[Qwen] delete batch failed: {json.dumps(result, ensure_ascii=False)[:300]}")
-                    except Exception as e:
-                        logger.warning(f"[Qwen] delete batch error: {e}")
-
-            logger.info(f"[Qwen] finished deleting {len(session_ids)} conversations")
+                    // 批量删除
+                    let deleted = 0;
+                    for (let i = 0; i < sessionIds.length; i += 20) {
+                        const batch = sessionIds.slice(i, i + 20);
+                        const delResp = await fetch('https://chat2-api.qianwen.com/api/v1/session/delete/batch?' + params, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            credentials: 'include',
+                            body: JSON.stringify({ session_ids: batch })
+                        });
+                        const delData = await delResp.json();
+                        if (delData?.data?.delete_success) deleted += batch.length;
+                    }
+                    return { deleted, total: sessionIds.length };
+                } catch (e) {
+                    return { error: String(e) };
+                }
+            }""")
+            deleted = result.get('deleted', 0) if isinstance(result, dict) else 0
+            total = result.get('total', 0) if isinstance(result, dict) else 0
+            logger.info(f"[Qwen] delete_all: deleted {deleted}/{total} sessions")
         except Exception as e:
-            logger.warning(f"[Qwen] delete_all_conversations error: {e}")
+            logger.warning(f"[Qwen] delete_all exception: {e}")
 
     async def delete_qianwen_conversation(self, session_id: str):
         """删除单个千问对话。"""
@@ -1175,6 +1187,69 @@ class BrowserClient:
             except Exception as e:
                 logger.warning(f"Error deleting doubao conversation {conv_id}: {e}")
 
+    async def delete_all_doubao_conversations(self):
+        """删除所有豆包会话（通过浏览器页面 API）。"""
+        try:
+            if not self._doubao_page or self._doubao_page.is_closed():
+                logger.warning("[Doubao] no page, skip batch delete")
+                return
+
+            device_id = CONFIG.get('device_id', '')
+            web_id = CONFIG.get('web_id', '')
+            tea_uuid = CONFIG.get('tea_uuid', '')
+
+            result = await self._doubao_page.evaluate("""async (args) => {
+                const { device_id, web_id, tea_uuid } = args;
+                try {
+                    const params = new URLSearchParams({
+                        'version_code': '20800', 'language': 'zh', 'device_platform': 'web',
+                        'aid': '497858', 'real_aid': '497858', 'pkg_type': 'release_version',
+                        'device_id': device_id, 'pc_version': '3.22.1', 'web_id': web_id,
+                        'tea_uuid': tea_uuid, 'region': 'CN', 'sys_region': 'CN',
+                        'samantha_web': '1', 'web_platform': 'browser', 'use-olympus-account': '1',
+                        'web_tab_id': crypto.randomUUID(),
+                    });
+                    const listResp = await fetch('/im/chain/recent_conv?' + params.toString(), {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json; encoding=utf-8', 'agw-js-conv': 'str' },
+                        body: JSON.stringify({
+                            'cmd': 3200,
+                            'uplink_body': { 'pull_recent_conv_chain_uplink_body': {
+                                'limit': 200, 'message_count_per_conv': 0, 'api_version': 1, 'conv_version': 0, 'direction': 3,
+                                'option': { 'not_need_message': true, 'need_complete_conversation': true, 'need_coco_conversation': true, 'need_coco_bot': true, 'need_pc_pin_chain': true, 'pc_pin_query_type': 0 }
+                            }},
+                            'sequence_id': crypto.randomUUID(), 'channel': 2, 'version': '1',
+                        })
+                    });
+                    const listData = await listResp.json();
+                    const cells = listData?.downlink_body?.pull_recent_conv_chain_downlink_body?.cells || [];
+                    const convIds = cells.map(c => c.conversation?.conversation_id).filter(Boolean);
+
+                    if (convIds.length === 0) return { deleted: 0, total: 0 };
+
+                    const delResp = await fetch('/im/conversation/batch_del_user_conv?' + params.toString(), {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json; encoding=utf-8', 'agw-js-conv': 'str' },
+                        body: JSON.stringify({
+                            'cmd': 4171,
+                            'uplink_body': { 'batch_delete_user_conversation_uplink_body': { 'conversation_id': convIds, 'delete_all': false, 'conversation_type': 3 } },
+                            'sequence_id': crypto.randomUUID(), 'channel': 2, 'version': '1',
+                        })
+                    });
+                    const delData = await delResp.json();
+                    const result = delData?.downlink_body?.batch_delete_user_conversation_downlink_body?.result || {};
+                    const deleted = Object.values(result).filter(v => v === true).length;
+                    return { deleted, total: convIds.length };
+                } catch (e) {
+                    return { error: String(e) };
+                }
+            }""", {"device_id": device_id, "web_id": web_id, "tea_uuid": tea_uuid})
+            deleted = result.get('deleted', 0) if isinstance(result, dict) else 0
+            total = result.get('total', 0) if isinstance(result, dict) else 0
+            logger.info(f"[Doubao] delete_all: deleted {deleted}/{total} sessions")
+        except Exception as e:
+            logger.warning(f"[Doubao] delete_all exception: {e}")
+
     # ═══════════════════════════════════════════════════════════════════════
     # DeepSeek 专用方法
     # ═══════════════════════════════════════════════════════════════════════
@@ -1196,7 +1271,7 @@ class BrowserClient:
             self._deepseek_browser = await self._deepseek_pw.chromium.launch_persistent_context(
                 user_data_dir=self._deepseek_user_data_dir,
                 headless=headless,
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
@@ -1437,7 +1512,7 @@ class BrowserClient:
             login_browser = await pw.chromium.launch_persistent_context(
                 user_data_dir=self._deepseek_user_data_dir,
                 headless=False,
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
@@ -1467,7 +1542,7 @@ class BrowserClient:
             self._deepseek_browser = await self._deepseek_pw.chromium.launch_persistent_context(
                 user_data_dir=self._deepseek_user_data_dir,
                 headless=CONFIG.get('_deepseek_headless', CONFIG.get('_headless_browser', True)),
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
@@ -2310,7 +2385,7 @@ class BrowserClient:
             logger.warning(f"[DeepSeek] delete exception: {e}")
 
     async def delete_all_deepseek_conversations(self):
-        """删除所有 DeepSeek 会话（通过浏览器页面 API 删除，带 Bearer token）。"""
+        """删除所有 DeepSeek 会话（通过浏览器页面 API 删除）。"""
         try:
             if not self._deepseek_page or self._deepseek_page.is_closed():
                 logger.warning("[DeepSeek] no page, skip batch delete")
@@ -2318,18 +2393,21 @@ class BrowserClient:
 
             result = await self._deepseek_page.evaluate("""async () => {
                 try {
-                    const token = window.__deepseek_auth_token || '';
-                    const csrfMeta = document.querySelector('meta[name="csrf-token"]');
-                    const csrf = csrfMeta ? csrfMeta.getAttribute('content') : '';
+                    // 从 localStorage 获取 auth token
+                    let token = '';
+                    try {
+                        const raw = localStorage.getItem('userToken');
+                        if (raw) {
+                            const obj = JSON.parse(raw);
+                            token = obj.value || '';
+                        }
+                    } catch(e) {}
                     
-                    const listResp = await fetch('/api/v0/chat_session/fetch_page', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-CSRF-Token': csrf,
-                            ...(token ? {'Authorization': `Bearer ${token}`} : {})
-                        },
-                        body: JSON.stringify({lte_cursor: {pinned: false}})
+                    const headers = { 'Content-Type': 'application/json' };
+                    if (token) headers['Authorization'] = 'Bearer ' + token;
+                    
+                    const listResp = await fetch('/api/v0/chat_session/fetch_page?lte_cursor.pinned=false', {
+                        headers: headers
                     });
                     const listData = await listResp.json();
                     const sessions = listData?.data?.biz_data?.chat_sessions || [];
@@ -2338,11 +2416,7 @@ class BrowserClient:
                     for (const s of sessions) {
                         const delResp = await fetch('/api/v0/chat_session/delete', {
                             method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'X-CSRF-Token': csrf,
-                                ...(token ? {'Authorization': `Bearer ${token}`} : {})
-                            },
+                            headers: headers,
                             body: JSON.stringify({chat_session_id: s.id})
                         });
                         const delData = await delResp.json();
@@ -3177,7 +3251,7 @@ class BrowserClient:
         self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
             user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
             headless=headless,
-            channel="msedge",
+            channel=_browser_channel(),
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
             viewport={"width": 1280, "height": 900},
             user_agent=USER_AGENT,
@@ -3399,7 +3473,7 @@ class BrowserClient:
             self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
                 user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
                 headless=False,
-                channel="msedge",
+                channel=_browser_channel(),
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
                 viewport={"width": 1280, "height": 900},
                 user_agent=USER_AGENT,
@@ -4339,7 +4413,7 @@ class BrowserClient:
         self._mimo_browser = await self._mimo_pw.chromium.launch_persistent_context(
             user_data_dir=self._mimo_user_data_dir,
             headless=headless,
-            channel="msedge",
+            channel=_browser_channel(),
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
             viewport={"width": 1280, "height": 900},
             user_agent=USER_AGENT,
@@ -4599,7 +4673,7 @@ class BrowserClient:
         self._mimo_browser = await self._mimo_pw.chromium.launch_persistent_context(
             user_data_dir=self._mimo_user_data_dir,
             headless=False,
-            channel="msedge",
+            channel=_browser_channel(),
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
             viewport={"width": 1280, "height": 900},
             user_agent=USER_AGENT,
@@ -4839,7 +4913,11 @@ class BrowserClient:
             return
         try:
             ph_token = await self._mimo_page.evaluate("""() => {
-                return document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('xiaomichatbot_ph='))?.split('=')[1] || null;
+                const raw = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('xiaomichatbot_ph='));
+                if (!raw) return null;
+                let val = raw.split('=').slice(1).join('=');
+                if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+                return val || null;
             }""")
             if not ph_token:
                 logger.warning("[MiMo] no xiaomichatbot_ph cookie found")
@@ -4868,7 +4946,11 @@ class BrowserClient:
             if not self._mimo_page or self._mimo_page.is_closed():
                 return
             ph_token = await self._mimo_page.evaluate("""() => {
-                return document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('xiaomichatbot_ph='))?.split('=')[1] || null;
+                const raw = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('xiaomichatbot_ph='));
+                if (!raw) return null;
+                let val = raw.split('=').slice(1).join('=');
+                if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+                return val || null;
             }""")
             if not ph_token:
                 logger.warning("[MiMo] no xiaomichatbot_ph cookie found")
@@ -4919,14 +5001,14 @@ class BrowserClient:
 
     async def close(self):
         """关闭所有浏览器。"""
-        for attr in ['_doubao_browser', '_qianwen_browser', '_deepseek_browser', '_zai_browser', '_mimo_browser']:
+        for attr in ['_doubao_browser', '_qianwen_browser', '_deepseek_browser', '_zai_browser', '_mimo_browser', '_minimax_browser', '_xinghuo_browser']:
             browser = getattr(self, attr, None)
             if browser:
                 try:
                     await browser.close()
                 except:
                     pass
-        for attr in ['_pw', '_doubao_pw', '_qianwen_pw', '_deepseek_pw', '_zai_pw', '_mimo_pw']:
+        for attr in ['_pw', '_doubao_pw', '_qianwen_pw', '_deepseek_pw', '_zai_pw', '_mimo_pw', '_minimax_pw', '_xinghuo_pw']:
             pw = getattr(self, attr, None)
             if pw:
                 try:
@@ -4935,7 +5017,7 @@ class BrowserClient:
                     pass
         
         # 取消所有待处理的页面操作，避免 TargetClosedError
-        for attr in ['_doubao_page', '_qianwen_page', '_deepseek_page', '_zai_page', '_mimo_page']:
+        for attr in ['_doubao_page', '_qianwen_page', '_deepseek_page', '_zai_page', '_mimo_page', '_minimax_page', '_xinghuo_page']:
             page = getattr(self, attr, None)
             if page:
                 try:
@@ -4943,6 +5025,1737 @@ class BrowserClient:
                         await page.close()
                 except:
                     pass
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # MiniMax Agent 浏览器操作
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def ensure_minimax_ready(self, headless: bool = True):
+        """确保 MiniMax Agent 浏览器已启动并登录。"""
+        if self._minimax_page and not self._minimax_page.is_closed():
+            return
+
+        from playwright.async_api import async_playwright
+        logger.info("[Minimax] Starting MiniMax Agent browser...")
+        self._minimax_pw = await async_playwright().start()
+        self._minimax_browser = await self._minimax_pw.chromium.launch_persistent_context(
+            user_data_dir=self._minimax_user_data_dir,
+            headless=headless,
+            channel=_browser_channel(),
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 900},
+            user_agent=USER_AGENT,
+            ignore_default_args=["--enable-automation"],
+        )
+        self._minimax_page = self._minimax_browser.pages[0] if self._minimax_browser.pages else await self._minimax_browser.new_page()
+
+        # 反检测
+        await self._minimax_page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+        """)
+
+        await self._minimax_page.goto("https://agent.minimaxi.com/", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(5)
+
+        # 移除遮挡弹窗
+        await self._minimax_page.evaluate("""() => {
+            document.querySelectorAll('[data-connect-mobile-hint-dismiss-boundary]').forEach(el => el.remove());
+            document.querySelectorAll('.fixed').forEach(el => {
+                const z = el.style.zIndex || window.getComputedStyle(el).zIndex;
+                if (parseInt(z) >= 999) el.remove();
+            });
+        }""")
+        await asyncio.sleep(1)
+
+        # 检查是否已登录（查找登录按钮）
+        is_logged_in = await self._minimax_page.evaluate("""() => {
+            return !document.querySelector('[data-testid="sidebar-login-button"]');
+        }""")
+
+        if not is_logged_in:
+            if headless:
+                raise RuntimeError("MiniMax Agent 未登录，请先运行 python main.py --login minimax")
+            # 非 headless 模式，尝试登录
+            logger.info("[Minimax] Not logged in, opening login page...")
+            await self._minimax_page.evaluate("""() => {
+                const btn = document.querySelector('[data-testid="sidebar-login-button"]');
+                if (btn) btn.click();
+            }""")
+            await asyncio.sleep(3)
+
+            # 等待用户登录（最多 3 分钟）
+            for i in range(90):
+                await asyncio.sleep(2)
+                url = self._minimax_page.url
+                if (url.startswith('https://agent.minimaxi.com') and
+                    'account.minimaxi.com' not in url and
+                    'unified-login' not in url):
+                    logger.info("[Minimax] Login successful!")
+                    break
+            else:
+                raise RuntimeError("MiniMax Agent 登录超时")
+
+        logger.info("[Minimax] MiniMax Agent browser ready")
+
+    async def get_minimax_session_id(self) -> str:
+        """从 MiniMax 页面 URL 提取当前会话 ID。"""
+        try:
+            if not self._minimax_page:
+                return ""
+            url = self._minimax_page.url
+            if '/mavis/' in url:
+                sid = url.split('/mavis/')[-1].split('?')[0].split('#')[0]
+                if sid:
+                    return sid
+            return ""
+        except Exception:
+            return ""
+
+    async def stream_minimax_chat(self, prompt: str, model_type: str = "m3",
+                                   thinking_enabled: bool = False,
+                                   search_enabled: bool = False,
+                                   inline_file_content: str | None = None,
+                                   model_name: str | None = None):
+        """向 MiniMax Agent 发送消息并流式返回响应。
+
+        Yields: (kind, value) 元组
+            kind: "session_id", "chunk", "done", "error"
+        """
+        if not self._minimax_page or self._minimax_page.is_closed():
+            yield ("error", "MiniMax page not available")
+            return
+
+        async with self._minimax_lock:
+            try:
+                # 创建新会话
+                await self._minimax_page.goto("https://agent.minimaxi.com/", wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+
+                # 移除弹窗
+                await self._minimax_page.evaluate("""() => {
+                    document.querySelectorAll('[data-connect-mobile-hint-dismiss-boundary]').forEach(el => el.remove());
+                    document.querySelectorAll('.fixed').forEach(el => {
+                        const z = el.style.zIndex || window.getComputedStyle(el).zIndex;
+                        if (parseInt(z) >= 999) el.remove();
+                    });
+                }""")
+                await asyncio.sleep(1)
+
+                # 注入 SSE 拦截器
+                await self._minimax_page.evaluate("""() => {
+                    if (!window.__minimax_sse_patched) {
+                        window.__minimax_sse_patched = true;
+                        window.__minimax_sse_events = [];
+                        const origFetch = window.fetch;
+                        window.fetch = async function(...args) {
+                            const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+                            const resp = await origFetch.apply(this, args);
+                            if (url.includes('/chat/') || url.includes('/send_msg') || url.includes('/continue_run')) {
+                                try {
+                                    const cloned = resp.clone();
+                                    const reader = cloned.body.getReader();
+                                    const decoder = new TextDecoder();
+                                    (async () => {
+                                        let buf = '';
+                                        while (true) {
+                                            const {value, done} = await reader.read();
+                                            if (done) {
+                                                window.__minimax_sse_events.push(JSON.stringify({type: 'done'}));
+                                                break;
+                                            }
+                                            buf += decoder.decode(value, {stream: true});
+                                            const lines = buf.split('\\n');
+                                            buf = lines.pop() || '';
+                                            for (const line of lines) {
+                                                if (line.startsWith('data:')) {
+                                                    const raw = line.slice(5).trim();
+                                                    if (raw === '[DONE]') {
+                                                        window.__minimax_sse_events.push(JSON.stringify({type: 'done'}));
+                                                    } else if (raw) {
+                                                        window.__minimax_sse_events.push(JSON.stringify({type: 'data', data: raw}));
+                                                    }
+                                                } else if (line.startsWith('event:')) {
+                                                    const evt = line.slice(6).trim();
+                                                    if (evt === 'done' || evt === 'close') {
+                                                        window.__minimax_sse_events.push(JSON.stringify({type: 'done'}));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    })();
+                                } catch(e) {}
+                            }
+                            return resp;
+                        };
+                    }
+                }""")
+
+                # 准备发送内容
+                content = inline_file_content if inline_file_content else prompt
+
+                # 查找输入框并输入
+                textarea = self._minimax_page.locator('textarea, [contenteditable="true"]').first
+                await textarea.click()
+                await asyncio.sleep(0.5)
+
+                # 使用 native setter 确保 React 状态同步
+                await self._minimax_page.evaluate("""(text) => {
+                    const el = document.querySelector('textarea, [contenteditable="true"]');
+                    if (!el) return;
+                    if (el.tagName === 'TEXTAREA') {
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                        nativeSetter.call(el, text);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    } else {
+                        el.textContent = text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }""", content)
+                await asyncio.sleep(0.5)
+
+                # 清空 SSE 事件缓冲
+                await self._minimax_page.evaluate("window.__minimax_sse_events = []")
+
+                # 点击发送按钮或按 Enter
+                send_btn = self._minimax_page.locator('button[data-testid*="send"], button[aria-label*="发送"]').first
+                try:
+                    await send_btn.click(timeout=3000)
+                except Exception:
+                    await textarea.press("Enter")
+
+                await asyncio.sleep(1)
+
+                # 获取会话 ID
+                session_id = await self.get_minimax_session_id()
+                if session_id:
+                    yield ("session_id", session_id)
+
+                # 读取 SSE 事件
+                last_event_count = 0
+                empty_count = 0
+                max_empty = 30  # 60 秒无数据则超时
+
+                while empty_count < max_empty:
+                    await asyncio.sleep(2)
+                    events = await self._minimax_page.evaluate("window.__minimax_sse_events || []")
+                    new_events = events[last_event_count:]
+                    last_event_count = len(events)
+
+                    if not new_events:
+                        empty_count += 1
+                        continue
+
+                    empty_count = 0
+                    for evt_str in new_events:
+                        try:
+                            evt = json.loads(evt_str)
+                            if evt.get("type") == "done":
+                                yield ("done", "")
+                                return
+                            elif evt.get("type") == "data":
+                                data_str = evt.get("data", "")
+                                # 尝试解析 SSE data
+                                try:
+                                    data = json.loads(data_str)
+                                    # MiniMax 可能使用不同的数据格式
+                                    content = (data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                              or data.get("data", {}).get("delta_content", "")
+                                              or data.get("delta_content", "")
+                                              or "")
+                                    if content:
+                                        yield ("chunk", content)
+                                except json.JSONDecodeError:
+                                    # 可能是纯文本
+                                    if data_str and data_str != "[DONE]":
+                                        yield ("chunk", data_str)
+                        except Exception:
+                            pass
+
+                yield ("done", "")
+
+            except Exception as e:
+                logger.warning(f"[Minimax] stream_chat error: {e}")
+                yield ("error", str(e))
+
+    async def delete_minimax_conversation(self, session_id: str):
+        """删除单个 MiniMax 会话。"""
+        if not session_id or not self._minimax_page or self._minimax_page.is_closed():
+            return
+        try:
+            # 获取 token
+            token = await self._minimax_page.evaluate("localStorage.getItem('token') || ''")
+            if not token:
+                logger.warning("[Minimax] no token for delete")
+                return
+
+            result = await self._minimax_page.evaluate("""async (args) => {
+                try {
+                    const resp = await fetch('/sidebar/session/' + args.sid + '?device_platform=web&biz_id=3&app_id=3001', {
+                        method: 'DELETE',
+                        headers: { 'Authorization': 'Bearer ' + args.token, 'Content-Type': 'application/json' }
+                    });
+                    return { ok: resp.ok, status: resp.status };
+                } catch (e) {
+                    return { error: String(e) };
+                }
+            }""", {"sid": session_id, "token": token})
+            if result.get("ok"):
+                logger.info(f"[Minimax] deleted session {session_id}")
+            else:
+                logger.warning(f"[Minimax] delete failed: {result}")
+        except Exception as e:
+            logger.warning(f"[Minimax] delete exception: {e}")
+
+    async def delete_all_minimax_conversations(self):
+        """删除所有 MiniMax 会话。"""
+        try:
+            if not self._minimax_page or self._minimax_page.is_closed():
+                logger.warning("[Minimax] no page, skip batch delete")
+                return
+
+            result = await self._minimax_page.evaluate("""async () => {
+                try {
+                    const token = localStorage.getItem('token') || '';
+                    if (!token) return { error: 'no token' };
+
+                    // 获取会话列表
+                    const listResp = await fetch('/sidebar/session?device_platform=web&biz_id=3&app_id=3001', {
+                        headers: { 'Authorization': 'Bearer ' + token }
+                    });
+                    const listData = await listResp.json();
+                    const sessions = listData?.data?.sessions || [];
+                    if (sessions.length === 0) return { deleted: 0, total: 0 };
+
+                    let deleted = 0;
+                    for (const s of sessions) {
+                        try {
+                            const delResp = await fetch('/sidebar/session/' + s.id + '?device_platform=web&biz_id=3&app_id=3001', {
+                                method: 'DELETE',
+                                headers: { 'Authorization': 'Bearer ' + token }
+                            });
+                            if (delResp.ok) deleted++;
+                        } catch(e) {}
+                    }
+                    return { deleted, total: sessions.length };
+                } catch (e) {
+                    return { error: String(e) };
+                }
+            }""")
+            deleted = result.get('deleted', 0) if isinstance(result, dict) else 0
+            total = result.get('total', 0) if isinstance(result, dict) else 0
+            logger.info(f"[Minimax] delete_all: deleted {deleted}/{total} sessions")
+        except Exception as e:
+            logger.warning(f"[Minimax] delete_all exception: {e}")
+
+    async def close_minimax(self):
+        """关闭 MiniMax 浏览器。"""
+        try:
+            if self._minimax_page and not self._minimax_page.is_closed():
+                await self._minimax_page.close()
+        except Exception:
+            pass
+        self._minimax_page = None
+        try:
+            if self._minimax_browser:
+                await self._minimax_browser.close()
+        except Exception:
+            pass
+        self._minimax_browser = None
+        try:
+            if self._minimax_pw:
+                await self._minimax_pw.stop()
+        except Exception:
+            pass
+        self._minimax_pw = None
+        logger.info("[Minimax] resources cleaned up")
+
+    async def _minimax_fetch_with_signature(self, path: str, extra: dict | None = None, body: dict | None = None, method: str = "GET") -> dict:
+        """在浏览器内完整执行 Minimax API 请求，包括构建 URL 和生成签名。"""
+        signature_js = """
+        async (path, extra, body, method) => {
+            // 从 localStorage 获取 token
+            const token = localStorage.getItem('_token');
+            if (!token) throw new Error('no token');
+            
+            // 获取用户信息
+            const ud = localStorage.getItem('user_detail_agent');
+            let userId = '';
+            if (ud) {
+                try { userId = JSON.parse(ud).realUserID || JSON.parse(ud).userID || ''; } catch(e) {}
+            }
+            const deviceId = localStorage.getItem('UNIQUE_USER_ID') || '';
+            
+            // 基础参数
+            const base = {{
+                device_platform: "web",
+                biz_id: "3",
+                app_id: "3001",
+                version_code: "22201",
+                timezone_offset: String(-new Date().getTimezoneOffset() * 60),
+                sys_language: navigator.language || "zh",
+                lang: "zh",
+                uuid: deviceId,
+                os_name: navigator.userAgent.includes("Windows") ? "Windows" : navigator.userAgent.includes("Mac") ? "macOS" : "Linux",
+                browser_name: "Chrome",
+                device_memory: String(navigator.deviceMemory || 8),
+                cpu_core_num: String(navigator.hardwareConcurrency || 8),
+                browser_language: navigator.language || "zh-CN",
+                browser_platform: navigator.platform || "Win32",
+                user_id: userId,
+                screen_width: String(screen.width || 1280),
+                screen_height: String(screen.height || 900),
+                client: "web"
+            }};
+            
+            // 合并额外参数
+            const allParams = { ...base, ...extra };
+            // 加上 Unix 时间戳
+            const now = Date.now();
+            const unix = String(now);
+            allParams.unix = unix;
+            
+            // 构建查询字符串
+            const usp = new URLSearchParams();
+            for (const [k, v] of Object.entries(allParams)) {
+                usp.append(k, String(v));
+            }
+            const queryString = usp.toString();
+            
+            // 构建完整 URL
+            const url = `https://agent.minimaxi.com${path}?${queryString}`;
+            
+            // 提取路径+查询用于签名（去掉 hostname）
+            const pathWithQS = path + '?' + queryString;
+            
+            // 生成 x-timestamp
+            const xTimestamp = Math.floor(now / 1000).toString();
+            
+            // 生成 x-signature: MD5(xTimestamp + "I*7Cf%WZ#S&%1RlZJ&C2" + bodyString)
+            let bodyStr = "{}";
+            if (body && typeof body === 'object') {
+                bodyStr = JSON.stringify(body);
+            } else if (typeof body === 'string') {
+                bodyStr = body;
+            }
+            const secret = "I*7Cf%WZ#S&%1RlZJ&C2";
+            const xSignature = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(xTimestamp + secret + bodyStr))
+                .then(buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join(''))
+                .then(hex => {
+                    // crypto.subtle only supports SHA-256, SHA-384, SHA-512. We need MD5.
+                    // Fallback to simple custom MD5 or use crypto.js?
+                    // For now, we'll implement a simple MD5 in JS
+                    return md5(xTimestamp + secret + bodyStr);
+                });
+            
+            // 生成 yy: MD5(encodeURIComponent(pathWithQS) + '_' + bodyStr + MD5(xTimestamp) + 'ooui')
+            const tsMd5 = md5(xTimestamp);
+            const yyInput = encodeURIComponent(pathWithQS) + '_' + bodyStr + tsMd5 + 'ooui';
+            const yy = md5(yyInput);
+            
+            // 发送请求
+            const headers = {
+                'Content-Type': 'application/json',
+                'token': token,
+                'x-timestamp': xTimestamp,
+                'x-signature': xSignature,
+                'yy': yy
+            };
+            
+            try {
+                const resp = await fetch(url, {
+                    method: method,
+                    headers: headers,
+                    body: body && method === 'POST' ? JSON.stringify(body) : undefined
+                });
+                const text = await resp.text();
+                return { status: resp.status, body: text, ok: resp.ok };
+            } catch (e) {
+                return { error: String(e) };
+            }
+        }
+        
+        // MD5 implementation in JS (copy from captured context)
+        function md5(string) {
+            function rotateLeft(lValue, iShiftBits) {
+                return (lValue<<iShiftBits) | (lValue>>>(32-iShiftBits));
+            }
+            function addUnsigned(lX,lY) {
+                var lX4,lY4,lX8,lY8,lResult;
+                lX8 = (lX & 0x80000000); lY8 = (lY & 0x80000000);
+                lX4 = (lX & 0x40000000); lY4 = (lY & 0x40000000);
+                lResult = (lX & 0x3FFFFFF) + (lY & 0x3FFFFFF);
+                if (lX4 & lY4) return (lResult ^ 0x80000000 ^ lX8 ^ lY8);
+                if (lX4 | lY4) {
+                    if (lResult & 0x40000000) return (lResult ^ 0xC0000000 ^ lX8 ^ lY8);
+                    else return (lResult ^ 0x40000000 ^ lX8 ^ lY8);
+                } else return (lResult ^ lX8 ^ lY8);
+            }
+            // ... full implementation needed but truncated for brevity
+            return "00000000000000000000000000000000"; // Placeholder
+        }
+        """
+        # Actually, we need to move the full MD5 implementation to an earlier injection or include it
+        
+        # For now, let's call an existing page method if available
+        raise NotImplementedError("Use browser-side signing instead")
+
+    async def _minimax_common_params(self) -> dict:
+        """获取 Minimax API 公共查询参数。"""
+        import time as _time
+        token = await self._minimax_page.evaluate("localStorage.getItem('_token')")
+        if not token:
+            raise RuntimeError("[Minimax] no token in localStorage._token")
+        
+        user_info = await self._minimax_page.evaluate("""() => {
+            const ud = localStorage.getItem('user_detail_agent');
+            let userId = '';
+            if (ud) {
+                try { userId = JSON.parse(ud).realUserID || JSON.parse(ud).userID || ''; } catch(e) {}
+            }
+            return {
+                userId: userId,
+                deviceId: localStorage.getItem('UNIQUE_USER_ID') || ''
+            };
+        }""")
+        
+        return {
+            "device_platform": "web",
+            "biz_id": "3",
+            "app_id": "3001",
+            "version_code": "22201",
+            "unix": str(int(_time.time() * 1000)),
+            "timezone_offset": "28800",
+            "sys_language": "zh",
+            "lang": "zh",
+            "uuid": user_info.get("deviceId", ""),
+            "os_name": "Windows" if sys.platform.startswith("win") else "macOS" if sys.platform == "darwin" else "Linux",
+            "browser_name": "Chrome",
+            "device_memory": "32",
+            "cpu_core_num": "8",
+            "browser_language": "zh-CN",
+            "browser_platform": "Win32" if sys.platform.startswith("win") else "MacIntel" if sys.platform == "darwin" else "Linux x86_64",
+            "user_id": user_info.get("userId", ""),
+            "screen_width": "1280",
+            "screen_height": "900",
+            "token": token,
+            "client": "web",
+        }
+
+    async def _minimax_api_request(self, path: str, extra: dict | None = None, body: dict | None = None, method: str = "GET") -> dict:
+        """发送带签名的 Minimax API 请求。Python 端计算签名（hashlib.md5），浏览器端构建 URL 和 fetch。"""
+        params = await self._minimax_common_params()
+        if extra:
+            params.update(extra)
+        params["unix"] = str(int(time.time() * 1000))
+        
+        unix_ms = params["unix"]
+        x_timestamp = str(int(int(unix_ms) / 1000))
+        
+        body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else None
+        
+        # 计算签名所需的 body_str：GET 为空串，POST 为 JSON（或空串）
+        body_for_sig = body_json if (method.upper() == "POST" and body_json) else ""
+        
+        # 在浏览器端用 URLSearchParams 构建查询字符串（与 Minimax 原生 JS 一致）
+        build_result = await self._minimax_page.evaluate("""
+            (args) => {
+                const usp = new URLSearchParams();
+                for (const [k, v] of Object.entries(args.params)) {
+                    usp.append(k, String(v));
+                }
+                const qs = usp.toString();
+                const pathWithQS = args.path + '?' + qs;
+                const fullUrl = 'https://agent.minimaxi.com' + pathWithQS;
+                return { qs, pathWithQS, fullUrl };
+            }
+        """, {"params": params, "path": path})
+        
+        path_with_qs = build_result["pathWithQS"]
+        full_url = build_result["fullUrl"]
+        
+        # x-signature = MD5(xTimestamp + secret + bodyStr)
+        secret = "I*7Cf%WZ#S&%1RlZJ&C2"
+        x_signature = hashlib.md5(f"{x_timestamp}{secret}{body_for_sig}".encode("utf-8")).hexdigest()
+        
+        # yy = MD5(encodeURIComponent(pathWithQS) + '_' + bodyStr + MD5(xTimestamp) + 'ooui')
+        ts_md5 = hashlib.md5(x_timestamp.encode("utf-8")).hexdigest()
+        yy_input = urllib.parse.quote(path_with_qs, safe="") + "_" + body_for_sig + ts_md5 + "ooui"
+        yy = hashlib.md5(yy_input.encode("utf-8")).hexdigest()
+        
+        token = params.get("token", "")
+        
+        logger.debug(f"[Minimax] {method} {path[:60]}.. yy={yy[:8]}.. sig={x_signature[:8]}..")
+        
+        result = await self._minimax_page.evaluate("""
+            async (args) => {
+                const {url, bodyObj, method, token, xTimestamp, xSignature, yy} = args;
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'token': token,
+                    'x-timestamp': xTimestamp,
+                    'x-signature': xSignature,
+                    'yy': yy
+                };
+                try {
+                    const resp = await fetch(url, {
+                        method: method,
+                        headers: headers,
+                        body: bodyObj ? JSON.stringify(bodyObj) : undefined
+                    });
+                    return { status: resp.status, body: await resp.text(), ok: resp.ok };
+                } catch (e) {
+                    return { error: String(e) };
+                }
+            }
+        """, {
+            "url": full_url,
+            "bodyObj": body,
+            "method": method,
+            "token": token,
+            "xTimestamp": x_timestamp,
+            "xSignature": x_signature,
+            "yy": yy,
+        })
+        
+        return result
+
+    async def _minimax_build_url(self, base_path: str, extra: dict | None = None) -> str:
+        """构建 Minimax API URL。在浏览器内部用 URLSearchParams 构建，确保编码与浏览器一致。"""
+        import time
+        params = await self._minimax_common_params()
+        params["unix"] = str(int(time.time() * 1000))
+        if extra:
+            params.update(extra)
+        # 在浏览器内部构建 URL，避免 Python urlencode 编码 JWT token 中的 . 字符
+        js_params = json.dumps(params)
+        result = await self._minimax_page.evaluate(f"""
+            (() => {{
+                const p = {js_params};
+                const usp = new URLSearchParams();
+                for (const [k, v] of Object.entries(p)) {{
+                    usp.append(k, String(v));
+                }}
+                return 'https://agent.minimaxi.com{base_path}?' + usp.toString();
+            }})()
+        """)
+        return result
+
+    async def upload_minimax_file(self, file_data: bytes, file_name: str, mime_type: str = "text/plain") -> dict:
+        """上传文件到 Minimax：获取策略 → Python oss2 直接上传 OSS → 回调注册。
+        返回 {file_id, file_url, file_name, mime_type}。
+        """
+        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_minimax_ready(headless=headless)
+
+        import hashlib
+        import uuid
+        import time
+        import base64
+        
+        file_md5 = hashlib.md5(file_data).hexdigest()
+        file_size = len(file_data)
+        ext = file_name.rsplit('.', 1)[-1] if '.' in file_name else 'txt'
+        oss_filename = f"{uuid.uuid4().hex}.{ext}"
+
+        # 1. 获取 OSS 上传策略
+        policy_resp = await self._minimax_api_request("/v1/api/files/request_policy", method="GET")
+        
+        if "error" in policy_resp:
+            raise RuntimeError(f"[Minimax] request_policy error: {policy_resp['error']}")
+        
+        policy_data = json.loads(policy_resp["body"])
+        policy = policy_data.get("data", {})
+        if not policy:
+            raise RuntimeError(f"[Minimax] request_policy empty: {policy_resp['body'][:500]}")
+        
+        dir_path = policy.get("dir", "cdn-yingshi-ai-com/prod/user/multi_chat_file")
+        endpoint = policy.get("endpoint", "oss-cn-wulanchabu.aliyuncs.com")
+        bucket = policy["bucketName"]
+        oss_key = f"{dir_path}/{oss_filename}"
+        
+        access_key_id = policy["accessKeyId"]
+        access_key_secret = policy["accessKeySecret"]
+        security_token = policy["securityToken"]
+        
+        logger.info(f"[Minimax] OSS policy OK, uploading to: {oss_key}")
+
+        # 2. 使用 oss2 Python 库签名并上传到 OSS（避免浏览器端 OSS V1 签名兼容问题）
+        import oss2
+        auth = oss2.StsAuth(access_key_id, access_key_secret, security_token)
+        oss_bucket = oss2.Bucket(auth, f"https://{endpoint}", bucket)
+
+        try:
+            result = oss_bucket.put_object(oss_key, file_data, headers={'Content-Type': mime_type})
+            if result.status != 200:
+                raise RuntimeError(f"HTTP {result.status}, request_id={result.request_id}")
+            logger.info(f"[Minimax] OSS upload success: etag={result.etag}")
+        except Exception as e:
+            raise RuntimeError(f"[Minimax] OSS upload exception: {e}")
+
+        # 3. 回调通知 Minimax
+        cb_body = {
+            "fileName": oss_filename,
+            "originFileName": file_name,
+            "dir": dir_path,
+            "endpoint": endpoint,
+            "bucketName": bucket,
+            "size": str(file_size),
+            "mimeType": mime_type,
+            "fileMd5": file_md5,
+        }
+        
+        cb_resp = await self._minimax_api_request("/v1/api/files/policy_callback", body=cb_body, method="POST")
+        
+        if "error" in cb_resp:
+            raise RuntimeError(f"[Minimax] policy_callback error: {cb_resp['error']}")
+        
+        cb_data = json.loads(cb_resp["body"])
+        file_info = cb_data.get("data", {})
+        if not file_info:
+            raise RuntimeError(f"[Minimax] policy_callback failed: {cb_resp['body'][:500]}")
+        
+        logger.info(f"[Minimax] File registered: fileID={file_info.get('fileID')}, ossPath={file_info.get('ossPath')}")
+        return {
+            "file_id": file_info.get("fileID"),
+            "file_url": file_info.get("ossPath"),
+            "file_name": file_name,
+            "mime_type": mime_type,
+        }
+
+    async def upload_minimax_file_via_ui(self, file_data: bytes, file_name: str, mime_type: str = "text/plain") -> dict:
+        """通过页面 UI 上传文件到 Minimax：写入临时文件 → file-input.set_input_files() → 等待页面完成 OSS 上传 → 拦截 policy_callback 响应。
+        返回 {file_id, file_url, file_name, mime_type}。
+        """
+        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_minimax_ready(headless=headless)
+
+        import tempfile
+        import re
+
+        with tempfile.NamedTemporaryFile(suffix=f".{file_name.rsplit('.', 1)[-1] if '.' in file_name else 'txt'}", delete=False) as tf:
+            tf.write(file_data)
+            temp_path = tf.name
+
+        try:
+            callback_data = {}
+
+            async def intercept_callback(route):
+                response = await route.fetch()
+                body = await response.text()
+                url = route.request.url
+                if "policy_callback" in url:
+                    try:
+                        data = json.loads(body)
+                        callback_data.update(data.get("data", {}))
+                    except Exception:
+                        pass
+                await route.fulfill(response=response)
+
+            await self._minimax_page.route("**/policy_callback**", intercept_callback)
+
+            file_input = self._minimax_page.locator('[data-testid="file-input"]')
+            await file_input.set_input_files(temp_path)
+            logger.info(f"[Minimax] UI upload initiated for: {file_name}")
+
+            upload_done = False
+            for i in range(120):
+                await self._minimax_page.wait_for_timeout(1000)
+                att_state = await self._minimax_page.evaluate("""() => {
+                    const bar = document.querySelector('[data-testid="attachment-bar"]');
+                    if (!bar) return null;
+                    const uploading = bar.querySelector('[data-testid="attachment-uploading"]');
+                    const removeBtn = bar.querySelector('[aria-label="移除附件"]');
+                    // 检查任何"分析中/解析中/processing"相关文字
+                    const text = bar.textContent || '';
+                    const hasAnalyzing = /分析|解析|处理|processing|analyzing|loading/i.test(text);
+                    return {
+                        hasUploadBar: !!uploading,
+                        hasRemoveBtn: !!removeBtn,
+                        hasAnalyzing: hasAnalyzing,
+                        barText: text.slice(0, 50),
+                    };
+                }""")
+                if att_state is None:
+                    continue
+                if not att_state['hasUploadBar'] and att_state['hasRemoveBtn'] and not att_state['hasAnalyzing']:
+                    if not upload_done:
+                        upload_done = True
+                        logger.info(f"[Minimax] UI upload (OSS+register) complete in {i+1}s, waiting for analysis...")
+                        # 上传完成后再等待 2 秒确保后端分析完成
+                        await self._minimax_page.wait_for_timeout(2000)
+                    break
+                if not att_state['hasUploadBar'] and not att_state['hasRemoveBtn']:
+                    await self._minimax_page.wait_for_timeout(2000)
+                    bar_exists = await self._minimax_page.evaluate("!!document.querySelector('[data-testid=\"attachment-bar\"]')")
+                    if not bar_exists:
+                        raise RuntimeError(f"[Minimax] Upload bar disappeared after {i+1}s - upload may have failed")
+                if i % 10 == 9:
+                    logger.debug(f"[Minimax] Still processing... {i+1}s, state: {att_state}")
+
+            if not callback_data:
+                raise RuntimeError("[Minimax] policy_callback was not intercepted - upload may have failed")
+
+            file_info = callback_data
+            file_id = file_info.get("fileID")
+            file_url = file_info.get("ossPath") or file_info.get("coverUrl")
+
+            if not file_id or not file_url:
+                raise RuntimeError(f"[Minimax] Missing file info in callback: {json.dumps(callback_data)}")
+
+            logger.info(f"[Minimax] File uploaded via UI: fileID={file_id}, url={file_url}")
+            return {
+                "file_id": file_id,
+                "file_url": file_url,
+                "file_name": file_name,
+                "mime_type": mime_type,
+            }
+        finally:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+            try:
+                await self._minimax_page.unroute("**/policy_callback**", intercept_callback)
+            except Exception:
+                pass
+
+    async def create_minimax_session(self, model_name: str = "MiniMax-M3") -> str:
+        """创建 Minimax Agent 会话，返回 session_id。"""
+        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_minimax_ready(headless=headless)
+
+        agent_id = await self._minimax_page.evaluate("""() => {
+            return localStorage.getItem('agentId') || '411762200674378';
+        }""")
+        
+        resp = await self._minimax_api_request(
+            f"/archon/api/v1/agent/{agent_id}/session",
+            extra={"region": "cn"},
+            body={"model": f"minimax/{model_name}"},
+            method="POST"
+        )
+        
+        if "error" in resp:
+            raise RuntimeError(f"[Minimax] create session error: {resp['error']}")
+        
+        data = json.loads(resp["body"])
+        session_id = data.get("session_id", "") or data.get("data", {}).get("id", "")
+        if not session_id:
+            raise RuntimeError(f"[Minimax] create session failed: {resp['body'][:500]}")
+        
+        logger.info(f"[Minimax] Session created: {session_id}")
+        return session_id
+
+    async def send_minimax_message_with_sse(self, session_id: str, content: str, attachments: list | None = None, model_name: str = "MiniMax-M3", thinking_enabled: bool = False, search_enabled: bool = False):
+        """[备用] 发送消息到 Minimax Agent 并以 SSE 流式返回。通过签名+fetch 直接调用 API。
+        Yields (kind, value)。
+        """
+        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_minimax_ready(headless=headless)
+
+        import uuid as _uuid
+        
+        att_list = []
+        if attachments:
+            for att in attachments:
+                att_list.append({
+                    "type": "file",
+                    "file_path": att.get("file_name", ""),
+                    "file_name": att.get("file_name", ""),
+                    "mime_type": att.get("mime_type", "text/plain"),
+                    "data_url": att.get("file_url", ""),
+                })
+        
+        variant = "thinking" if thinking_enabled else "default"
+        msg_body_dict = {
+            "content": content,
+            "attachments": att_list,
+            "model": {
+                "provider_id": "minimax",
+                "model_id": model_name,
+                "variant": variant,
+            },
+            "turn_id": str(_uuid.uuid4()),
+            "enable_team": True,
+            "worktreeMode": False,
+        }
+        msg_body_json = json.dumps(msg_body_dict, separators=(",", ":"), ensure_ascii=False)
+        
+        stream_path = f"/archon/api/v1/session/{session_id}/message"
+        params = await self._minimax_common_params()
+        params["region"] = "cn"
+        params["unix"] = str(int(time.time() * 1000))
+        
+        build_result = await self._minimax_page.evaluate("""
+            (args) => {
+                const usp = new URLSearchParams();
+                for (const [k, v] of Object.entries(args.params)) {
+                    usp.append(k, String(v));
+                }
+                const qs = usp.toString();
+                const pathWithQS = args.path + '?' + qs;
+                const fullUrl = 'https://agent-stream.minimaxi.com' + pathWithQS;
+                return { qs, pathWithQS, fullUrl };
+            }
+        """, {"params": params, "path": stream_path})
+        
+        full_url = build_result["fullUrl"]
+        path_with_qs = build_result["pathWithQS"]
+        
+        x_timestamp = str(int(int(params["unix"]) / 1000))
+        secret = "I*7Cf%WZ#S&%1RlZJ&C2"
+        x_signature = hashlib.md5(f"{x_timestamp}{secret}{msg_body_json}".encode("utf-8")).hexdigest()
+        ts_md5 = hashlib.md5(x_timestamp.encode("utf-8")).hexdigest()
+        yy_input = urllib.parse.quote(path_with_qs, safe="") + "_" + msg_body_json + ts_md5 + "ooui"
+        yy = hashlib.md5(yy_input.encode("utf-8")).hexdigest()
+        token = params.get("token", "")
+
+        await self._minimax_page.evaluate("""() => {
+            window.__minimax_sse_chunks = [];
+            window.__minimax_sse_done = false;
+            window.__minimax_sse_error = null;
+        }""")
+
+        asyncio.create_task(self._minimax_page.evaluate("""async (args) => {
+            try {
+                const resp = await fetch(args.url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'text/event-stream',
+                        'token': args.token,
+                        'x-timestamp': args.xTimestamp,
+                        'x-signature': args.xSignature,
+                        'yy': args.yy,
+                    },
+                    body: args.body,
+                });
+                if (!resp.ok) {
+                    const text = await resp.text();
+                    window.__minimax_sse_error = 'HTTP ' + resp.status + ' ' + text.slice(0, 300);
+                    window.__minimax_sse_done = true;
+                    return;
+                }
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) { window.__minimax_sse_done = true; break; }
+                    buf += decoder.decode(value, { stream: true });
+                    const lines = buf.split('\\n');
+                    buf = lines.pop() || '';
+                    for (const line of lines) {
+                        if (line.startsWith('data:')) {
+                            const raw = line.slice(5).trim();
+                            if (raw && raw !== '[DONE]') {
+                                try { window.__minimax_sse_chunks.push(raw); } catch(e) {}
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                window.__minimax_sse_error = String(e);
+                window.__minimax_sse_done = true;
+            }
+        }""", {
+            "url": full_url,
+            "body": msg_body_json,
+            "token": token,
+            "xTimestamp": x_timestamp,
+            "xSignature": x_signature,
+            "yy": yy,
+        }))
+
+        last_count = 0
+        empty_count = 0
+        while empty_count < 60:
+            await asyncio.sleep(1)
+            chunks = await self._minimax_page.evaluate("window.__minimax_sse_chunks || []")
+            done = await self._minimax_page.evaluate("window.__minimax_sse_done")
+            err = await self._minimax_page.evaluate("window.__minimax_sse_error")
+            
+            if err:
+                yield ("error", err)
+                return
+            
+            new_chunks = chunks[last_count:]
+            last_count = len(chunks)
+            
+            if new_chunks:
+                empty_count = 0
+                for chunk_str in new_chunks:
+                    try:
+                        data = json.loads(chunk_str)
+                        c = ""
+                        if isinstance(data, dict):
+                            msg_type = data.get("type")
+                            if msg_type == 6:
+                                chunk = data.get("agent_message_chunk", {})
+                                c = chunk.get("msg_content", "") or chunk.get("content", "") or chunk.get("thinking_content", "")
+                            elif msg_type in (2, 10):
+                                pass
+                            elif "content" in data:
+                                c = data["content"]
+                        if c:
+                            yield ("chunk", c)
+                    except json.JSONDecodeError:
+                        if chunk_str and chunk_str != "[DONE]":
+                            yield ("chunk", chunk_str)
+            else:
+                empty_count += 1
+            if done:
+                break
+        yield ("done", "")
+
+    async def send_minimax_message_via_ui(self, content: str, model_name: str = "MiniMax-M3", thinking_enabled: bool = False, search_enabled: bool = False):
+        """[主要] 通过页面 UI 发送消息到 Minimax Agent 并拦截 fetch 捕获 SSE 流式返回。
+        前提：附件已通过 upload_minimax_file_via_ui 上传且分析完成，attachment-bar 中已有文件卡片。
+        参考MiMo的 stream_mimo_chat 实现。
+        Yields (kind, value)。
+        """
+        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_minimax_ready(headless=headless)
+
+        q = asyncio.Queue()
+
+        async def _on_minimax_chunk(chunk_json: str):
+            try:
+                data = json.loads(chunk_json)
+                msg_type = data.get("type")
+                if msg_type == 6:
+                    chunk = data.get("agent_message_chunk", {})
+                    text = chunk.get("msg_content", "") or chunk.get("content", "") or chunk.get("thinking_content", "")
+                    if text:
+                        q.put_nowait(("chunk", text))
+                elif msg_type == 2:
+                    pass
+                elif msg_type == 10:
+                    pass
+                else:
+                    cont = data.get("content", "")
+                    if cont:
+                        q.put_nowait(("chunk", cont))
+            except Exception:
+                pass
+
+        async def _on_minimax_done():
+            q.put_nowait(("done", ""))
+
+        try:
+            await self._minimax_page.expose_function("minimaxOnChunk", _on_minimax_chunk)
+        except Exception:
+            pass
+        try:
+            await self._minimax_page.expose_function("minimaxOnDone", _on_minimax_done)
+        except Exception:
+            pass
+
+        if not getattr(self, "_minimax_fetch_intercepted", False):
+            await self._minimax_page.evaluate(r"""() => {
+                const origFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+                    const response = await origFetch.apply(this, args);
+                    if (url.includes('/session/') && url.includes('/message') && response.headers.get('content-type')?.includes('text/event-stream')) {
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buf = '';
+                        (async () => {
+                            while (true) {
+                                const { value, done } = await reader.read();
+                                if (done) break;
+                                buf += decoder.decode(value, { stream: true });
+                                const lines = buf.split('\n');
+                                buf = lines.pop() || '';
+                                for (const line of lines) {
+                                    if (!line.startsWith('data:')) continue;
+                                    const raw = line.slice(5).trim();
+                                    if (!raw || raw === '[DONE]') continue;
+                                    try {
+                                        window.minimaxOnChunk(raw);
+                                    } catch (e) {}
+                                }
+                            }
+                            window.minimaxOnDone();
+                        })();
+                    }
+                    return response;
+                };
+            }""")
+            self._minimax_fetch_intercepted = True
+            logger.info("[Minimax] fetch interceptor installed")
+
+        # 确保附件分析完成（参考 MiMo：查找文件大小信息出现 = 解析完成）
+        att_bar = await self._minimax_page.evaluate("""() => {
+            const bar = document.querySelector('[data-testid="attachment-bar"]');
+            if (!bar) return { exists: false };
+            const uploading = bar.querySelector('[data-testid="attachment-uploading"]');
+            const removeBtn = bar.querySelector('[aria-label="移除附件"]');
+            const text = bar.textContent || '';
+            const hasAnalyzing = /分析|解析|处理|processing|analyzing|loading/i.test(text);
+            return {
+                exists: true,
+                hasUploading: !!uploading,
+                hasRemoveBtn: !!removeBtn,
+                hasAnalyzing: hasAnalyzing,
+            };
+        }""")
+        if att_bar.get("exists"):
+            if att_bar.get("hasUploading") or att_bar.get("hasAnalyzing"):
+                logger.info("[Minimax] Attachment still processing, waiting for analysis to complete...")
+                for i in range(120):
+                    await self._minimax_page.wait_for_timeout(1000)
+                    st = await self._minimax_page.evaluate("""() => {
+                        const bar = document.querySelector('[data-testid="attachment-bar"]');
+                        if (!bar) return { exists: false };
+                        const uploading = bar.querySelector('[data-testid="attachment-uploading"]');
+                        const removeBtn = bar.querySelector('[aria-label="移除附件"]');
+                        const text = bar.textContent || '';
+                        const hasAnalyzing = /分析|解析|处理|processing|analyzing|loading/i.test(text);
+                        return { exists: true, hasUploading: !!uploading, hasRemoveBtn: !!removeBtn, hasAnalyzing: hasAnalyzing };
+                    }""")
+                    if not st.get("exists"):
+                        logger.warning("[Minimax] Attachment bar disappeared during analysis wait")
+                        break
+                    if not st.get("hasUploading") and not st.get("hasAnalyzing") and st.get("hasRemoveBtn"):
+                        logger.info(f"[Minimax] Attachment analysis complete in {i+1}s")
+                        break
+                    if i % 10 == 9:
+                        logger.debug(f"[Minimax] Still analyzing attachment... {i+1}s")
+
+        # 填写 textarea（ProseMirror rich-text-editor）
+        await self._minimax_page.evaluate("""(args) => {
+            const ta = document.querySelector('[data-testid="message-textarea"]');
+            if (!ta) throw new Error('message-textarea not found');
+
+            // ProseMirror: 需要正确设置 document state
+            // 方法1: 直接操作 ProseMirror view
+            const view = ta.pmViewDesc;
+            if (view) {
+                const { TextSelection } = prosemirrorState || {};
+                const tr = view.state.tr;
+                const pos = 1;
+                tr.insertText(args.text, pos);
+                view.dispatch(tr);
+            } else {
+                // 方法2: fallback - 设置 textContent + 触发 input 事件
+                ta.textContent = args.text;
+                // 通知 React/ProseMirror 输入变更
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }""", {"text": content})
+
+        await asyncio.sleep(0.5)
+
+        # 确保 send-button 可用
+        send_btn = self._minimax_page.locator('[data-testid="send-button"]')
+        btn_count = await send_btn.count()
+        if btn_count == 0:
+            yield ("error", "send-button not found")
+            return
+
+        btn_visible = await send_btn.first.is_visible()
+        if not btn_visible:
+            yield ("error", "send-button not visible")
+            return
+
+        await send_btn.first.click()
+        logger.info(f"[Minimax] Message sent via UI: {content[:50]}...")
+
+        await asyncio.sleep(2)
+
+        # 从队列读取 SSE 结果
+        while True:
+            try:
+                kind, value = await asyncio.wait_for(q.get(), timeout=180)
+                yield (kind, value)
+                if kind == "done":
+                    break
+            except asyncio.TimeoutError:
+                logger.warning("[Minimax] timeout waiting for SSE response")
+                yield ("error", "Timeout")
+                break
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 讯飞星火 (xinghuo.xfyun.cn) 相关方法
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def ensure_xinghuo_ready(self, headless: bool = True):
+        """确保讯飞星火浏览器已启动并登录。"""
+        if self._xinghuo_page and not self._xinghuo_page.is_closed():
+            return
+
+        from playwright.async_api import async_playwright
+        logger.info("[Xinghuo] Starting Xinghuo SparkDesk browser...")
+        self._xinghuo_pw = await async_playwright().start()
+        self._xinghuo_browser = await self._xinghuo_pw.chromium.launch_persistent_context(
+            user_data_dir=self._xinghuo_user_data_dir,
+            headless=headless,
+            channel=_browser_channel(),
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 900},
+            user_agent=USER_AGENT,
+            ignore_default_args=["--enable-automation"],
+        )
+        self._xinghuo_page = self._xinghuo_browser.pages[0] if self._xinghuo_browser.pages else await self._xinghuo_browser.new_page()
+
+        # 轻量 init_script：仅做基本反爬虫规避。API 在 / 上下文完全可用,
+        # /desk 的重定向由网站 DevTools 检测引起，无需也不应强行阻止。
+        await self._xinghuo_page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+        """)
+
+        # 访问根路径，使用 / 上下文（API 正常工作）。缩短等待时间。
+        await self._xinghuo_page.goto("https://xinghuo.xfyun.cn/", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(2)
+
+        # 检查登录状态（已登录的页面不会显示"登录"按钮，或会显示"退出"）
+        is_logged = await self._xinghuo_page.evaluate("""() => {
+            const t = document.body?.innerText || '';
+            return !t.includes('登录') || t.includes('退出');
+        }""")
+
+        if not is_logged:
+            if headless:
+                raise RuntimeError("讯飞星火未登录，请先运行 python main.py --login xinghuo")
+            # 非 headless 模式，等待用户登录（至少 2 分钟）
+            logger.info("[Xinghuo] Not logged in, waiting for login...")
+            for i in range(60):
+                await asyncio.sleep(3)
+                try:
+                    check = await self._xinghuo_page.evaluate("""() => {
+                        const t = document.body?.innerText || '';
+                        return { logged: t.includes('退出') || !t.includes('登录') };
+                    }""")
+                    if check.get('logged'):
+                        logger.info("[Xinghuo] Login successful!")
+                        break
+                except:
+                    pass
+            else:
+                raise RuntimeError("讯飞星火登录超时")
+
+        logger.info("[Xinghuo] SparkDesk browser ready")
+
+    async def stream_xinghuo_chat(self, prompt: str, model_type: str = "4.0-ultra",
+                                   thinking_enabled: bool = False,
+                                   search_enabled: bool = False,
+                                   inline_file_content: str | None = None,
+                                   model_name: str | None = None,
+                                   file_info: list | None = None):
+        """向讯飞星火发送消息并流式返回响应。
+
+        Yields: (kind, value) 元组
+            kind: "chat_id", "chunk", "done", "error"
+        """
+        if not self._xinghuo_page or self._xinghuo_page.is_closed():
+            headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+            await self.ensure_xinghuo_ready(headless=headless)
+        if not self._xinghuo_page or self._xinghuo_page.is_closed():
+            yield ("error", "Xinghuo page not available")
+            return
+
+        async with self._xinghuo_lock:
+            try:
+                current_url = self._xinghuo_page.url
+                if 'xinghuo.xfyun.cn' not in current_url:
+                    await self._xinghuo_page.goto("https://xinghuo.xfyun.cn/", wait_until="networkidle", timeout=60000)
+                    await asyncio.sleep(5)
+
+                content = inline_file_content if inline_file_content else prompt
+
+                model_map = {
+                    "4.0-ultra": "4.0Ultra",
+                    "4.0": "4.0",
+                    "3.5": "3.5",
+                    "max": "max",
+                    "pro": "pro",
+                }
+                selected_model = model_map.get(model_type, "4.0Ultra")
+
+                # Step 1: 创建对话
+                chat_id = await self._xinghuo_page.evaluate("""async () => {
+                    try {
+                        const createResp = await fetch('/iflygpt/u/chat-list/v1/create-chat-list', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({title: '新对话', chatType: 1}),
+                            credentials: 'include'
+                        });
+                        const createData = await createResp.json();
+                        return String(createData?.data?.id || '');
+                    } catch(e) {
+                        return '';
+                    }
+                }""")
+
+                if not chat_id:
+                    yield ("error", "create chat failed")
+                    return
+
+                yield ("chat_id", chat_id)
+
+                # Step 2: 如果有文件附件，上传到 OSS 并等待解析完成
+                if file_info:
+                    logger.info(f"[Xinghuo] Uploading {len(file_info)} file(s) for chat {chat_id}")
+                    import json as _json
+                    file_refs = []
+                    for fi in file_info:
+                        file_data = fi["data"]
+                        file_name = fi["name"]
+                        try:
+                            upload_result = await self.upload_xinghuo_file_to_oss(file_data, file_name)
+                            if upload_result.get("status") != 200:
+                                logger.warning(f"[Xinghuo] OSS upload failed: {upload_result.get('text', '')[:200]}")
+                                continue
+                            file_url = upload_result.get("link", "")
+                            if not file_url:
+                                logger.warning(f"[Xinghuo] OSS upload returned no link")
+                                continue
+                            saved = await self.save_xinghuo_file(file_url, chat_id)
+                            if saved.get("code") != 0:
+                                logger.warning(f"[Xinghuo] saveFile failed: {saved}")
+                                continue
+                            status_result = await self.poll_xinghuo_file_status(chat_id)
+                            if status_result.get("status") == "ready":
+                                finfo = status_result["file"]
+                                file_refs.append({
+                                    "fileUrl": finfo.get("fileUrl", file_url),
+                                    "fileId": finfo.get("id", ""),
+                                    "fileName": finfo.get("fileName", file_name),
+                                })
+                                logger.info(f"[Xinghuo] File uploaded: {file_name} -> {finfo.get('fileUrl', '')[:80]}")
+                            else:
+                                logger.warning(f"[Xinghuo] File parse status: {status_result.get('status')}")
+                        except Exception as e:
+                            logger.warning(f"[Xinghuo] File upload exception: {e}")
+
+                    # 替换 content JSON 中的 file_data 为文件引用
+                    if file_refs and inline_file_content:
+                        try:
+                            content_obj = _json.loads(content)
+                            ref_idx = [0]
+                            def _replace_file_data(obj):
+                                if isinstance(obj, dict):
+                                    if obj.get("type") == "file" and "file_data" in obj.get("file", {}):
+                                        if ref_idx[0] < len(file_refs):
+                                            ref = file_refs[ref_idx[0]]
+                                            ref_idx[0] += 1
+                                            obj["file"] = {
+                                                "fileUrl": ref["fileUrl"],
+                                                "fileId": ref["fileId"],
+                                                "fileName": ref["fileName"],
+                                            }
+                                    for v in obj.values():
+                                        if isinstance(v, (dict, list)):
+                                            _replace_file_data(v)
+                                elif isinstance(obj, list):
+                                    for item in obj:
+                                        _replace_file_data(item)
+                            _replace_file_data(content_obj)
+                            content = _json.dumps(content_obj, ensure_ascii=False, separators=(',', ':'))
+                        except Exception as e:
+                            logger.warning(f"[Xinghuo] Failed to update content with file refs: {e}")
+
+                # Step 3: 发送消息（FormData）+ 流式读取
+                stream_state = await self._xinghuo_page.evaluate("""async (args) => {
+                    window.__xh_stream_chunks = [];
+                    window.__xh_stream_chunk_idx = 0;
+                    window.__xh_stream_done = false;
+                    window.__xh_stream_error = '';
+                    window.__xh_stream_chat_id = args.chatId;
+
+                    try {
+                        const ts = String(+new Date);
+                        const fd = ts.substring(ts.length - 6);
+                        const body = new FormData();
+                        body.append('fd', fd);
+                        body.append('text', args.content);
+                        body.append('isBot', '0');
+                        body.append('clientType', '1');
+                        body.append('chatId', args.chatId);
+
+                        const resp = await fetch('/iflygpt-chat/u/chat_message/chat', {
+                            method: 'POST',
+                            body: body,
+                            credentials: 'include',
+                            headers: { 'Botweb': '1', 'clientType': '1' }
+                        });
+
+                        const ct = resp.headers.get('content-type') || '';
+                        if (!ct.includes('text/event-stream')) {
+                            const text = await resp.text();
+                            window.__xh_stream_error = 'unexpected content-type: ' + ct + ' body: ' + text.substring(0, 200);
+                            window.__xh_stream_done = true;
+                            return { ok: false, error: window.__xh_stream_error };
+                        }
+
+                        // 流式读取 SSE，逐 chunk 解码
+                        const reader = resp.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buf = '';
+
+                        while (true) {
+                            const {value, done} = await reader.read();
+                            if (done) break;
+
+                            buf += decoder.decode(value, {stream: true});
+                            const lines = buf.split('\\n');
+                            buf = lines.pop() || '';
+
+                            for (const line of lines) {
+                                if (line.startsWith('data:')) {
+                                    const raw = line.slice(5).trim();
+                                    if (raw && raw !== '[DONE]') {
+                                        try {
+                                            const bin = atob(raw);
+                                            const bytes = new Uint8Array(bin.length);
+                                            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                                            const decoded = new TextDecoder('utf-8').decode(bytes);
+                                            window.__xh_stream_chunks.push(decoded);
+                                        } catch(e) {
+                                            window.__xh_stream_chunks.push(raw);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        window.__xh_stream_done = true;
+                        return { ok: true, chatId: args.chatId };
+                    } catch(e) {
+                        window.__xh_stream_error = String(e);
+                        window.__xh_stream_done = true;
+                        return { ok: false, error: String(e) };
+                    }
+                }""", {"content": content, "chatId": chat_id, "model": selected_model})
+
+                if not stream_state.get('ok'):
+                    yield ("error", stream_state.get('error', 'unknown error'))
+                    return
+
+                chat_id = stream_state.get('chatId', '')
+                if chat_id:
+                    yield ("chat_id", chat_id)
+
+                # 轮询读取新 chunk，逐个 yield
+                empty_count = 0
+                max_empty = 90
+                last_idx = 0
+
+                while empty_count < max_empty:
+                    await asyncio.sleep(0.3)
+                    state = await self._xinghuo_page.evaluate("""() => ({
+                        done: window.__xh_stream_done,
+                        error: window.__xh_stream_error,
+                        chunkCount: (window.__xh_stream_chunks || []).length
+                    })""")
+
+                    chunk_count = state.get('chunkCount', 0)
+                    if chunk_count > last_idx:
+                        new_chunks = await self._xinghuo_page.evaluate("""(fromIdx) => {
+                            const chunks = window.__xh_stream_chunks || [];
+                            return chunks.slice(fromIdx);
+                        }""", last_idx)
+                        for chunk in new_chunks:
+                            if chunk:
+                                yield ("chunk", chunk)
+                        last_idx = chunk_count
+                        empty_count = 0
+                    else:
+                        empty_count += 1
+
+                    if state.get('done'):
+                        # 读取可能遗漏的最后一批 chunk
+                        if chunk_count > last_idx:
+                            final_chunks = await self._xinghuo_page.evaluate("""(fromIdx) => {
+                                const chunks = window.__xh_stream_chunks || [];
+                                return chunks.slice(fromIdx);
+                            }""", last_idx)
+                            for chunk in final_chunks:
+                                if chunk:
+                                    yield ("chunk", chunk)
+                        err = state.get('error', '')
+                        if err:
+                            yield ("error", err)
+                        break
+
+                yield ("done", "")
+
+            except Exception as e:
+                logger.warning(f"[Xinghuo] stream_chat error: {e}")
+                yield ("error", str(e))
+
+    async def delete_xinghuo_conversation(self, chat_id: str):
+        """删除单个讯飞星火对话。"""
+        if not chat_id or not self._xinghuo_page or self._xinghuo_page.is_closed():
+            return
+        try:
+            result = await self._xinghuo_page.evaluate("""async (chatId) => {
+                try {
+                    const resp = await fetch('/iflygpt/u/chat-list/v1/del-chat-list', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({chatListId: Number(chatId)}),
+                        credentials: 'include'
+                    });
+                    const data = await resp.json();
+                    return { ok: data.flag, data: data };
+                } catch (e) {
+                    return { error: String(e) };
+                }
+            }""", chat_id)
+            if result.get("ok"):
+                logger.info(f"[Xinghuo] deleted chat {chat_id}")
+            else:
+                logger.warning(f"[Xinghuo] delete failed: {result}")
+        except Exception as e:
+            logger.warning(f"[Xinghuo] delete exception: {e}")
+
+    async def delete_all_xinghuo_conversations(self):
+        """删除所有讯飞星火对话。"""
+        try:
+            if not self._xinghuo_page or self._xinghuo_page.is_closed():
+                logger.warning("[Xinghuo] no page, skip batch delete")
+                return 0, 0
+
+            result = await self._xinghuo_page.evaluate("""async () => {
+                try {
+                    let pageNum = 1;
+                    const pageSize = 30;
+                    let totalDeleted = 0;
+                    let totalFetched = 0;
+
+                    while (true) {
+                        const listResp = await fetch('/iflygpt/u/chat-list/v2/chat-list', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({chatType: 1, pageNum, pageSize}),
+                            credentials: 'include'
+                        });
+                        const listData = await listResp.json();
+                        const chats = listData?.data?.list || listData?.data || [];
+                        totalFetched += chats.length;
+
+                        if (chats.length === 0) break;
+
+                        for (const c of chats) {
+                            try {
+                                const delResp = await fetch('/iflygpt/u/chat-list/v1/del-chat-list', {
+                                    method: 'POST',
+                                    headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({chatListId: Number(c.id)}),
+                                    credentials: 'include'
+                                });
+                                const delData = await delResp.json();
+                                if (delData?.flag) totalDeleted++;
+                            } catch(e) {}
+                        }
+
+                        if (chats.length < pageSize) break;
+                        pageNum++;
+                    }
+
+                    return { deleted: totalDeleted, total: totalFetched };
+                } catch (e) {
+                    return { error: String(e) };
+                }
+            }""")
+            deleted = result.get('deleted', 0) if isinstance(result, dict) else 0
+            total = result.get('total', 0) if isinstance(result, dict) else 0
+            logger.info(f"[Xinghuo] delete_all: deleted {deleted}/{total} chats")
+            return deleted, total
+        except Exception as e:
+            logger.warning(f"[Xinghuo] delete_all exception: {e}")
+            return 0, 0
+
+    async def close_xinghuo(self):
+        """关闭讯飞星火浏览器。"""
+        try:
+            if self._xinghuo_page and not self._xinghuo_page.is_closed():
+                await self._xinghuo_page.close()
+        except Exception as e:
+            logger.debug(f"[Xinghuo] close page error: {e}")
+        self._xinghuo_page = None
+        try:
+            if self._xinghuo_browser:
+                await self._xinghuo_browser.close()
+        except Exception as e:
+            logger.debug(f"[Xinghuo] close browser error: {e}")
+        self._xinghuo_browser = None
+        try:
+            if self._xinghuo_pw:
+                await self._xinghuo_pw.stop()
+        except Exception:
+            pass
+        self._xinghuo_pw = None
+        logger.info("[Xinghuo] resources cleaned up")
+
+    async def get_xinghuo_oss_sign(self) -> dict:
+        """获取 OSS 上传签名。"""
+        headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_xinghuo_ready(headless=headless)
+        return await self._xinghuo_page.evaluate("""async () => {
+            const resp = await fetch('/iflygpt/oss/sign', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({business: 'chatdoc'}),
+                credentials: 'include',
+            });
+            return await resp.json();
+        }""")
+
+    async def get_xinghuo_chatdoc_sign(self) -> dict:
+        """获取 chatdoc 上传签名。"""
+        headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_xinghuo_ready(headless=headless)
+        return await self._xinghuo_page.evaluate("""async () => {
+            const resp = await fetch('/iflygpt/file_chat/getSign', {
+                method: 'GET',
+                credentials: 'include',
+            });
+            return await resp.json();
+        }""")
+
+    async def upload_xinghuo_file_to_oss(self, file_data: bytes, file_name: str) -> dict:
+        """上传文件到讯飞 OSS 并返回 OSS 签名结果。"""
+        headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_xinghuo_ready(headless=headless)
+        oss_sign_result = await self.get_xinghuo_oss_sign()
+        if oss_sign_result.get("code") != 0:
+            raise RuntimeError(f"OSS sign failed: {oss_sign_result}")
+        sign_data = oss_sign_result["data"]
+        authorization = sign_data["authorization"]
+        date = sign_data["date"]
+        url = sign_data["url"]
+        host = sign_data["host"]
+        policy_dir = sign_data["policyDir"]
+        oss_filename = sign_data["fileName"]
+        accessid = sign_data["accessid"]
+        policy = sign_data["policy"]
+
+        # 将二进制数据转为 base64，在浏览器端解码为 Blob
+        import base64
+        file_b64 = base64.b64encode(file_data).decode("ascii")
+
+        resp = await self._xinghuo_page.evaluate("""async (args) => {
+            const { fileB64, fileName, url, host, date, policyDir, ossFilename, accessid, policy, signature } = args;
+            // base64 解码为 Uint8Array
+            const raw = atob(fileB64);
+            const arr = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+            const blob = new Blob([arr], { type: 'application/octet-stream' });
+
+            // 构建 FormData
+            const fd = new FormData();
+            fd.append('key', policyDir + '/' + ossFilename);
+            fd.append('OSSAccessKeyId', accessid);
+            fd.append('policy', policy);
+            fd.append('Signature', signature);
+            fd.append('file', blob, fileName);
+
+            try {
+                const resp = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Host': host,
+                        'Date': date,
+                    },
+                    body: fd,
+                    credentials: 'omit',
+                });
+                const text = await resp.text();
+                // 尝试提取 <Location> 中的 URL（上传成功后 OSS 返回 XML）
+                const match = text.match(/<Location>([\\s\\S]*?)<\\/Location>/);
+                const link = match ? match[1] : '';
+                return { status: resp.status, link: link, text: text.slice(0, 500) };
+            } catch(e) {
+                return { status: 0, link: '', text: e.message };
+            }
+        }""", {
+            "fileB64": file_b64,
+            "fileName": file_name,
+            "url": url,
+            "host": host,
+            "date": date,
+            "policyDir": policy_dir,
+            "ossFilename": oss_filename,
+            "accessid": accessid,
+            "policy": policy,
+            "signature": authorization,
+        })
+        return resp
+
+    async def save_xinghuo_file(self, file_url: str, chat_id: str) -> dict:
+        """保存已上传的文件到聊天系统。"""
+        sign_result = await self.get_xinghuo_chatdoc_sign()
+        if sign_result.get("code") != 0:
+            raise RuntimeError(f"Chatdoc sign failed: {sign_result}")
+        sign_data = sign_result["data"]
+        resp = await self._xinghuo_page.evaluate("""async (args) => {
+            const params = new URLSearchParams();
+            params.append('signature', args.signature);
+            params.append('appId', args.appId);
+            params.append('timestamp', String(args.timestamp));
+            params.append('chatId', args.chatId);
+            params.append('fileUrl', args.fileUrl);
+            const resp = await fetch('/iflygpt/file_chat/saveFile?' + params.toString(), {
+                method: 'POST',
+                credentials: 'include',
+            });
+            return await resp.json();
+        }""", {
+            "signature": sign_data["signature"],
+            "appId": sign_data["appId"],
+            "timestamp": str(sign_data["timestamp"]),
+            "chatId": chat_id,
+            "fileUrl": file_url,
+        })
+        return resp
+
+    async def poll_xinghuo_file_status(self, chat_id: str, max_wait: int = 30, interval: int = 2) -> dict:
+        """轮询文件解析状态，返回解析结果。"""
+        for i in range(max_wait // interval):
+            await asyncio.sleep(interval)
+            result = await self._xinghuo_page.evaluate("""async (args) => {
+                const resp = await fetch('/iflygpt/file_chat/listFiles?chatId=' + args.chatId, {
+                    method: 'GET',
+                    credentials: 'include',
+                });
+                return await resp.json();
+            }""", {"chatId": chat_id})
+            files = result.get("data", {}).get("files", [])
+            for f in files:
+                status = f.get("status", "")
+                if status == 2:
+                    return {"status": "ready", "file": f}
+                elif status == 3:
+                    return {"status": "failed", "file": f}
+        return {"status": "timeout"}
+
+    async def upload_and_save_xinghuo_file(self, file_data: bytes, file_name: str, chat_id: str) -> dict:
+        """完整的文件上传流程：OSS 上传 -> 保存 -> 轮询解析。"""
+        upload_result = await self.upload_xinghuo_file_to_oss(file_data, file_name)
+        if upload_result.get("status") != 200:
+            raise RuntimeError(f"OSS upload failed: {upload_result}")
+        saved = await self.save_xinghuo_file(upload_result.get("link", ""), chat_id)
+        if saved.get("code") != 0:
+            raise RuntimeError(f"Save file failed: {saved}")
+        status_result = await self.poll_xinghuo_file_status(chat_id)
+        if status_result.get("status") == "ready":
+            file_info = status_result["file"]
+            return {
+                "success": True,
+                "file_url": file_info.get("fileUrl", ""),
+                "file_id": file_info.get("id", ""),
+                "file_name": file_info.get("fileName", file_name),
+            }
+        return {"success": False, "reason": status_result.get("status", "unknown")}
 
 
 browser_client = BrowserClient()

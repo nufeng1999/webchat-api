@@ -424,14 +424,14 @@ async def _run_music_generation_playwright(task_id: str, prompt: str,
             pw = await async_playwright().start()
             browser = await pw.chromium.launch(
                 headless=True,
-                channel="msedge",
+                channel=CONFIG.get("_browser_channel") if CONFIG.get("_browser_channel") is not None else ("msedge" if sys.platform.startswith("win") else None),
                 args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
             )
             logger.info("[Music] CloakBrowser not available, using Playwright")
 
         context = await browser.new_context(
             viewport={'width': 1280, 'height': 900},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
+            user_agent=USER_AGENT
         )
         await context.add_cookies(cookies)
 

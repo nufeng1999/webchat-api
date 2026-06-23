@@ -1,13 +1,36 @@
 import asyncio
 import logging
 import uuid
+import sys
 from typing import Optional, Dict
 from urllib.parse import urlencode, quote
-
 from playwright.async_api import async_playwright, Browser, Page, TimeoutError
 from playwright_stealth import Stealth
 
 logger = logging.getLogger("doubao-signer")
+
+_BrowserChannelMap = {
+    "chromium": None,
+    "chrome": "chrome",
+    "edge": "msedge",
+}
+
+def _get_browser_channel() -> Optional[str]:
+    """获取 Playwright channel 参数。未配置时 Windows 默认 msedge，其他系统默认 None。"""
+    # 尝试从 config.json 读取
+    try:
+        import json
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            ch = cfg.get("_browser_channel")
+            if ch is not None:
+                return ch
+    except Exception:
+        pass
+    # 未配置时按平台默认
+    return "msedge" if sys.platform.startswith("win") else None
 
 
 class PlaywrightSigner:
@@ -35,7 +58,7 @@ class PlaywrightSigner:
                 self.playwright = await async_playwright().start()
                 self.browser = await self.playwright.chromium.launch(
                     headless=True,
-                    channel="msedge",
+                    channel=_get_browser_channel(),
                     args=["--no-sandbox", "--disable-setuid-sandbox"]
                 )
                 stealth = Stealth()

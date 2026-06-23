@@ -7,6 +7,8 @@ from adapters.qianwen import QianwenAdapter
 from adapters.deepseek import DeepseekAdapter
 from adapters.zai import ZaiAdapter
 from adapters.mimo import MimoAdapter
+from adapters.minimax import MinimaxAdapter
+from adapters.xinghuo import XinghuoAdapter
 from models import MODEL_CONFIG
 
 logger = logging.getLogger("webchat-api")
@@ -19,6 +21,8 @@ _MODEL_ADAPTER_MAP: dict[str, str] = {
     "deepseek-": "deepseek",
     "zai-": "zai",
     "mimo-": "mimo",
+    "minimax-": "minimax",
+    "xinghuo-": "xinghuo",
     # Anthropic 兼容模型映射到 doubao
     "claude-3-5-sonnet": "doubao",
     "claude-3-5-haiku": "doubao",
@@ -48,6 +52,12 @@ def _init_adapters():
 
     mimo = MimoAdapter()
     _ADAPTER_INSTANCES["mimo"] = mimo
+
+    minimax = MinimaxAdapter()
+    _ADAPTER_INSTANCES["minimax"] = minimax
+
+    xinghuo = XinghuoAdapter()
+    _ADAPTER_INSTANCES["xinghuo"] = xinghuo
 
     for name, adapter in _ADAPTER_INSTANCES.items():
         logger.info(f"Adapter registered: {name} ({len(adapter.get_models())} models)")

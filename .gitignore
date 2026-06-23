@@ -5,8 +5,14 @@
 *.txt
 *login*.*
 *test*.*
+*_profile/
+_explore*.*
 explore*.*
+spark_*.*
 *backup*.*
+*.db
+*.sqlite
+*.log
 .env
 
 config.json
@@ -16,16 +22,16 @@ logs/
 conversations/
 temp/
 data/
+screenshots/
+spark_user_data/
+spark_user_data2/
 
-*.db
-*.sqlite
-*.log
+.venv/
+venv/
 
 .DS_Store
 Thumbs.db
 
-.venv/
-venv/
 
 test_*.py
 check_*.py
@@ -91,9 +97,7 @@ exectask_prompt.md
 request_task.md
 ret_format_task.md
 config.py
-my_prompt/ret_format_task - 副本.md
-my_prompt/exectask_prompt - 副本.md
-my_prompt/request_task - 副本.md
+my_prompt/
 /my_prompt/backup
 deepseek_storage_state.json
 deepseek_api_results.json
@@ -109,3 +113,6 @@ mimo_*.txt
 mimo_*.md
 tmp/zai_01_home.png
 out.json
+analyze_components.py
+analyze_routes.py
+find_chunks2.py

@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import logging
 import asyncio
 import time
@@ -55,11 +56,16 @@ def get_prompt_path() -> str:
         prompt_dir = os.path.join(BASE_DIR, prompt_dir)
     os.makedirs(prompt_dir, exist_ok=True)
     return prompt_dir
-
-def get_webchat_task() -> str:
-    """从 prompt_path/request_task.md 文件读取 webchat_task 配置。"""
+def get_webchat_task(adapter_name: str = None) -> str:
+    """从 prompt_path/{adapter_name}_request_task.md 或 prompt_path/request_task.md 文件读取 webchat_task 配置。"""
     try:
-        task_path = os.path.join(get_prompt_path(), "request_task.md")
+        prompt_dir = get_prompt_path()
+        if adapter_name:
+            adapter_path = os.path.join(prompt_dir, f"{adapter_name}_request_task.md")
+            if os.path.exists(adapter_path):
+                with open(adapter_path, 'r', encoding='utf-8') as f:
+                    return escape_md_for_json(f.read().strip())
+        task_path = os.path.join(prompt_dir, "request_task.md")
         if os.path.exists(task_path):
             with open(task_path, 'r', encoding='utf-8') as f:
                 return escape_md_for_json(f.read().strip())
@@ -67,10 +73,17 @@ def get_webchat_task() -> str:
         logger.warning(f"Failed to read request_task.md: {e}")
     return ""
 
-def get_ret_format_prompt() -> str:
-    """从 prompt_path/ret_format_task.md 文件读取 ret_format_prompt 配置。"""
+
+def get_ret_format_prompt(adapter_name: str = None) -> str:
+    """从 prompt_path/{adapter_name}_ret_format_task.md 或 prompt_path/ret_format_task.md 文件读取 ret_format_prompt 配置。"""
     try:
-        task_path = os.path.join(get_prompt_path(), "ret_format_task.md")
+        prompt_dir = get_prompt_path()
+        if adapter_name:
+            adapter_path = os.path.join(prompt_dir, f"{adapter_name}_ret_format_task.md")
+            if os.path.exists(adapter_path):
+                with open(adapter_path, 'r', encoding='utf-8') as f:
+                    return escape_md_for_json(f.read().strip())
+        task_path = os.path.join(prompt_dir, "ret_format_task.md")
         if os.path.exists(task_path):
             with open(task_path, 'r', encoding='utf-8') as f:
                 return escape_md_for_json(f.read().strip())
@@ -78,10 +91,19 @@ def get_ret_format_prompt() -> str:
         logger.warning(f"Failed to read ret_format_task.md: {e}")
     return ""
 
-def get_exectask_prompt() -> str:
-    """从 prompt_path/exectask_prompt.md 文件读取 exectask_prompt 配置。"""
+
+def get_exectask_prompt(adapter_name: str = None) -> str:
+    """从 prompt_path/{adapter_name}_exectask_prompt.md 或 prompt_path/exectask_prompt.md 文件读取 exectask_prompt 配置。"""
     try:
-        task_path = os.path.join(get_prompt_path(), "exectask_prompt.md")
+        prompt_dir = get_prompt_path()
+        if adapter_name:
+            adapter_path = os.path.join(prompt_dir, f"{adapter_name}_exectask_prompt.md")
+            if os.path.exists(adapter_path):
+                with open(adapter_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    return f"[{timestamp}]\n{escape_md_for_json(content)}"
+        task_path = os.path.join(prompt_dir, "exectask_prompt.md")
         if os.path.exists(task_path):
             with open(task_path, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
@@ -90,11 +112,16 @@ def get_exectask_prompt() -> str:
     except Exception as e:
         logger.warning(f"Failed to read exectask_prompt.md: {e}")
     return ""
-
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+# 根据运行平台选择 UA
+if sys.platform.startswith("win"):
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+elif sys.platform == "darwin":
+    USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+else:
+    USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 COOKIE_EXPIRY_PATTERNS = [
     "login",
@@ -123,7 +150,7 @@ def setup_logging():
     import sys
     
     # Windows 控制台启用 ANSI 颜色
-    if sys.platform == 'win32':
+    if sys.platform.startswith('win'):
         try:
             from colorama import init
             init(autoreset=True)
@@ -254,7 +281,7 @@ class CookiePool:
             if os.path.exists(extract_script):
                 import subprocess
                 result = subprocess.run(
-                    ["python", extract_script],
+                    [sys.executable, extract_script],
                     capture_output=True, text=True, timeout=30,
                     cwd=BASE_DIR
                 )
@@ -403,6 +430,10 @@ class RequestLimiter:
             return "zai"
         if model.startswith("mimo-"):
             return "mimo"
+        if model.startswith("minimax-"):
+            return "minimax"
+        if model.startswith("xinghuo-"):
+            return "xinghuo"
         return "doubao"
     
     async def acquire(self, model: str) -> tuple[bool, str]:
@@ -457,7 +488,7 @@ concurrency_limiter = ConcurrencyLimiter(
 )
 request_limiter = RequestLimiter(
     max_wait_time=CONFIG.get('request_limiter_max_wait', 180),
-    max_concurrent=CONFIG.get('request_limiter_max_concurrent', {"doubao": 2, "qianwen": 1, "deepseek": 1, "zai": 1, "mimo": 1})
+    max_concurrent=CONFIG.get('request_limiter_max_concurrent', {"doubao": 2, "qianwen": 1, "deepseek": 1, "zai": 1, "mimo": 1, "minimax": 1, "xinghuo": 1})
 )
 
 

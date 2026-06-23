@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import asyncio
 import logging
 import time
@@ -45,7 +46,7 @@ async def _launch_browser():
         pw = await async_playwright().start()
         return await pw.chromium.launch(
             headless=True,
-            channel="msedge",
+            channel=CONFIG.get("_browser_channel") if CONFIG.get("_browser_channel") is not None else ("msedge" if sys.platform.startswith("win") else None),
             args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
         )
 

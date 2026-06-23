@@ -54,7 +54,7 @@ class DoubaoAdapter(BaseAdapter):
         last_msg = request.messages[-1] if request.messages else None
         is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
         file_content = await self._prepare_inline_file_content(request, is_tool_return)
-        prompt_text = get_exectask_prompt()
+        prompt_text = get_exectask_prompt(self.get_adapter_name())
 
         try:
             logs_dir = os.path.join(BASE_DIR, "logs")
@@ -153,9 +153,9 @@ class DoubaoAdapter(BaseAdapter):
         """Prepare the file content as inline text。"""
         request_dict = request.model_dump()
         if is_tool_return:
-            request_dict['task'] = get_ret_format_prompt()
+            request_dict['task'] = get_ret_format_prompt(self.get_adapter_name())
         else:
-            request_dict['task'] = get_webchat_task()
+            request_dict['task'] = get_webchat_task(self.get_adapter_name())
 
         request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
 

@@ -120,7 +120,7 @@ class QianwenAdapter(BaseAdapter):
         if last_role == 'tool':
             file_name = "toolreturn.json"
             request_dict = request.model_dump()
-            request_dict['task'] = get_ret_format_prompt()
+            request_dict['task'] = get_ret_format_prompt(self.get_adapter_name())
             request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
             request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
             try:
@@ -138,13 +138,13 @@ class QianwenAdapter(BaseAdapter):
             except Exception as e:
                 logger.error(f"[Qwen] upload toolreturn.json failed: {e}")
                 raise
-            prompt_text = get_exectask_prompt()
+            prompt_text = get_exectask_prompt(self.get_adapter_name())
             logger.info(f"Qianwen tool return: model={request.model}, uploaded {tool_path}")
         else:
             file_name = "request.json"
-            prompt_text = get_exectask_prompt()
+            prompt_text = get_exectask_prompt(self.get_adapter_name())
             request_dict = request.model_dump()
-            request_dict['task'] = get_webchat_task()
+            request_dict['task'] = get_webchat_task(self.get_adapter_name())
             request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
             request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
             try:

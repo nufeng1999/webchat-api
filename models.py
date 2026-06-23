@@ -42,6 +42,16 @@ MIMO_MODEL_CONFIG = {
     "mimo-v2.5-tts-voiceclone": {"model_type": "default", "desc": "MiMo-V2.5-TTS-VoiceClone (音色克隆模型)", "use_deep_think": False, "use_search": False, "supports_file": False, "display_name": "MiMo-V2.5-TTS-VoiceClone"},
 }
 
+MINIMAX_MODEL_CONFIG = {
+    "minimax-m3": {"model_type": "m3", "desc": "MiniMax-M3 (旗舰多模态模型)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "MiniMax-M3"},
+}
+
+XINGHUO_MODEL_CONFIG = {
+    "xinghuo-4.0-ultra": {"model_type": "4.0-ultra", "desc": "讯飞星火 4.0 Ultra (旗舰模型)", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "星火 4.0 Ultra"},
+    "xinghuo-4.0": {"model_type": "4.0", "desc": "讯飞星火 4.0", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "星火 4.0"},
+    "xinghuo-3.5": {"model_type": "3.5", "desc": "讯飞星火 3.5", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "星火 3.5"},
+}
+
 SYSTEM_PROMPT_MAP = {
     "doubao-coding": "你是一个专业的编程助手，擅长多种编程语言，能够编写、调试、优化代码，并解释技术概念。请用代码块格式输出代码。",
     "doubao-writing": "你是一个专业的写作助手，擅长各类文体写作，包括公文、邮件、文案、小说、论文等。请根据用户需求生成高质量的结构化文本。",

@@ -56,11 +56,34 @@ async def lifespan(app: FastAPI):
     _cleanup_task = asyncio.create_task(_auto_cleanup_task())
     await init_db()
 
-    # 浏览器按需初始化：Doubao → ensure_doubao_ready(), Qianwen → ensure_qianwen_ready()
+    # 预加载浏览器（根据 _preload_xxx 配置）
+    from browser_client import browser_client
+    _preload_map = {
+        "doubao": browser_client.ensure_doubao_ready,
+        "qianwen": browser_client.ensure_qianwen_ready,
+        "deepseek": browser_client.ensure_deepseek_ready,
+        "zai": browser_client.ensure_zai_ready,
+        "mimo": browser_client.ensure_mimo_ready,
+        "minimax": browser_client.ensure_minimax_ready,
+        "xinghuo": browser_client.ensure_xinghuo_ready,
+    }
+    preload_names = [name for name in _preload_map if CONFIG.get(f"_preload_{name}")]
+    if preload_names:
+        async def _do_preload(name):
+            headless = CONFIG.get(f"_{name}_headless", CONFIG.get("_headless_browser", True))
+            try:
+                await _preload_map[name](headless=headless)
+                logger.info(f"[Preload] {name} ready")
+            except Exception as e:
+                logger.warning(f"[Preload] {name} failed: {e}")
+        await asyncio.gather(*[_do_preload(n) for n in preload_names])
+        logger.info(f"Preloaded browsers: {', '.join(preload_names)}")
+    else:
+        logger.info("No browsers preloaded (use _preload_xxx to enable)")
+
     # 千问模型列表启动时异步刷新，失败则使用默认模型列表
     global _qianwen_model_refresh_task
     _qianwen_model_refresh_task = asyncio.create_task(refresh_qianwen_models())
-    logger.info("Browser clients will be initialized on-demand (lazy loading)")
 
     yield
     # 设置事件循环异常处理器，静默 Playwright 关闭后残留的连接读取错误
@@ -144,6 +167,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to delete MiMo conversations: {e}")
 
+        try:
+            from browser_client import browser_client
+            await browser_client.delete_all_xinghuo_conversations()
+            logger.info("Xinghuo conversations deleted from server")
+        except Exception as e:
+            logger.warning(f"Failed to delete Xinghuo conversations: {e}")
+
     if _cleanup_task:
         _cleanup_task.cancel()
     if signer:
@@ -157,7 +187,7 @@ async def lifespan(app: FastAPI):
     # 恢复原始异常处理器
     loop.set_exception_handler(_original_handler if _original_handler else None)
 
-app = FastAPI(title="Doubao Free API", version="3.3.0", lifespan=lifespan)
+app = FastAPI(title="WebChat Free API", version="3.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -235,6 +265,20 @@ async def _delete_adapter_conversation(adapter):
                 await browser_client.delete_mimo_conversation(session_id)
                 logger.info(f"[Cleanup] deleted mimo session {session_id}")
             adapter._last_session_id = ""
+        elif adapter_name == 'minimax':
+            session_id = getattr(adapter, '_last_session_id', '')
+            if session_id:
+                from browser_client import browser_client
+                await browser_client.delete_minimax_conversation(session_id)
+                logger.info(f"[Cleanup] deleted minimax session {session_id}")
+            adapter._last_session_id = ""
+        elif adapter_name == 'xinghuo':
+            chat_id = getattr(adapter, '_last_chat_id', '')
+            if chat_id:
+                from browser_client import browser_client
+                await browser_client.delete_xinghuo_conversation(chat_id)
+                logger.info(f"[Cleanup] deleted xinghuo chat {chat_id}")
+            adapter._last_chat_id = ""
     except Exception as e:
         logger.warning(f"[Cleanup] failed to delete conversation: {e}")
 
@@ -953,9 +997,9 @@ async def _auto_cleanup_task():
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Doubao Free API")
+    parser = argparse.ArgumentParser(description="WebChat Free API")
     parser.add_argument("--login", type=str, nargs='?', const='doubao', default=None,
-                        help="Open browser for login and save credentials. Specify 'doubao', 'qianwen', or 'deepseek' (default: doubao)")
+                        help="Open browser for login and save credentials. Specify 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', or 'minimax' (default: doubao)")
     parser.add_argument("--host", default=None,
                         help="Server host (default: from config.json)")
     parser.add_argument("--port", type=int, default=None,
@@ -972,12 +1016,21 @@ if __name__ == "__main__":
                         help="Show Zai browser window only")
     parser.add_argument("--show-mimo", action="store_true", default=False,
                         help="Show MiMo browser window only")
+    parser.add_argument("--show-minimax", action="store_true", default=False,
+                        help="Show MiniMax Agent browser window only")
+    parser.add_argument("--show-xinghuo", action="store_true", default=False,
+                        help="Show Xinghuo SparkDesk browser window only")
     parser.add_argument("--keep-conversations", action="store_true", default=False,
                         help="Keep all conversation history after server shutdown (default: delete)")
     parser.add_argument("-q", "--quiet", action="store_true", default=False,
                         help="Suppress console log output (only show errors in file)")
     parser.add_argument("--log-level", type=str, default=None,
                         help="Set console log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
+    parser.add_argument("--browser", type=str, default=None,
+                        choices=["chromium", "chrome", "edge"],
+                        help="Browser engine for Playwright: chromium, chrome, edge (default: edge on Windows, chromium on other OS)")
+    parser.add_argument("--clear-history", type=str, nargs='?', const='all', default=None,
+                        help="Clear conversation history. Specify platform names (doubao,deepseek,mimo,zai,qianwen,minimax,xinghuo) or 'all' (default: all)")
     args = parser.parse_args()
 
     # 控制台日志控制
@@ -990,19 +1043,32 @@ if __name__ == "__main__":
 
     # 全局 headless 配置（旧参数兼容）
     CONFIG['_headless_browser'] = not args.show
+    # 浏览器通道映射：Playwright channel 参数
+    # chromium = 不传 channel（使用 Playwright 内置 Chromium），chrome = chrome, edge = msedge
+    _browser_channel_map = {
+        "chromium": None,
+        "chrome": "chrome",
+        "edge": "msedge",
+    }
+    # 未指定 --browser 时，Windows 默认 edge，其他系统默认 chromium
+    if args.browser is None:
+        args.browser = "edge" if sys.platform.startswith("win") else "chromium"
+    CONFIG['_browser_channel'] = _browser_channel_map.get(args.browser, "msedge" if sys.platform.startswith("win") else None)
     # 各站点独立配置（优先级：--show-xxx > --show > 默认 headless）
     CONFIG['_doubao_headless'] = not (args.show or args.show_doubao)
     CONFIG['_qianwen_headless'] = not (args.show or args.show_qianwen)
     CONFIG['_deepseek_headless'] = not (args.show or args.show_deepseek)
     CONFIG['_zai_headless'] = not (args.show or args.show_zai)
     CONFIG['_mimo_headless'] = not (args.show or args.show_mimo)
+    CONFIG['_minimax_headless'] = not (args.show or args.show_minimax)
+    CONFIG['_xinghuo_headless'] = not (args.show or args.show_xinghuo)
     CONFIG['_keep_conversations'] = args.keep_conversations
 
     if args.login:
         target = args.login.lower()
-        if target not in ("doubao", "qianwen", "deepseek", "zai", "mimo"):
+        if target not in ("doubao", "qianwen", "deepseek", "zai", "mimo", "minimax", "xinghuo"):
             if not _console_filter_quiet:
-                print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', or 'mimo'", file=sys.stderr)
+                print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', or 'xinghuo'", file=sys.stderr)
             os._exit(1)
         if target == "doubao":
             from login import do_login
@@ -1046,6 +1112,22 @@ if __name__ == "__main__":
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
+        elif target == "minimax":
+            from minimax_login import login_and_save
+            asyncio.run(login_and_save())
+            if not _console_filter_quiet:
+                print("MiniMax Agent login completed")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        elif target == "xinghuo":
+            from xinghuo_login import login_and_save
+            asyncio.run(login_and_save())
+            if not _console_filter_quiet:
+                print("讯飞星火 login completed")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         else:
             from qianwen_login import do_qianwen_login
             result = asyncio.run(do_qianwen_login(show_browser=True))
@@ -1064,6 +1146,65 @@ if __name__ == "__main__":
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(1)
+
+    if args.clear_history:
+        from browser_client import BrowserClient
+        client = BrowserClient()
+        platforms = [p.strip().lower() for p in args.clear_history.split(',') if p.strip()]
+        if 'all' in platforms:
+            platforms = ['doubao', 'deepseek', 'mimo', 'zai', 'qianwen', 'minimax', 'xinghuo']
+
+        async def _clear_all():
+            for p in platforms:
+                if p == 'doubao':
+                    try:
+                        await client.ensure_doubao_ready(headless=True)
+                        await client.delete_all_doubao_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] doubao: {e}")
+                elif p == 'deepseek':
+                    try:
+                        await client.ensure_deepseek_ready(headless=True)
+                        await client.delete_all_deepseek_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] deepseek: {e}")
+                elif p == 'mimo':
+                    try:
+                        await client.ensure_mimo_ready(headless=True)
+                        await client.delete_all_mimo_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] mimo: {e}")
+                elif p == 'zai':
+                    try:
+                        await client.ensure_zai_ready(headless=True)
+                        await client.delete_all_zai_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] zai: {e}")
+                elif p == 'qianwen':
+                    try:
+                        await client.ensure_qianwen_ready(headless=True)
+                        await client.delete_all_qianwen_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] qianwen: {e}")
+                elif p == 'minimax':
+                    try:
+                        await client.ensure_minimax_ready(headless=True)
+                        await client.delete_all_minimax_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] minimax: {e}")
+                elif p == 'xinghuo':
+                    try:
+                        await client.ensure_xinghuo_ready(headless=True)
+                        await client.delete_all_xinghuo_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] xinghuo: {e}")
+                else:
+                    logger.warning(f"[Clear] unknown platform: {p}")
+            await client.close()
+
+        asyncio.run(_clear_all())
+        logger.info("History cleared")
+        os._exit(0)
 
     host = args.host or CONFIG.get('server_host', '0.0.0.0')
     port = args.port or CONFIG.get('server_port', 8765)
