@@ -95,14 +95,28 @@ def _browser_channel():
     return "msedge" if sys.platform.startswith("win") else None
 
 
+def _linux_safe_args():
+    """构建浏览器 launch args。优先从 CONFIG['_browser_launch_args'] 读取，否则使用跨平台默认值。"""
+    custom = CONFIG.get("_browser_launch_args")
+    if custom and isinstance(custom, list):
+        return custom
+    base = ["--no-sandbox", "--disable-setuid-sandbox"]
+    if not sys.platform.startswith("win"):
+        base.extend(["--disable-gpu", "--disable-dev-shm-usage"])
+    return base
+
+
 def _browser_launch_kwargs(**kwargs):
     """构建 Playwright chromium.launch_persistent_context 的参数。
     自动处理 channel 参数：如果 CONFIG 中未指定（None），则省略 channel，
     让 Playwright 使用内置 Chromium（跨平台安全）。
+    Linux 自动添加 --disable-gpu --disable-dev-shm-usage 避免白屏。
     """
     channel = _browser_channel()
     if channel:
         kwargs["channel"] = channel
+    if "args" not in kwargs:
+        kwargs["args"] = _linux_safe_args()
     return kwargs
 
 
@@ -115,6 +129,7 @@ class BrowserClient:
         self._doubao_lock = asyncio.Lock()
         self._doubao_queues = {}
         self._doubao_user_data_dir = DOUBAO_USER_DATA_DIR
+        self._visible_browser_started_at = None
 
         # Qianwen 专属
         self._qianwen_pw = None
@@ -174,10 +189,22 @@ class BrowserClient:
 
     async def ensure_doubao_ready(self, headless=True):
         """确保 Doubao 浏览器就绪，使用持久化 user_data_dir 保留登录状态。"""
-        if self._doubao_page and self._doubao_browser and self._doubao_browser.pages:
+        # 检测浏览器是否已关闭（用户手动关闭后自动重建）
+        page_closed = self._doubao_page is None or (hasattr(self._doubao_page, 'is_closed') and self._doubao_page.is_closed())
+        context_closed = self._doubao_browser is None or (hasattr(self._doubao_browser, 'is_connected') and not self._doubao_browser.is_connected())
+        if not page_closed and not context_closed and self._doubao_browser and self._doubao_browser.pages:
             return True
+        # 任一页面或上下文关闭都重建
+        if page_closed or context_closed:
+            logger.info("[Doubao] browser or page closed by user, rebuilding...")
+            self._doubao_page = None
+            self._doubao_browser = None
+            self._doubao_pw = None
         async with self._doubao_lock:
-            if self._doubao_page and self._doubao_browser and self._doubao_browser.pages:
+            # 二次检查
+            page_closed = self._doubao_page is None or (hasattr(self._doubao_page, 'is_closed') and self._doubao_page.is_closed())
+            context_closed = self._doubao_browser is None or (hasattr(self._doubao_browser, 'is_connected') and not self._doubao_browser.is_connected())
+            if not page_closed and not context_closed and self._doubao_browser and self._doubao_browser.pages:
                 return True
 
             if not os.path.exists(self._doubao_user_data_dir):
@@ -189,7 +216,7 @@ class BrowserClient:
                 user_data_dir=self._doubao_user_data_dir,
                 headless=headless,
                 channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
@@ -288,7 +315,7 @@ class BrowserClient:
                 user_data_dir=self._doubao_user_data_dir,
                 headless=False,
                 channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
@@ -317,7 +344,7 @@ class BrowserClient:
                 user_data_dir=self._doubao_user_data_dir,
                 headless=True,
                 channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
@@ -346,7 +373,7 @@ class BrowserClient:
                 user_data_dir=self._qianwen_user_data_dir,
                 headless=headless,
                 channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
@@ -385,7 +412,7 @@ class BrowserClient:
                         user_data_dir=self._qianwen_user_data_dir,
                         headless=False,
                         channel=_browser_channel(),
-                        args=["--no-sandbox", "--disable-setuid-sandbox"],
+                        args=_linux_safe_args(),
                         user_agent=USER_AGENT,
                         viewport={"width": 1280, "height": 900},
                     )
@@ -414,7 +441,7 @@ class BrowserClient:
                         user_data_dir=self._qianwen_user_data_dir,
                         headless=True,
                         channel=_browser_channel(),
-                        args=["--no-sandbox", "--disable-setuid-sandbox"],
+                        args=_linux_safe_args(),
                         user_agent=USER_AGENT,
                         viewport={"width": 1280, "height": 900},
                     )
@@ -870,7 +897,7 @@ class BrowserClient:
                         continue
 
                     if event_type == "STREAM_ERROR":
-                        msg = data.get("error_msg") or data.get("message") or json.dumps(data, ensure_ascii=False)
+                        msg = json.dumps(data, ensure_ascii=False)
                         q.put_nowait(("error", msg))
                         q.put_nowait(("done", ""))
                         await route.fulfill(response=resp)
@@ -1272,7 +1299,7 @@ class BrowserClient:
                 user_data_dir=self._deepseek_user_data_dir,
                 headless=headless,
                 channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
@@ -1513,7 +1540,7 @@ class BrowserClient:
                 user_data_dir=self._deepseek_user_data_dir,
                 headless=False,
                 channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
@@ -1543,7 +1570,7 @@ class BrowserClient:
                 user_data_dir=self._deepseek_user_data_dir,
                 headless=CONFIG.get('_deepseek_headless', CONFIG.get('_headless_browser', True)),
                 channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
@@ -2625,10 +2652,11 @@ class BrowserClient:
 
     async def show_doubao_for_rate_limit(self):
         """关闭 headless 浏览器，启动 visible 浏览器供用户处理限流/验证码。"""
+        self._visible_browser_started_at = time.time()
         try:
             if self._doubao_page:
                 try:
-                    if self._doubao_page.is_closed():
+                    if hasattr(self._doubao_page, 'is_closed') and self._doubao_page.is_closed():
                         logger.info("[Doubao] page already closed by user, skipping close")
                     else:
                         await self._doubao_page.close()
@@ -2637,10 +2665,7 @@ class BrowserClient:
                 self._doubao_page = None
             if self._doubao_browser:
                 try:
-                    if not self._doubao_browser.pages:
-                        logger.info("[Doubao] browser already disconnected by user, skipping close")
-                    else:
-                        await self._doubao_browser.close()
+                    await self._doubao_browser.close()
                 except Exception as e:
                     logger.warning(f"[Doubao] browser already disconnected: {e}")
                 self._doubao_browser = None
@@ -2656,11 +2681,12 @@ class BrowserClient:
         logger.info("[Doubao] visible browser started for rate limit handling")
 
     async def hide_doubao_browser(self):
-        """关闭 visible 浏览器，恢复 headless（下次 ensure 会重建 headless）"""
+        """关闭 visible 浏览器，立即恢复 headless 模式继续工作。"""
+        self._visible_browser_started_at = None
         try:
             if self._doubao_page:
                 try:
-                    if self._doubao_page.is_closed():
+                    if hasattr(self._doubao_page, 'is_closed') and self._doubao_page.is_closed():
                         logger.info("[Doubao] page already closed by user, skipping close")
                     else:
                         await self._doubao_page.close()
@@ -2669,10 +2695,7 @@ class BrowserClient:
                 self._doubao_page = None
             if self._doubao_browser:
                 try:
-                    if not self._doubao_browser.pages:
-                        logger.info("[Doubao] browser already disconnected by user, skipping close")
-                    else:
-                        await self._doubao_browser.close()
+                    await self._doubao_browser.close()
                 except Exception as e:
                     logger.warning(f"[Doubao] browser already disconnected: {e}")
                 self._doubao_browser = None
@@ -2682,9 +2705,13 @@ class BrowserClient:
                 except Exception as e:
                     logger.warning(f"[Doubao] pw already stopped: {e}")
                 self._doubao_pw = None
-            logger.info("[Doubao] visible browser closed, will restart headless on next request")
         except Exception as e:
             logger.warning(f"[Doubao] error closing visible browser: {e}")
+        try:
+            await self.ensure_doubao_ready(headless=True)
+            logger.info("[Doubao] visible browser closed, headless browser restarted")
+        except Exception as e:
+            logger.warning(f"[Doubao] failed to restart headless browser: {e}")
 
     async def upload_document_via_page(self, file_data: bytes, file_name: str) -> dict:
         """Upload file to doubao cloud storage via HTTP API, returns attachment dict with URI.

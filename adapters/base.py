@@ -694,7 +694,7 @@ class BaseAdapter(ABC):
         """删除当前对话/会话。"""
         ...
 
-    async def _handle_rate_limit(self, attempt: int, max_retries: int):
+    async def _handle_rate_limit(self, attempt: int, max_retries: int, error_msg: str = None):
         """处理限流。返回 True 表示已处理可继续重试，False 表示无法处理。"""
         return False
 
@@ -750,6 +750,7 @@ class BaseAdapter(ABC):
                 buffered_chunks = [] if is_agent else None
                 think_buf = ""
                 got_rate_limit = False
+                rate_limit_error = None
                 parse_success = False
                 is_retry_break = False
 
@@ -769,6 +770,7 @@ class BaseAdapter(ABC):
                         err_str = str(value).lower()
                         if "rate" in err_str and "limit" in err_str:
                             got_rate_limit = True
+                            rate_limit_error = str(value)
                             logger.warning(f"{adapter_name} rate limited (attempt {attempt+1}/{max_retries})")
                             await self._delete_conversation()
                             break
@@ -858,7 +860,7 @@ class BaseAdapter(ABC):
                                 return
 
                 if got_rate_limit:
-                    handled = await self._handle_rate_limit(attempt, max_retries)
+                    handled = await self._handle_rate_limit(attempt, max_retries, rate_limit_error)
                     if handled:
                         continue
                     if attempt < max_retries - 1:

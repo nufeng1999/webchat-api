@@ -145,6 +145,10 @@ def reload_config():
     SIGN_METHOD = CONFIG.get('sign_method', 'b3')
     logger.info("Config reloaded")
 
+def get_rate_limit_wait_seconds():
+    """从配置读取限流等待时间（秒），默认 240 秒（4分钟）"""
+    return CONFIG.get('_rate_limit_wait_seconds', 360)
+
 def setup_logging():
     """设置全局日志格式，带颜色。"""
     import sys
@@ -481,7 +485,7 @@ class RequestLimiter:
 
 rate_limiter = RateLimiter(
     max_requests=CONFIG.get('rate_limit_max', 30),
-    window_seconds=CONFIG.get('rate_limit_window', 60)
+    window_seconds=CONFIG.get('rate_limit_window', 360)
 )
 concurrency_limiter = ConcurrencyLimiter(
     max_concurrent=CONFIG.get('max_concurrent', 5)

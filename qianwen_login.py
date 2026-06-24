@@ -37,7 +37,7 @@ async def do_qianwen_login(show_browser: bool = True) -> dict:
             user_data_dir=USER_DATA_DIR,
             headless=not show_browser,
             channel=CONFIG.get("_browser_channel") if CONFIG.get("_browser_channel") is not None else ("msedge" if sys.platform.startswith("win") else None),
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=["--no-sandbox", "--disable-setuid-sandbox"] + (["--disable-gpu", "--disable-dev-shm-usage"] if not sys.platform.startswith("win") else []),
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 900},
         )

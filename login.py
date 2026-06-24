@@ -38,6 +38,15 @@ async def do_login(show_browser: bool = True) -> dict:
         os.makedirs(USER_DATA_DIR, exist_ok=True)
         logger.info(f"Created user data directory: {USER_DATA_DIR}")
 
+    launch_args = CONFIG.get("_browser_launch_args") if isinstance(CONFIG.get("_browser_launch_args"), list) else ["--no-sandbox", "--disable-setuid-sandbox"]
+    if not isinstance(CONFIG.get("_browser_launch_args"), list) and not sys.platform.startswith("win"):
+        launch_args.extend([
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--no-zygote",
+            "--disable-software-rasterizer",
+        ])
+
     pw = None
     browser = None
     try:
@@ -46,7 +55,7 @@ async def do_login(show_browser: bool = True) -> dict:
             user_data_dir=USER_DATA_DIR,
             headless=not show_browser,
             channel=CONFIG.get("_browser_channel") if CONFIG.get("_browser_channel") is not None else ("msedge" if sys.platform.startswith("win") else None),
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=launch_args,
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 900},
         )

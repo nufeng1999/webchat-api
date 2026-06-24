@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import AsyncGenerator, Optional
 from adapters.base import BaseAdapter
 from models import ChatCompletionRequest, ChatMessage, MODEL_CONFIG
-from config import CONFIG, Colors, BASE_DIR, get_webchat_task, get_ret_format_prompt, get_exectask_prompt
+from config import CONFIG, Colors, BASE_DIR, get_webchat_task, get_ret_format_prompt, get_exectask_prompt, get_rate_limit_wait_seconds
 from sse import format_openai_chunk, format_openai_done, extract_text_from_content
 
 logger = logging.getLogger("doubao-adapter")
@@ -97,35 +97,63 @@ class DoubaoAdapter(BaseAdapter):
         """删除当前对话。"""
         await self._delete_current_conversation()
 
-    async def _handle_rate_limit(self, attempt: int, max_retries: int):
-        """处理限流：显示可见浏览器让用户处理，等待最多 180 秒。返回 True 表示已处理可继续重试。"""
+    async def _handle_rate_limit(self, attempt: int, max_retries: int, error_msg: str = None):
+        """处理限流：区分临时限流（自动恢复）和需验证（弹窗用户处理）。返回 True 表示已处理可继续重试。"""
         if attempt < max_retries - 1:
-            logger.warning("[Doubao] rate limited! showing visible browser for user to handle...")
-            try:
-                from browser_client import browser_client
-                await browser_client.show_doubao_for_rate_limit()
-            except Exception as e:
-                logger.warning(f"[Doubao] failed to show visible browser: {e}")
-            logger.info("[Doubao] waiting up to 180 seconds for user to handle rate limit...")
-            for sec in range(0, 180, 10):
-                await asyncio.sleep(10)
+            # 解析错误详情，判断是否需验证
+            needs_verification = False
+            if error_msg:
+                try:
+                    err_data = json.loads(error_msg)
+                    decision = err_data.get("error_detail", {}).get("ext", {}).get("decision", {})
+                    if decision.get("type") == "verify":
+                        needs_verification = True
+                        logger.info(f"[Doubao] rate limit includes verify decision (subtype={decision.get('subtype')}, scene={decision.get('verify_scene')}) → needs user action")
+                except json.JSONDecodeError:
+                    # 非 JSON 格式，按旧逻辑处理
+                    pass
+
+            if needs_verification:
+                # 需要验证：显示可见浏览器让用户处理
+                wait_seconds = get_rate_limit_wait_seconds()
+                logger.warning(f"[Doubao] rate limited with verification needed! showing visible browser for user to handle...waiting up to {wait_seconds} seconds")
                 try:
                     from browser_client import browser_client
-                    if browser_client._doubao_page and not browser_client._doubao_page.is_closed():
+                    await browser_client.show_doubao_for_rate_limit()
+                except Exception as e:
+                    logger.warning(f"[Doubao] failed to show visible browser: {e}")
+                logger.info(f"[Doubao] waiting up to {wait_seconds} seconds for user to handle rate limit...")
+                visible_start = browser_client._visible_browser_started_at
+                min_wait = get_rate_limit_wait_seconds()
+                for sec in range(0, min_wait, 10):
+                    await asyncio.sleep(10)
+                    try:
+                        from browser_client import browser_client
+                        bc = browser_client
+                        elapsed = time.time() - visible_start if visible_start else sec + 10
+                        page_alive = bc._doubao_page is not None and (not hasattr(bc._doubao_page, 'is_closed') or not bc._doubao_page.is_closed())
+                        if page_alive and elapsed < min_wait:
+                            continue
+                        if not page_alive:
+                            logger.info(f"[Doubao] browser closed by user after {int(elapsed)}s, stopping wait")
+                            break
+                    except Exception:
+                        logger.info(f"[Doubao] browser check failed after {sec+10}s, assuming closed")
                         break
-                    else:
-                        logger.info(f"[Doubao] browser closed by user after {sec+10}s, stopping wait")
-                        break
-                except Exception:
-                    logger.info(f"[Doubao] browser check failed after {sec+10}s, assuming closed")
-                    break
-            try:
-                from browser_client import browser_client
-                await browser_client.hide_doubao_browser()
-            except Exception as e:
-                logger.warning(f"[Doubao] failed to hide visible browser: {e}")
-            logger.info(f"[Doubao] resuming after rate limit handling, retry {attempt+2}/{max_retries}")
-            return True
+                try:
+                    from browser_client import browser_client
+                    await browser_client.hide_doubao_browser()
+                except Exception as e:
+                    logger.warning(f"[Doubao] failed to hide visible browser: {e}")
+                logger.info(f"[Doubao] resuming after rate limit handling, retry {attempt+2}/{max_retries}")
+                return True
+            else:
+                # 临时限流：静默等待后直接重试
+                retry_seconds = CONFIG.get('_rate_limit_retry_seconds', 15)
+                logger.info(f"[Doubao] temporary rate limit (no verify), waiting {retry_seconds}s then retrying...")
+                await asyncio.sleep(retry_seconds)
+                logger.info(f"[Doubao] resuming after temporary rate limit, retry {attempt+2}/{max_retries}")
+                return True
         return False
 
     async def _on_success(self, chat_id: str):
