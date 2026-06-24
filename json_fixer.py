@@ -9,15 +9,18 @@ JSON 矫正器：修复 LLM 输出的破损 JSON，特别是 arguments 字段未
     result = fixer.fix_tool_calls(raw_json_str)
 
 支持的修复场景:
-    1. arguments 字段包含未转义的裸 JSON 对象
-    2. 多层嵌套的 arguments 修复
-    3. 不完整的 JSON 截断修复
-    4. markdown 代码块包裹的 JSON
-    5. 转义层级混乱（\\\\\\\\ 应为 \\\\）
-    6. 括号不平衡（多余的 } 或缺 }）
-    7. 数组内对象缺少 }（tool_calls 内的 tool_call 缺右括号）
-    8. 多余的尾部逗号（,] 或 ,}）
-    9. 顶层非 dict 时从 json_repair 的 list 结果中合并提取
+    0. 首尾空白、字面量 \\n
+    1. markdown 代码块包裹
+    2. arguments 裸对象（未转义的 JSON 对象）
+    3. arguments 字符串内过转义（\\\\\\" → \\\\\\" → \\" → \"）
+    4. 全局转义层级修复（四级→二级→一级）
+    5. 单引号→双引号
+    6. 未加引号的键名
+    7. 括号不平衡（多余的 } 或缺 }）
+    8. 数组内对象缺少 }
+    9. 尾部逗号（,] 或 ,}）
+    10. 顶层非 dict 时从 json_repair 的 list 结果中合并提取
+    11. json_repair 兜底
 """
 import json
 import re
@@ -35,83 +38,94 @@ class JsonFixer:
     def fix(self, raw_json_str: str) -> dict:
         """
         主入口：修复 LLM 输出的破损 JSON，返回解析后的 dict。
-        修复策略按优先级排列：
-            1. 直接解析
-            2. 去除 markdown 代码块
-            3. 修复 arguments 裸对象
-            4. 修复转义层级
-            5. 括号不平衡修复（多余 }）
-            6. 数组内对象缺 } 修复
-            7. 尾部逗号修复
-            8. json_repair 兜底
+        多种修复策略逐级尝试，只要某一步成功即返回。
         """
         logger.debug(f"开始 JSON 矫正\n{raw_json_str}")
         if not raw_json_str or not raw_json_str.strip():
             raise ValueError("输入为空，无法解析")
 
-        text = raw_json_str.strip()
+        text = raw_json_str
 
-        # 1. 直接解析
+        # ── Step 0: 首尾清理 ──
+        text = text.strip()
+        if text.startswith('\\n'):
+            text = text[2:].lstrip()
+        if text.endswith('\\n'):
+            text = text[:-2].rstrip()
+
+        # ── Step 1: 过转义修复（最关键的 LLM 专属问题）──
+        text = self._fix_over_escape(text)
+
+        # ── Step 2: 直接解析 ──
         try:
-            parsed = json.loads(text)
-            return self._normalize_arguments(parsed)
+            return self._normalize_arguments(json.loads(text))
         except json.JSONDecodeError:
             pass
 
-        # 2. 去除 markdown 代码块
+        # ── Step 3: 去除 markdown 代码块 ──
         cleaned = self._strip_code_block(text)
         if cleaned != text:
             try:
-                parsed = json.loads(cleaned)
-                return self._normalize_arguments(parsed)
+                return self._normalize_arguments(json.loads(cleaned))
             except json.JSONDecodeError:
                 text = cleaned
 
-        # 3. 修复 arguments 裸对象
+        # ── Step 4: 修复 arguments 裸/半裸对象 ──
         fixed = self._fix_bare_arguments(text)
         if fixed != text:
             try:
-                parsed = json.loads(fixed)
-                return self._normalize_arguments(parsed)
+                return self._normalize_arguments(json.loads(fixed))
             except json.JSONDecodeError:
                 text = fixed
 
-        # 4. 修复转义层级
-        fixed_escape = self._fix_escape_levels(text)
+        # ── Step 5: 转义层级迭代修复 ──
+        fixed_esc = self._fix_escape_levels(text)
         try:
-            parsed = json.loads(fixed_escape, strict=False)
-            return self._normalize_arguments(parsed)
+            return self._normalize_arguments(json.loads(fixed_esc, strict=False))
         except json.JSONDecodeError:
             pass
 
-        # 5. 括号不平衡修复（多余的 }）
-        fixed_braces = self._fix_unbalanced_braces(fixed_escape)
+        # ── Step 6: 单引号→双引号 ──
+        fixed_sq = self._fix_single_quotes(fixed_esc)
+        if fixed_sq != fixed_esc:
+            try:
+                return self._normalize_arguments(json.loads(fixed_sq, strict=False))
+            except json.JSONDecodeError:
+                pass
+
+        # ── Step 7: 未加引号的键名 ──
+        fixed_uq = self._fix_unquoted_keys(fixed_sq)
+        if fixed_uq != fixed_sq:
+            try:
+                return self._normalize_arguments(json.loads(fixed_uq, strict=False))
+            except json.JSONDecodeError:
+                pass
+
+        # ── Step 8: 尾部逗号 ──
+        fixed_tc = self._fix_trailing_commas(fixed_uq)
         try:
-            parsed = json.loads(fixed_braces, strict=False)
-            return self._normalize_arguments(parsed)
+            return self._normalize_arguments(json.loads(fixed_tc, strict=False))
         except json.JSONDecodeError:
             pass
 
-        # 6. 数组内对象缺 } 修复
-        fixed_missing = self._fix_missing_closing_braces(fixed_braces)
+        # ── Step 9: 括号不平衡（多余 }）──
+        fixed_ub = self._fix_unbalanced_braces(fixed_tc)
         try:
-            parsed = json.loads(fixed_missing, strict=False)
-            return self._normalize_arguments(parsed)
+            return self._normalize_arguments(json.loads(fixed_ub, strict=False))
         except json.JSONDecodeError:
             pass
 
-        # 7. 尾部逗号修复
-        fixed_trailing = self._fix_trailing_commas(fixed_missing)
+        # ── Step 9: 数组内对象缺 } ──
+        fixed_mb = self._fix_missing_closing_braces(fixed_ub)
         try:
-            parsed = json.loads(fixed_trailing, strict=False)
-            return self._normalize_arguments(parsed)
+            return self._normalize_arguments(json.loads(fixed_mb, strict=False))
         except json.JSONDecodeError:
             pass
 
-        # 8. json_repair 兜底
+        # ── Step 10: json_repair 兜底 ──
         try:
             import json_repair
-            repaired = json_repair.loads(fixed_trailing)
+            repaired = json_repair.loads(fixed_mb)
             logger.debug(f"json_repair修复的\n{repaired}")
             repaired = self._merge_repaired(repaired)
             if isinstance(repaired, dict):
@@ -121,15 +135,14 @@ class JsonFixer:
         except Exception as e:
             logger.debug(f"json_repair 修复失败: {e}")
 
-        # 所有策略失败
+        # ── Step 11: 最终失败 ──
         try:
-            final_err = json.loads(fixed_trailing, strict=False)
+            return self._normalize_arguments(json.loads(fixed_mb, strict=False))
         except json.JSONDecodeError as e:
             raise ValueError(
                 f"JSON 矫正失败 | pos={e.pos} | msg={e.msg}\n"
-                f"修复后内容片段: {fixed_trailing[max(0, e.pos-50):e.pos+50]}"
+                f"修复后内容片段: {fixed_mb[max(0, e.pos-50):e.pos+50]}"
             ) from e
-        return self._normalize_arguments(final_err)
 
     def fix_arguments(self, raw_json_str: str) -> str:
         if not raw_json_str:
@@ -173,8 +186,11 @@ class JsonFixer:
     def _normalize_arguments(data):
         if isinstance(data, dict):
             for key, val in data.items():
-                if key == "arguments" and isinstance(val, dict):
-                    data[key] = json.dumps(val, ensure_ascii=False)
+                if key == "arguments":
+                    if isinstance(val, dict):
+                        data[key] = json.dumps(val, ensure_ascii=False)
+                    elif isinstance(val, str) and val.strip().startswith("{"):
+                        data[key] = JsonFixer._repair_arguments_inner(val)
                 elif isinstance(val, (dict, list)):
                     JsonFixer._normalize_arguments(val)
         elif isinstance(data, list):
@@ -184,6 +200,52 @@ class JsonFixer:
         return data
 
     @staticmethod
+    def _repair_arguments_inner(val: str) -> str:
+        """修复 arguments 值的内部 JSON：去除尾部垃圾、补齐缺失括号。"""
+        try:
+            json.loads(val)
+            return val
+        except json.JSONDecodeError:
+            pass
+        try:
+            json.loads(val, strict=False)
+            return val
+        except json.JSONDecodeError:
+            pass
+        # 尝试 raw_decode 提取有效 JSON（去除尾部垃圾如 }]}}],）
+        try:
+            decoder = json.JSONDecoder()
+            obj, end = decoder.raw_decode(val)
+            repaired = val[:end].strip()
+            try:
+                json.loads(repaired)
+                return json.dumps(obj, ensure_ascii=False)
+            except json.JSONDecodeError:
+                pass
+        except json.JSONDecodeError:
+            pass
+        # 补齐缺失的 }
+        try:
+            stripped = val.rstrip()
+            open_count = stripped.count("{")
+            close_count = stripped.count("}")
+            diff = open_count - close_count
+            if diff > 0:
+                repaired = stripped + "}" * diff
+                if json.loads(repaired):
+                    return json.dumps(json.loads(repaired), ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
+        # json_repair 兜底
+        try:
+            import json_repair
+            repaired = json_repair.loads(val)
+            return json.dumps(repaired, ensure_ascii=False)
+        except Exception:
+            pass
+        return val
+
+    @staticmethod
     def _strip_code_block(text: str) -> str:
         if not text.startswith("```"):
             return text
@@ -191,6 +253,213 @@ class JsonFixer:
         if m:
             return m.group(1).strip()
         return text
+
+    @staticmethod
+    def _fix_over_escape(text: str) -> str:
+        """修复 arguments 值内的过转义问题。
+        LLM 常把 arguments 写成: "arguments":"{\\"description\\":\\"...\\",...}"
+        其中 \\" 在 JSON 解析时会被当作: 一个反斜杠 + 一个未转义的引号 → 字符串提前结束。
+        本方法只修复 arguments 字符串值内部的 \\" → \"，不影响外层 JSON 结构。"""
+        result = text
+        search_start = 0
+        while True:
+            idx = result.find('"arguments"', search_start)
+            if idx == -1:
+                break
+            colon_pos = result.find(':', idx + len('"arguments"'))
+            if colon_pos == -1:
+                search_start = idx + 1
+                continue
+            after_colon = colon_pos + 1
+            while after_colon < len(result) and result[after_colon] in ' \t\n\r':
+                after_colon += 1
+            if after_colon >= len(result) or result[after_colon] != '"':
+                search_start = idx + 1
+                continue
+            quote_start = after_colon
+
+            # 判断是否是对象值（以 { 开头），决定扫描策略
+            content_starts_with_brace = (
+                quote_start + 1 < len(result) and result[quote_start + 1] == '{'
+            )
+
+            if content_starts_with_brace:
+                # ── 花括号感知扫描 ──
+                # LLM 常输出 arguments 值内部有过转义（\\"）或未转义的引号，
+                # 导致简单扫描提前终止。通过跟踪 {/} 嵌套深度，只接受
+                # depth == 0 时的引号为真正的字符串终结符。
+                # 同时在扫描过程中构建修正后的内容：
+                #   - \\"（过转义）→ \"
+                #   - 裸 " 位于 depth>0 → \"（补齐转义）
+                fixed_parts = []
+                brace_depth = 0
+                i = quote_start + 1
+                while i < len(result):
+                    ch = result[i]
+                    if ch == '\\':
+                        if i + 1 < len(result) and result[i + 1] == '\\':
+                            # \\ 对 — 可能是 \\" 过转义
+                            if i + 2 < len(result) and result[i + 2] == '"' and brace_depth > 0:
+                                fixed_parts.append('\\"')
+                                i += 3
+                                continue
+                            else:
+                                fixed_parts.append('\\\\')
+                                i += 2
+                                continue
+                        else:
+                            fixed_parts.append(result[i:i + 2])
+                            i += 2
+                            continue
+                    if ch == '"':
+                        if brace_depth == 0:
+                            break
+                        else:
+                            fixed_parts.append('\\"')
+                            i += 1
+                            continue
+                    if ch == '{':
+                        brace_depth += 1
+                    elif ch == '}':
+                        if brace_depth > 0:
+                            brace_depth -= 1
+                    fixed_parts.append(ch)
+                    i += 1
+
+                if i >= len(result):
+                    search_start = idx + 1
+                    continue
+                quote_end = i
+                fixed_inner = ''.join(fixed_parts)
+                fixed_inner = JsonFixer._fix_over_escape_inner(fixed_inner)
+            else:
+                # ── 简单扫描（非对象值，如纯字符串）──
+                i = quote_start + 1
+                while i < len(result):
+                    ch = result[i]
+                    if ch == '\\':
+                        i += 2
+                        continue
+                    if ch == '"':
+                        break
+                    i += 1
+                if i >= len(result):
+                    search_start = idx + 1
+                    continue
+                quote_end = i
+                inner = result[quote_start + 1:quote_end]
+                fixed_inner = JsonFixer._fix_over_escape_inner(inner)
+
+            if fixed_inner != result[quote_start + 1:quote_end]:
+                result = result[:quote_start + 1] + fixed_inner + result[quote_end:]
+                search_start = quote_start + 1 + len(fixed_inner)
+                continue
+            search_start = quote_end + 1
+        return result
+
+    @staticmethod
+    def _fix_over_escape_inner(s: str) -> str:
+        """修复字符串内部的过转义。
+        输入是 arguments 的字符串值内容（不含外层引号）。
+        处理: \\" → \" (修复过度转义的双引号)
+              \' → '   (单引号在 JSON 字符串中不需要转义)
+        保留: \n, \t, \\ 等合法转义。
+        """
+        result = []
+        i = 0
+        n = len(s)
+        while i < n:
+            if i + 3 < n and s[i] == '\\' and s[i + 1] == '\\' and s[i + 2] == '\\' and s[i + 3] == '"':
+                # \\\" → \"  (三级转义→一级)
+                result.append('\\"')
+                i += 4
+            elif i + 2 < n and s[i] == '\\' and s[i + 1] == '\\' and s[i + 2] == '"':
+                # \\" → \"  (二级转义→一级)
+                result.append('\\"')
+                i += 3
+            elif i + 1 < n and s[i] == '\\' and s[i + 1] == '"':
+                # 已经是正确的 \"
+                result.append('\\"')
+                i += 2
+            elif i + 1 < n and s[i] == '\\' and s[i + 1] == "'":
+                # \' → '  (单引号在 JSON 字符串中非法转义，移除反斜杠)
+                result.append("'")
+                i += 2
+            elif i + 1 < n and s[i] == '\\' and s[i + 1] in 'ntrb/f\\':
+                # 合法的转义序列 \n, \t, \r, \b, \f, \\
+                result.append(s[i])
+                result.append(s[i + 1])
+                i += 2
+            else:
+                result.append(s[i])
+                i += 1
+        return ''.join(result)
+
+    @staticmethod
+    def _fix_single_quotes(text: str) -> str:
+        """修复单引号字符串 → 双引号字符串。
+        仅修复外层 JSON 结构中的单引号键和值。"""
+        result = []
+        i = 0
+        n = len(text)
+        in_single = False
+        while i < n:
+            ch = text[i]
+            if ch == "'" and not in_single:
+                in_single = True
+                result.append('"')
+                i += 1
+                continue
+            if ch == "'" and in_single:
+                in_single = False
+                result.append('"')
+                i += 1
+                continue
+            if in_single:
+                if ch == '\\' and i + 1 < n:
+                    # 单引号字符串内的转义
+                    result.append('\\')
+                    result.append(text[i + 1])
+                    i += 2
+                    continue
+                result.append(ch)
+                i += 1
+                continue
+            result.append(ch)
+            i += 1
+        return ''.join(result)
+
+    @staticmethod
+    def _fix_unquoted_keys(text: str) -> str:
+        """修复未加引号的键名，如 {a:1} → {"a":1}。
+        使用简单的正则：在 { 或 , 后面的未加引号标识符。"""
+        # 先处理 { 后的键
+        text = re.sub(r'([{,]\s*)([a-zA-Z_]\w*)(\s*:)', r'\1"\2"\3', text)
+        return text
+
+    @staticmethod
+    def _fix_escape_levels(text: str) -> str:
+        """迭代修复转义层级：\\\\\\\\ → \\\\ → \\。
+        每次尝试解析，成功即返回。"""
+        fixed = text
+        for _ in range(5):
+            try:
+                json.loads(fixed, strict=False)
+                return fixed
+            except json.JSONDecodeError:
+                pass
+            try:
+                fixed = (
+                    fixed
+                    .replace('\\\\\\\\', '\\\\')
+                    .replace('\\\\"', '\\"')
+                    .replace('\\\\n', '\\n')
+                    .replace('\\\\t', '\\t')
+                    .replace('\\\\/', '/')
+                )
+            except Exception:
+                break
+        return fixed
 
     @staticmethod
     def _fix_bare_arguments(text: str) -> str:
@@ -277,23 +546,38 @@ class JsonFixer:
 
     @staticmethod
     def _find_matching_brace(text: str, start: int) -> int:
+        """找到与 start 位置 { 匹配的 }。正确处理 JSON 字符串中的转义。
+        \\（双反斜杠）→ 字面量反斜杠对，不影响字符串状态。
+        \"（反斜杠+引号）→ 转义引号，不切换 in_string。"""
         if start >= len(text) or text[start] != '{':
             return 0
         depth = 0
         in_string = False
-        escape_next = False
-        for i in range(start, len(text)):
+        i = start
+        n = len(text)
+        while i < n:
             ch = text[i]
-            if escape_next:
-                escape_next = False
-                continue
             if ch == '\\':
-                escape_next = True
-                continue
+                # 看下一个字符
+                if i + 1 < n:
+                    next_ch = text[i + 1]
+                    if next_ch == '\\':
+                        # 双反斜杠 → 字面量，跳过两个字符
+                        i += 2
+                        continue
+                    else:
+                        # 转义序列（\"、\n、\t 等）→ 跳过两个字符
+                        i += 2
+                        continue
+                else:
+                    i += 1
+                    continue
             if ch == '"':
                 in_string = not in_string
+                i += 1
                 continue
             if in_string:
+                i += 1
                 continue
             if ch == '{':
                 depth += 1
@@ -301,34 +585,13 @@ class JsonFixer:
                 depth -= 1
                 if depth == 0:
                     return i
+            i += 1
         return 0
 
     @staticmethod
     def _escape_for_string(raw: str) -> str:
         escaped = raw.replace('\\', '\\\\').replace('"', '\\"')
         return f'"{escaped}"'
-
-    @staticmethod
-    def _fix_escape_levels(text: str) -> str:
-        fixed = text
-        for _ in range(5):
-            try:
-                json.loads(fixed, strict=False)
-                return fixed
-            except json.JSONDecodeError:
-                pass
-            try:
-                fixed = (
-                    fixed
-                    .replace('\\\\\\\\', '\\\\')
-                    .replace('\\\\"', '\\"')
-                    .replace('\\\\n', '\\n')
-                    .replace('\\\\t', '\\t')
-                    .replace('\\\\/', '/')
-                )
-            except Exception:
-                break
-        return fixed
 
     @staticmethod
     def _fix_unbalanced_braces(text: str) -> str:

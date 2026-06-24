@@ -358,10 +358,19 @@ class BrowserClient:
 
     async def ensure_qianwen_ready(self, headless=True):
         """确保 Qianwen 浏览器就绪，使用持久化 user_data_dir 保留登录状态。"""
-        if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.pages:
+        page_closed = self._qianwen_page is None or (hasattr(self._qianwen_page, 'is_closed') and self._qianwen_page.is_closed())
+        context_closed = self._qianwen_browser is None or (hasattr(self._qianwen_browser, 'is_connected') and not self._qianwen_browser.is_connected())
+        if not page_closed and not context_closed and self._qianwen_browser and self._qianwen_browser.pages:
             return True
+        if page_closed or context_closed:
+            logger.info("[Qwen] browser or page closed/crashed, rebuilding...")
+            self._qianwen_page = None
+            self._qianwen_browser = None
+            self._qianwen_pw = None
         async with self._qianwen_lock:
-            if self._qianwen_page and self._qianwen_browser and self._qianwen_browser.pages:
+            page_closed = self._qianwen_page is None or (hasattr(self._qianwen_page, 'is_closed') and self._qianwen_page.is_closed())
+            context_closed = self._qianwen_browser is None or (hasattr(self._qianwen_browser, 'is_connected') and not self._qianwen_browser.is_connected())
+            if not page_closed and not context_closed and self._qianwen_browser and self._qianwen_browser.pages:
                 return True
 
             if not os.path.exists(self._qianwen_user_data_dir):
@@ -2837,7 +2846,7 @@ class BrowserClient:
                 "src": ""
             }
 
-    async def upload_file_via_qianwen_page(self, file_data: bytes, file_name: str) -> str:
+    async def upload_file_via_qianwen_page(self, file_data: bytes, file_name: str, _retry: bool = False) -> str:
         headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
         await self.ensure_qianwen_ready(headless=headless)
         import tempfile
@@ -2864,11 +2873,11 @@ class BrowserClient:
 
             page.on('filechooser', on_fc)
 
-            # 点击“添加附件”按钮，打开菜单
+            # 点击"添加附件"按钮，打开菜单
             await page.click('[aria-label="添加附件"]')
             await asyncio.sleep(1)
 
-            # 点击“上传文档”菜单项
+            # 点击"上传文档"菜单项
             clicked = await page.evaluate("""() => {
                 const items = document.querySelectorAll('[role="menuitem"]');
                 for (const item of items) {
@@ -2922,6 +2931,38 @@ class BrowserClient:
                         logger.info(f"[Qwen] attachment detected in DOM (attempt {i+1})")
                         break
                 except Exception:
+                    pass
+                await asyncio.sleep(1)
+            if not attached:
+                logger.warning(f"[Qwen] attachment not detected in editor after 60s, proceeding anyway")
+
+            # 聚焦编辑器以便后续输入
+            await page.evaluate("""() => {
+                const el = document.querySelector('[contenteditable]') || document.querySelector('textarea');
+                if (el) { el.focus(); el.click(); }
+            }""")
+            return file_name
+
+        except Exception as e:
+            err_str = str(e)
+            # Target crashed / page 崩溃：自动重建并重试一次
+            if ("Target crashed" in err_str or "target crashed" in err_str.lower()) and not _retry:
+                logger.warning(f"[Qwen] page crashed during upload, rebuilding and retrying: {err_str}")
+                self._qianwen_page = None
+                self._qianwen_browser = None
+                self._qianwen_pw = None
+                try:
+                    return await self.upload_file_via_qianwen_page(file_data, file_name, _retry=True)
+                except Exception as retry_e:
+                    logger.error(f"[Qwen] upload retry also failed: {retry_e}")
+                    raise
+            logger.error(f"[Qwen] upload fail: {e}")
+            raise
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except:
                     pass
                 await asyncio.sleep(1)
             if not attached:
