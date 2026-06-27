@@ -383,45 +383,42 @@ class DoubaoAdapter(BaseAdapter):
                             continue
                         break
                     
-                    # ── Step 4: Wait for "图像生成" button to turn blue (state change) ──
-                    logger.info(f"[{adapter_name} ImageGen] waiting for '图像生成' button to turn blue...")
-                    for _blue_wait in range(30):
+                    # ── Step 4: Wait for image gen mode to be active (placeholder "描述你想要的图片" appears) ──
+                    logger.info(f"[{adapter_name} ImageGen] waiting for image gen mode placeholder...")
+                    for _mode_wait in range(30):
                         await _handle_error_page()
-                        btn_state = await page.evaluate("""() => {
-                            const btns = document.querySelectorAll('button');
-                            for (const btn of btns) {
-                                const txt = (btn.textContent || '').trim();
-                                if (txt === '图像生成') {
-                                    const computed = window.getComputedStyle(btn);
-                                    return {
-                                        found: true,
-                                        color: computed.color,
-                                        backgroundColor: computed.backgroundColor,
-                                        isBlue: computed.color.includes('rgb(51') || computed.backgroundColor.includes('51') || computed.color.includes('blue'),
-                                        className: btn.className?.substring(0, 50) || ''
-                                    };
-                                }
-                            }
-                            return { found: false };
+                        mode_check = await page.evaluate("""() => {
+                            const el = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+                            if (!el) return { found: false };
+                            const placeholder = el.getAttribute('data-placeholder') || el.placeholder || '';
+                            const childP = el.querySelector('[data-placeholder]');
+                            const childPlaceholder = childP ? childP.getAttribute('data-placeholder') : '';
+                            return { found: true, placeholder: placeholder, childPlaceholder: childPlaceholder, tagName: el.tagName };
                         }""")
-                        logger.info(f"[{adapter_name} ImageGen] button state: {btn_state}")
-                        if btn_state.get('isBlue'):
-                            logger.info(f"[{adapter_name} ImageGen] button turned blue, mode active!")
+                        logger.info(f"[{adapter_name} ImageGen] mode check: {mode_check}")
+                        ph = mode_check.get('placeholder') or ''
+                        cph = mode_check.get('childPlaceholder') or ''
+                        if '描述你想要的图片' in ph or '描述你想要的图片' in cph:
+                            logger.info(f"[{adapter_name} ImageGen] IMAGE GEN MODE ACTIVE (placeholder detected)!")
+                            break
+                        # Also detect by tagName change: textarea -> div[contenteditable] means mode switch
+                        if mode_check.get('tagName') == 'DIV' and mode_check.get('found'):
+                            logger.info(f"[{adapter_name} ImageGen] IMAGE GEN MODE ACTIVE (div contenteditable detected)!")
                             break
                         await asyncio.sleep(1)
                     else:
-                        logger.warning(f"[{adapter_name} ImageGen] button didn't turn blue, continuing anyway")
+                        logger.warning(f"[{adapter_name} ImageGen] image gen mode placeholder not detected, continuing anyway")
 
-                    # ── Step 5: Type prompt in SAME textarea and send ──
-                    logger.info(f"[{adapter_name} ImageGen] typing prompt in textarea...")
+                    # ── Step 5: Type prompt in SAME input and send ──
+                    logger.info(f"[{adapter_name} ImageGen] typing prompt in input...")
                     try:
-                        ta_el = await page.query_selector('textarea')
+                        ta_el = await page.query_selector('textarea, [contenteditable="true"], [role="textbox"]')
                         if ta_el:
                             await ta_el.scroll_into_view_if_needed()
                             await ta_el.focus()
                             await ta_el.click()
                         else:
-                            await page.evaluate("() => { const ta = document.querySelector('textarea'); if(ta) { ta.scrollIntoView({block:'center'}); ta.focus(); ta.click(); } }")
+                            await page.evaluate("() => { const el = document.querySelector('textarea, [contenteditable=true], [role=textbox]'); if(el) { el.scrollIntoView({block:'center'}); el.focus(); el.click(); } }")
                     except Exception as e:
                         logger.warning(f"[{adapter_name} ImageGen] scroll/focus error: {e}")
                     
@@ -438,7 +435,7 @@ class DoubaoAdapter(BaseAdapter):
 
                     # Verify text in input
                     text_check = await page.evaluate("""() => {
-                        const el = document.querySelector('textarea') || document.querySelector('[contenteditable=true]');
+                        const el = document.querySelector('textarea, [contenteditable=true], [role="textbox"]');
                         if (!el) return { ok: false };
                         const text = el.tagName === 'TEXTAREA' ? el.value : (el.textContent || el.innerText || '');
                         return { ok: text.trim().length > 0, text: text.trim().substring(0, 50) };
@@ -448,11 +445,16 @@ class DoubaoAdapter(BaseAdapter):
                     if not text_check.get('ok'):
                         logger.warning(f"[{adapter_name} ImageGen] text not entered! Trying JS value set...")
                         await page.evaluate("""(p) => {
-                            const el = document.querySelector('textarea') || document.querySelector('[contenteditable=true]');
+                            const el = document.querySelector('textarea, [contenteditable=true], [role="textbox"]');
                             if (el) {
                                 el.focus();
-                                el.value = p;
-                                el.dispatchEvent(new Event('input', {bubbles: true}));
+                                if (el.tagName === 'TEXTAREA') {
+                                    el.value = p;
+                                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                                } else {
+                                    el.textContent = p;
+                                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                                }
                             }
                         }""", prompt)
                         await asyncio.sleep(1)
