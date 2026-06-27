@@ -53,6 +53,9 @@ class JsonFixer:
         if text.endswith('\\n'):
             text = text[:-2].rstrip()
 
+        # ── Step 0.5: 仅对 arguments 解码 \uXXXX ──
+        text = self._decode_arguments_unicode_escapes(text)
+
         # ── Step 1: 过转义修复（最关键的 LLM 专属问题）──
         text = self._fix_over_escape(text)
 
@@ -148,6 +151,8 @@ class JsonFixer:
         if not raw_json_str:
             return raw_json_str
         text = raw_json_str.strip()
+        # 预解码 arguments 值中的 Unicode 转义序列
+        text = self._decode_arguments_unicode_escapes(text)
         try:
             json.loads(text)
             return text
@@ -181,6 +186,107 @@ class JsonFixer:
     # ═══════════════════════════════════════════════════════════════════════
     # 内部方法
     # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _decode_arguments_unicode_escapes(text: str) -> str:
+        """仅解码 arguments 字符串值内的 \\uXXXX 形式的 Unicode 转义序列。
+        不影响 JSON 其他部分的 \\uXXXX，也不处理 \\\\uXXXX（已被转义的反斜杠+u 原文）。
+        仅修改 arguments 对应的字符串值内容。"""
+        result = text
+        search_start = 0
+        while True:
+            idx = result.find('"arguments"', search_start)
+            if idx == -1:
+                break
+            colon_pos = result.find(':', idx + len('"arguments"'))
+            if colon_pos == -1:
+                search_start = idx + 1
+                continue
+            after_colon = colon_pos + 1
+            while after_colon < len(result) and result[after_colon] in ' \t\n\r':
+                after_colon += 1
+            if after_colon >= len(result) or result[after_colon] != '"':
+                search_start = idx + 1
+                continue
+            quote_start = after_colon
+
+            # 判断是否是对象值（以 { 开头），决定扫描策略
+            content_starts_with_brace = (
+                quote_start + 1 < len(result) and result[quote_start + 1] == '{'
+            )
+
+            if content_starts_with_brace:
+                # ── 花括号感知扫描（同 _fix_over_escape）──
+                brace_depth = 0
+                i = quote_start + 1
+                while i < len(result):
+                    ch = result[i]
+                    if ch == '\\':
+                        if i + 1 < len(result) and result[i + 1] == '\\':
+                            if i + 2 < len(result) and result[i + 2] == '"' and brace_depth > 0:
+                                i += 3
+                                continue
+                            else:
+                                i += 2
+                                continue
+                        else:
+                            i += 2
+                            continue
+                    if ch == '"':
+                        if brace_depth == 0:
+                            break
+                        else:
+                            i += 1
+                            continue
+                    if ch == '{':
+                        brace_depth += 1
+                    elif ch == '}':
+                        if brace_depth > 0:
+                            brace_depth -= 1
+                    i += 1
+
+                if i >= len(result):
+                    search_start = idx + 1
+                    continue
+                quote_end = i
+                inner = result[quote_start + 1:quote_end]
+                decoded_inner = re.sub(
+                    r'(?<!\\)\\u([0-9a-fA-F]{4})',
+                    lambda m: chr(int(m.group(1), 16)),
+                    inner,
+                )
+                if decoded_inner != inner:
+                    result = result[:quote_start + 1] + decoded_inner + result[quote_end:]
+                    search_start = quote_start + 1 + len(decoded_inner)
+                    continue
+            else:
+                # ── 简单扫描 ──
+                i = quote_start + 1
+                while i < len(result):
+                    ch = result[i]
+                    if ch == '\\':
+                        i += 2
+                        continue
+                    if ch == '"':
+                        break
+                    i += 1
+                if i >= len(result):
+                    search_start = idx + 1
+                    continue
+                quote_end = i
+                inner = result[quote_start + 1:quote_end]
+                decoded_inner = re.sub(
+                    r'(?<!\\)\\u([0-9a-fA-F]{4})',
+                    lambda m: chr(int(m.group(1), 16)),
+                    inner,
+                )
+                if decoded_inner != inner:
+                    result = result[:quote_start + 1] + decoded_inner + result[quote_end:]
+                    search_start = quote_start + 1 + len(decoded_inner)
+                    continue
+
+            search_start = quote_end + 1
+        return result
 
     @staticmethod
     def _normalize_arguments(data):
@@ -370,7 +476,7 @@ class JsonFixer:
         n = len(s)
         while i < n:
             if i + 3 < n and s[i] == '\\' and s[i + 1] == '\\' and s[i + 2] == '\\' and s[i + 3] == '"':
-                # \\\" → \"  (三级转义→一级)
+                # \\\\" → \"  (三级转义→一级)
                 result.append('\\"')
                 i += 4
             elif i + 2 < n and s[i] == '\\' and s[i + 1] == '\\' and s[i + 2] == '"':
@@ -521,6 +627,10 @@ class JsonFixer:
     def _fix_bare_string_arguments(text: str, key_idx: int, open_quote_pos: int) -> str:
         content_start = open_quote_pos + 1
         if content_start >= len(text) or text[content_start] != '{':
+            return text
+        # 如果 { 后面紧跟 \，说明内容已经正确转义（由 _fix_over_escape 处理过），
+        # 不应再作为裸对象重新编码，否则会破坏已有的转义结构
+        if content_start + 1 < len(text) and text[content_start + 1] == '\\':
             return text
         end_brace = JsonFixer._find_matching_brace(text, content_start)
         if end_brace == 0:
