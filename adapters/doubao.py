@@ -261,8 +261,12 @@ class DoubaoAdapter(BaseAdapter):
     async def generate_images(self, prompt: str, n: int = 1, size: str = "1024x1024", **kwargs) -> dict:
         """
         通过浏览器代理生成图片（豆包 "图像生成" 模式）。
-        导航到 /chat/create-image 页面，输入提示词，等待图片在 DOM 中渲染，
-        然后提取 img[src] URL 并下载到本地。
+        流程：
+        1. 导航到 /chat/ 页面
+        2. 点击"新对话"按钮创建新对话
+        3. 等待新对话稳定后，点击"图像生成"按钮切换到文生图模式
+        4. 输入提示词并发送
+        5. 轮询等待图片生成完成并下载到本地
         - 锁机制：同一时间只有一个图片生成请求
         - 限流检测 + _handle_rate_limit
         - conversation_id 追踪 + 对话删除
@@ -322,7 +326,7 @@ class DoubaoAdapter(BaseAdapter):
                                 pass
                         return False
 
-                    # ── Step 1: Ensure we're on /chat/ and handle error pages ──
+                    # ── Step 1: Ensure we're on /chat/ ──
                     logger.info(f"[{adapter_name} ImageGen] navigating to /chat/...")
                     await page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=60000)
                     await asyncio.sleep(5)
@@ -332,8 +336,8 @@ class DoubaoAdapter(BaseAdapter):
                     logger.info(f"[{adapter_name} ImageGen] waiting for chat page to fully load...")
                     for _load in range(30):
                         load_state = await page.evaluate("""() => {
-                            const hasInput = !!document.querySelector('[contenteditable=true][role=textbox]') || !!document.querySelector('[contenteditable="true"]') || !!document.querySelector('textarea');
-                            const hasSendBtn = !!document.getElementById('flow-end-msg-send') || !![...document.querySelectorAll('button')].find(b=>(b.textContent||'').trim()==='发送');
+                            const hasInput = !!document.querySelector('textarea');
+                            const hasSendBtn = !!document.getElementById('flow-end-msg-send');
                             const bodyLen = (document.body?.innerText || '').length;
                             return { hasInput, hasSendBtn, bodyLen, url: location.href };
                         }""")
@@ -344,12 +348,12 @@ class DoubaoAdapter(BaseAdapter):
                     else:
                         logger.warning(f"[{adapter_name} ImageGen] chat page load timeout, continuing anyway")
 
-                    # ── Step 3: Click "图像生成" button ──
-                    logger.info(f"[{adapter_name} ImageGen] looking for '图像生成' button...")
-                    create_img_ok = False
-                    for _btn_retry in range(15):
+                    # ── Step 3: Click "图像生成" button (below textarea) to switch to image gen mode ──
+                    logger.info(f"[{adapter_name} ImageGen] clicking '图像生成' button to enter image gen mode...")
+                    img_gen_clicked = False
+                    for _img_click in range(20):
                         await _handle_error_page()
-                        create_img_ok = await page.evaluate("""() => {
+                        img_gen_clicked = await page.evaluate("""() => {
                             const all = document.querySelectorAll('*');
                             for (const el of all) {
                                 if (el.childElementCount > 2) continue;
@@ -359,22 +363,14 @@ class DoubaoAdapter(BaseAdapter):
                                     return el.tagName + ':' + el.className.substring(0,30);
                                 }
                             }
-                            const navs = document.querySelectorAll('[class*="nav"] *, [class*="side"] *, [class*="menu"] *, [class*="tab"] *');
-                            for (const item of navs) {
-                                const txt = (item.textContent || '').trim();
-                                if (txt === '图像生成' || txt === '图片生成') {
-                                    item.click();
-                                    return 'nav:' + item.tagName;
-                                }
-                            }
                             return '';
                         }""")
-                        if create_img_ok:
-                            logger.info(f"[{adapter_name} ImageGen] clicked '图像生成': {create_img_ok}")
+                        if img_gen_clicked:
+                            logger.info(f"[{adapter_name} ImageGen] clicked '图像生成': {img_gen_clicked}")
                             break
                         await asyncio.sleep(1)
-
-                    if not create_img_ok:
+                    
+                    if not img_gen_clicked:
                         logger.warning(f"[{adapter_name} ImageGen] '图像生成' button not found")
                         all_btns_text = await page.evaluate("""() => {
                             const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
@@ -386,120 +382,54 @@ class DoubaoAdapter(BaseAdapter):
                             await asyncio.sleep(5)
                             continue
                         break
-
-                    # Screenshot after clicking 图像生成 button
-                    try:
-                        await page.screenshot(path="images/debug_after_click_imgbtn.png", timeout=10000)
-                    except Exception:
-                        pass
-
-                    # ── Step 4: Click the new conversation in sidebar (image gen creates a new conv) ──
-                    logger.info(f"[{adapter_name} ImageGen] clicking new conversation in sidebar...")
-                    sidebar_clicked = await page.evaluate("""() => {
-                        // Find sidebar conversation items (usually in a list)
-                        const sidebarItems = Array.from(document.querySelectorAll('[class*="sidebar"] *, [class*="side"] *, [class*="nav"] *, [class*="history"] *'));
-                        for (const item of sidebarItems) {
-                            const txt = (item.textContent || '').trim().substring(0, 50);
-                            if (txt && item.offsetParent !== null) {
-                                item.click();
-                                return { clicked: true, text: txt };
-                            }
-                        }
-                        // Fallback: find any clickable list item that's not the old one
-                        const allItems = Array.from(document.querySelectorAll('li, div[class*="item"], div[class*="row"], [role="listitem"]'));
-                        for (const item of allItems) {
-                            const txt = (item.textContent || '').trim().substring(0, 50);
-                            if (txt && item.offsetParent !== null && item.getBoundingClientRect().width > 0) {
-                                item.click();
-                                return { clicked: true, text: txt };
-                            }
-                        }
-                        return { clicked: false };
-                    }""")
-                    logger.info(f"[{adapter_name} ImageGen] sidebar click result: {sidebar_clicked}")
-                    await asyncio.sleep(3)
-
-                    # ── Step 5: Wait for image generation mode to activate ──
-                    logger.info(f"[{adapter_name} ImageGen] waiting for image generation mode...")
                     
-                    # Record initial textarea state
-                    initial_ta = await page.evaluate("""() => {
-                        const ta = document.querySelector('textarea');
-                        return ta ? {
-                            placeholder: ta.placeholder,
-                            value: ta.value,
-                            className: ta.className?.toString() || '',
-                            rect: ta.getBoundingClientRect().toString()
-                        } : null;
-                    }""")
-                    logger.info(f"[{adapter_name} ImageGen] initial textarea: {initial_ta}")
-                    
-                    # Wait for textarea placeholder to change (indicates mode switch)
-                    for _mode_wait in range(60):
+                    # ── Step 4: Wait for "图像生成" button to turn blue (state change) ──
+                    logger.info(f"[{adapter_name} ImageGen] waiting for '图像生成' button to turn blue...")
+                    for _blue_wait in range(30):
                         await _handle_error_page()
-                        
-                        current_ta = await page.evaluate("""() => {
-                            const ta = document.querySelector('textarea');
-                            return ta ? {
-                                placeholder: ta.placeholder,
-                                value: ta.value,
-                                className: ta.className?.toString() || '',
-                                rect: ta.getBoundingClientRect().toString()
-                            } : null;
+                        btn_state = await page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button');
+                            for (const btn of btns) {
+                                const txt = (btn.textContent || '').trim();
+                                if (txt === '图像生成') {
+                                    const computed = window.getComputedStyle(btn);
+                                    return {
+                                        found: true,
+                                        color: computed.color,
+                                        backgroundColor: computed.backgroundColor,
+                                        isBlue: computed.color.includes('rgb(51') || computed.backgroundColor.includes('51') || computed.color.includes('blue'),
+                                        className: btn.className?.substring(0, 50) || ''
+                                    };
+                                }
+                            }
+                            return { found: false };
                         }""")
-                        
-                        if current_ta:
-                            # Check if placeholder changed (indicates mode switch)
-                            if current_ta['placeholder'] != initial_ta['placeholder']:
-                                logger.info(f"[{adapter_name} ImageGen] MODE SWITCH DETECTED! placeholder: '{current_ta['placeholder']}'")
-                                break
-                            
-                            # Check if textarea moved significantly (layout change)
-                            if current_ta['rect'] != initial_ta['rect']:
-                                logger.info(f"[{adapter_name} ImageGen] LAYOUT CHANGE DETECTED! rect: {current_ta['rect']}")
-                                break
-                            
-                            # Check for image-generation-specific elements
-                            img_ui = await page.evaluate("""() => {
-                                const hasGenBtn = !![...document.querySelectorAll('button')].find(b => {
-                                    const txt = (b.textContent || '').trim();
-                                    return txt === '生成' || txt === '开始生成' || txt === '立即生成';
-                                });
-                                const hasImageGenTitle = !![...document.querySelectorAll('h1,h2,h3')].find(h => (h.textContent||'').includes('图像生成'));
-                                const ce = document.querySelector('[contenteditable=true]');
-                                return { hasGenBtn, hasImageGenTitle, hasCE: !!ce };
-                            }""")
-                            if img_ui.get('hasGenBtn') or img_ui.get('hasImageGenTitle'):
-                                logger.info(f"[{adapter_name} ImageGen] IMAGE UI DETECTED! {img_ui}")
-                                break
-                        
-                        if _mode_wait % 10 == 9:
-                            logger.info(f"[{adapter_name} ImageGen] waiting for mode switch... (#{_mode_wait}) current_placeholder='{current_ta['placeholder'] if current_ta else 'N/A'}'")
-                        
-                        await asyncio.sleep(2)
+                        logger.info(f"[{adapter_name} ImageGen] button state: {btn_state}")
+                        if btn_state.get('isBlue'):
+                            logger.info(f"[{adapter_name} ImageGen] button turned blue, mode active!")
+                            break
+                        await asyncio.sleep(1)
                     else:
-                        logger.warning(f"[{adapter_name} ImageGen] mode switch timeout, continuing anyway")
-                        try:
-                            await page.screenshot(path="images/debug_mode_switch_timeout.png", timeout=10000)
-                        except Exception:
-                            pass
+                        logger.warning(f"[{adapter_name} ImageGen] button didn't turn blue, continuing anyway")
 
-                    # ── Step 7: Scroll textarea into view and type prompt ──
-                    logger.info(f"[{adapter_name} ImageGen] scrolling textarea into view...")
-                    ta_rect = await page.evaluate("""() => {
-                        const ta = document.querySelector('textarea') || document.querySelector('[contenteditable=true]');
-                        if (!ta) return null;
-                        ta.scrollIntoView({ behavior: 'instant', block: 'center' });
-                        ta.focus();
-                        ta.click();
-                        const r = ta.getBoundingClientRect();
-                        return { top: r.top, left: r.left, width: r.width, height: r.height, placeholder: ta.placeholder };
-                    }""")
-                    logger.info(f"[{adapter_name} ImageGen] textarea rect: {ta_rect}")
+                    # ── Step 5: Type prompt in SAME textarea and send ──
+                    logger.info(f"[{adapter_name} ImageGen] typing prompt in textarea...")
+                    try:
+                        ta_el = await page.query_selector('textarea')
+                        if ta_el:
+                            await ta_el.scroll_into_view_if_needed()
+                            await ta_el.focus()
+                            await ta_el.click()
+                        else:
+                            await page.evaluate("() => { const ta = document.querySelector('textarea'); if(ta) { ta.scrollIntoView({block:'center'}); ta.focus(); ta.click(); } }")
+                    except Exception as e:
+                        logger.warning(f"[{adapter_name} ImageGen] scroll/focus error: {e}")
+                    
                     await asyncio.sleep(0.5)
                     
                     # Type using keyboard events
                     await page.keyboard.press("Control+A")
+                    await asyncio.sleep(0.1)
                     await page.keyboard.press("Backspace")
                     await asyncio.sleep(0.2)
                     await page.keyboard.type(prompt, delay=30)
@@ -529,7 +459,7 @@ class DoubaoAdapter(BaseAdapter):
 
                     # Send - try multiple strategies
                     send_result = await page.evaluate("""() => {
-                        // Strategy 1: 生成 button
+                        // Strategy 1: 生成 button (image gen mode)
                         const genBtn = [...document.querySelectorAll('button')].find(b => {
                             const txt = (b.textContent || '').trim();
                             return txt === '生成' || txt === '开始生成' || txt === '立即生成';
@@ -545,10 +475,6 @@ class DoubaoAdapter(BaseAdapter):
                             sendBtn.click();
                             return 'send-btn';
                         }
-                        
-                        // Strategy 3: 发送 button
-                        const sendTxt = [...document.querySelectorAll('button')].find(b => (b.textContent||'').trim() === '发送' && !b.disabled);
-                        if (sendTxt) { sendTxt.click(); return 'send-text'; }
                         
                         return 'none';
                     }""")

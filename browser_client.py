@@ -268,11 +268,21 @@ class BrowserClient:
                 user_data_dir=self._doubao_user_data_dir,
                 headless=headless,
                 channel=_browser_channel(),
-                args=_linux_safe_args(),
+                args=_linux_safe_args() + ["--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
             self._doubao_page = self._doubao_browser.pages[0] if self._doubao_browser.pages else await self._doubao_browser.new_page()
+
+            # 反检测：在页面脚本运行前注入
+            await self._doubao_page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """)
+
             await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
 
             logger.info("Doubao: navigating to doubao.com/chat/ ...")
@@ -315,10 +325,14 @@ class BrowserClient:
                                 !!document.querySelector('button[class*="send"]');
                 const bodyText = document.body.innerText || '';
                 const hasLoginPrompt = bodyText.includes('请先登录') || bodyText.includes('扫码登录');
-                return { hasInput, hasSend, hasLoginPrompt };
+                // Check for blocking modal (Semi UI modal portal)
+                const modal = document.querySelector('.semi-modal-wrap, .semi-modal-wrap-center, .semi-portal');
+                const hasBlockingModal = !!modal;
+                const modalText = modal ? (modal.textContent || '').trim().substring(0, 100) : '';
+                return { hasInput, hasSend, hasLoginPrompt, hasBlockingModal, modalText };
             }""") or {}
-            if has_chat_ui.get('hasLoginPrompt') and not has_chat_ui.get('hasSend'):
-                logger.warning("Doubao: login required - session expired. Opening visible browser...")
+            if has_chat_ui.get('hasBlockingModal') or (has_chat_ui.get('hasLoginPrompt') and not has_chat_ui.get('hasSend')):
+                logger.warning(f"Doubao: login/modal issue detected. hasBlockingModal={has_chat_ui.get('hasBlockingModal')}, modalText='{has_chat_ui.get('modalText')}'")
                 await self._doubao_login_recovery()
 
             logger.info("Doubao browser ready")
@@ -353,11 +367,18 @@ class BrowserClient:
                 user_data_dir=self._doubao_user_data_dir,
                 headless=False,
                 channel=_browser_channel(),
-                args=_linux_safe_args(),
+                args=_linux_safe_args() + ["--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
             login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
+            await login_page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """)
             await login_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
             logger.info("Doubao: visible browser opened for manual login. Please log in...")
 
@@ -382,11 +403,18 @@ class BrowserClient:
                 user_data_dir=self._doubao_user_data_dir,
                 headless=True,
                 channel=_browser_channel(),
-                args=_linux_safe_args(),
+                args=_linux_safe_args() + ["--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"],
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
             self._doubao_page = self._doubao_browser.pages[0] if self._doubao_browser.pages else await self._doubao_browser.new_page()
+            await self._doubao_page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """)
             await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
             await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
             await asyncio.sleep(2)
@@ -469,13 +497,11 @@ class BrowserClient:
 
     async def download_images_from_urls(self, urls: list, n: int = 1) -> list:
         """从 URL 列表下载图片到本地。
-        支持两种 URL 格式：
-        1. rc_gen_image URL（来自 /chat/ 页面的 image_generation 模式）
-        2. ocean-cloud-tos/image_generation URL（来自 /chat/create-image 页面）
+        对于 rc_gen_image URL，优先通过浏览器上下文获取真实的“下载原图”签名链接；
+        对于 ocean-cloud-tos/image_generation URL，使用 httpx 直接下载。
         """
         import uuid as _uuid
         import httpx as _httpx
-        from urllib.parse import unquote
         import hashlib
 
         local_urls = []
@@ -484,21 +510,17 @@ class BrowserClient:
 
         logger.info(f"[Doubao] download_images_from_urls called with {len(urls)} URLs")
 
-        # Build deduplicated list preserving order
         seen_hashes = set()
         unique_urls = []
         for url in urls:
-            # Extract a unique identifier from the URL
             m_rc = re.search(r'rc_gen_image/([a-f0-9]+)\.jpeg', url)
             if m_rc:
                 uid = f"rc:{m_rc.group(1)}"
             else:
-                # For ocean-cloud-tos URLs, extract the hash before the timestamp
                 m_oc = re.search(r'image_generation/([a-f0-9]+)_(\d+)', url)
                 if m_oc:
                     uid = f"oc:{m_oc.group(1)}"
                 else:
-                    # Fallback: use URL hash
                     uid = f"hash:{hashlib.md5(url.encode()).hexdigest()[:8]}"
 
             if uid not in seen_hashes:
@@ -506,22 +528,42 @@ class BrowserClient:
                 unique_urls.append((uid, url))
 
         logger.info(f"[Doubao] download: {len(unique_urls)} unique images, requesting {n}")
+        selected = unique_urls[:n]
 
-        # Determine quality preference for rc_gen_image URLs
-        quality_order = ['image_dld_watermark', 'image_ori_raw', 'image_raw_b', 'image_pre_watermark', 'downsize_watermark', 'image_thumb']
+        page = self._doubao_page
+        if page:
+            for uid, preview_url in selected:
+                if not uid.startswith("rc:"):
+                    continue
+                try:
+                    fullsize_url = await self._get_fullsize_download_url_via_browser(page, uid, preview_url)
+                    target_url = fullsize_url or preview_url
+                    if fullsize_url:
+                        logger.info(f"[Doubao] got full-size signed URL for {uid}: {target_url[:120]}...")
+                    else:
+                        logger.warning(f"[Doubao] no full-size signed URL for {uid}, using preview URL")
+                    resp = await page.request.get(target_url)
+                    content = await resp.body()
+                    logger.info(f"[Doubao] browser download {uid}: HTTP {resp.status}, {len(content)} bytes, ct={resp.headers.get('content-type','')}")
+                    if resp.status == 200 and len(content) > 1024:
+                        ct = resp.headers.get('content-type', '').lower()
+                        ext = '.jpg' if 'jpeg' in ct else '.png' if 'png' in ct else '.webp'
+                        m_rc2 = re.search(r'rc_gen_image/([a-f0-9]+)', target_url)
+                        base_hash = m_rc2.group(1) if m_rc2 else uid.split(":")[1]
+                        filename = f"{base_hash[:8]}_{_uuid.uuid4().hex[:6]}{ext}"
+                        filepath = os.path.join(images_dir, filename)
+                        with open(filepath, 'wb') as f:
+                            f.write(content)
+                        local_url = f"http://localhost:8765/images/{filename}"
+                        local_urls.append(local_url)
+                        logger.info(f"[Doubao] saved: {local_url} ({len(content)} bytes)")
+                    elif resp.status == 200:
+                        logger.warning(f"[Doubao] image too small for {uid}: {len(content)} bytes")
+                    else:
+                        logger.warning(f"[Doubao] browser download failed for {uid}: HTTP {resp.status}")
+                except Exception as e:
+                    logger.warning(f"[Doubao] browser download error for {uid}: {e}")
 
-        selected = []
-        for uid, url in unique_urls[:n]:
-            if uid.startswith("oc:"):
-                # ocean-cloud-tos URL: use directly
-                selected.append((uid, url))
-            elif uid.startswith("rc:"):
-                # rc_gen_image URL: pick best quality if multiple variants
-                base_hash = uid.split(":")[1]
-                # Already deduplicated, just pick the first one
-                selected.append((uid, url))
-
-        # Download images
         async with _httpx.AsyncClient(timeout=60, follow_redirects=True, headers={
             'accept': '*/*',
             'origin': 'https://www.doubao.com',
@@ -532,6 +574,8 @@ class BrowserClient:
             'sec-fetch-dest': 'empty',
         }) as client:
             for uid, target_url in selected:
+                if uid.startswith("rc:"):
+                    continue
                 try:
                     logger.info(f"[Doubao] downloading {uid}: {target_url[:120]}...")
                     resp = await client.get(target_url)
@@ -539,22 +583,11 @@ class BrowserClient:
                     if resp.status_code == 200 and len(resp.content) > 1024:
                         ct = resp.headers.get('content-type', '').lower()
                         ext = '.jpg' if 'jpeg' in ct else '.png' if 'png' in ct else '.webp'
-
-                        # Generate filename from the URL
                         if uid.startswith("oc:"):
-                            # ocean-cloud-tos: extract hash from URL
                             m_oc = re.search(r'image_generation/([a-f0-9]+)', target_url)
-                            if m_oc:
-                                base_hash = m_oc.group(1)
-                            else:
-                                base_hash = uid.split(":")[1]
+                            base_hash = m_oc.group(1) if m_oc else uid.split(":")[1]
                         else:
-                            m_rc = re.search(r'rc_gen_image/([a-f0-9]+)', target_url)
-                            if m_rc:
-                                base_hash = m_rc.group(1)
-                            else:
-                                base_hash = uid.split(":")[1]
-
+                            base_hash = uid.split(":", 1)[1]
                         filename = f"{base_hash[:8]}_{_uuid.uuid4().hex[:6]}{ext}"
                         filepath = os.path.join(images_dir, filename)
                         with open(filepath, 'wb') as f:
@@ -572,6 +605,83 @@ class BrowserClient:
         logger.info(f"[Doubao] download completed: {len(local_urls)}/{n} success")
         return local_urls
 
+    async def _get_fullsize_download_url_via_browser(self, page, uid: str, preview_url: str) -> str | None:
+        """右键图片打开上下文菜单，点击"下载原图"菜单项，拦截真实签名请求。"""
+        import asyncio as _asyncio
+
+        if not page or page.is_closed():
+            return None
+
+        base_hash = uid.split(":", 1)[1]
+        captured_urls = []
+
+        async def _capture(route):
+            req_url = route.request.url
+            if 'rc_gen_image' in req_url and 'image_dld' in req_url:
+                captured_urls.append(req_url)
+                logger.info(f"[Doubao] captured full-size request for {uid}: {req_url[:150]}")
+                await route.abort()
+                return
+            await route.continue_()
+
+        try:
+            await page.route("**/*", _capture)
+        except Exception as e:
+            logger.warning(f"[Doubao] route setup failed for {uid}: {e}")
+            return None
+
+        try:
+            # Step 1: Find the image and right-click it to open context menu
+            img_info = await page.evaluate("""(baseHash) => {
+                const imgs = Array.from(document.querySelectorAll('img[src*="rc_gen_image"]'));
+                const img = imgs.find(i => (i.src || '').includes(baseHash));
+                if (!img) return { found: false };
+                const rect = img.getBoundingClientRect();
+                return { found: true, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            }""", base_hash)
+            logger.info(f"[Doubao] img location for {uid}: {img_info}")
+
+            if not img_info or not img_info.get('found'):
+                return None
+
+            # Right-click on the image to open context menu
+            await page.mouse.click(img_info['x'], img_info['y'], button='right')
+            await _asyncio.sleep(0.5)
+
+            # Step 2: Click "下载原图" context menu item
+            clicked = await page.evaluate("""() => {
+                const menuItems = document.querySelectorAll('[class*="context-menu-item"]');
+                for (const item of menuItems) {
+                    const txt = (item.textContent || '').trim();
+                    if (txt.includes('下载原图')) {
+                        item.click();
+                        return { clicked: true, text: txt, className: (item.className || '').substring(0, 80) };
+                    }
+                }
+                return { clicked: false, reason: 'context menu item not found' };
+            }""")
+            logger.info(f"[Doubao] 下载原图 click result for {uid}: {clicked}")
+
+            if not clicked or not clicked.get('clicked'):
+                # Fallback: press Escape to close context menu, try a different approach
+                await page.keyboard.press('Escape')
+                await _asyncio.sleep(0.3)
+                return None
+
+            # Step 3: Wait for the intercepted full-size URL
+            for _ in range(20):
+                if captured_urls:
+                    return captured_urls[0]
+                await _asyncio.sleep(0.5)
+            return None
+        except Exception as e:
+            logger.warning(f"[Doubao] capture full-size url failed for {uid}: {e}")
+            return None
+        finally:
+            try:
+                await page.unroute("**/*", _capture)
+            except Exception:
+                pass
     async def ensure_qianwen_ready(self, headless=True):
         """确保 Qianwen 浏览器就绪，使用持久化 user_data_dir 保留登录状态。"""
         page_closed = self._qianwen_page is None or (hasattr(self._qianwen_page, 'is_closed') and self._qianwen_page.is_closed())
