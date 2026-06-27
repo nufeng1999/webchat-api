@@ -188,9 +188,11 @@ class DoubaoAdapter(BaseAdapter):
         request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
 
         msgs = request_dict.get('messages', [])
-        if len(msgs) > 5:
-            msgs = msgs[-5:]
-        request_dict['messages'] = msgs
+        if len(msgs) > 15:
+            new_msgs = msgs[:10] + msgs[-5:]
+        else:
+            new_msgs = msgs
+        request_dict['messages'] = new_msgs
 
         return json.dumps(request_dict, ensure_ascii=False, indent=None, separators=(',', ':'))
 
@@ -251,6 +253,469 @@ class DoubaoAdapter(BaseAdapter):
             f"[错误信息：{err_msg}]\n"
             f"[你的原始回复（前500字符）：{raw_text[:2000]}]"
         )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 图片生成
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def generate_images(self, prompt: str, n: int = 1, size: str = "1024x1024", **kwargs) -> dict:
+        """
+        通过浏览器代理生成图片（豆包 "图像生成" 模式）。
+        导航到 /chat/create-image 页面，输入提示词，等待图片在 DOM 中渲染，
+        然后提取 img[src] URL 并下载到本地。
+        - 锁机制：同一时间只有一个图片生成请求
+        - 限流检测 + _handle_rate_limit
+        - conversation_id 追踪 + 对话删除
+        - 下载图片到本地并返回 localhost URL
+        """
+        from browser_client import browser_client
+        import time
+
+        adapter_name = self.get_adapter_name()
+        max_retries = 3
+
+        lock = self._get_lock()
+        await lock.acquire()
+        try:
+            last_error = None
+            self._last_conversation_id = ""
+
+            for attempt in range(max_retries):
+                all_image_urls = []
+                conversation_id = "0"
+
+                logger.info(f"[{adapter_name} ImageGen] {Colors.RED}Attempt {attempt+1}/{max_retries}{Colors.RESET}")
+
+                try:
+                    headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+                    await browser_client.ensure_doubao_ready(headless=headless)
+
+                    page = browser_client._doubao_page
+                    if not page or page.is_closed():
+                        raise RuntimeError("Doubao page not available")
+
+                    # ── Helper: detect and handle error page ──
+                    async def _handle_error_page(timeout=30000):
+                        """Check for error page and handle it. Returns True if page is OK."""
+                        for _err in range(5):
+                            check = await page.evaluate("""() => {
+                                const txt = (document.body?.innerText || '');
+                                const hasError = txt.includes('该页面暂时不可用') || txt.includes('页面渲染异常') || txt.includes('page temporarily unavailable');
+                                const hasRefreshBtn = !!Array.from(document.querySelectorAll('button')).find(b => (b.textContent||'').includes('刷新页面'));
+                                const hasBackBtn = !!Array.from(document.querySelectorAll('button,a')).find(b => (b.textContent||'').includes('返回首页'));
+                                return { hasError, hasRefreshBtn, hasBackBtn, url: location.href };
+                            }""")
+                            if not check.get('hasError'):
+                                return True
+                            logger.warning(f"[{adapter_name} ImageGen] error page detected: url={check.get('url','')}")
+                            if check.get('hasRefreshBtn'):
+                                await page.evaluate("""() => { const b=[...document.querySelectorAll('button')].find(b=>(b.textContent||'').includes('刷新页面')); if(b)b.click(); }""")
+                            elif check.get('hasBackBtn'):
+                                await page.evaluate("""() => { const b=[...document.querySelectorAll('button,a')].find(b=>(b.textContent||'').includes('返回首页')); if(b)b.click(); }""")
+                            else:
+                                await page.reload(wait_until="domcontentloaded", timeout=timeout)
+                            await asyncio.sleep(5)
+                            # After refresh/reload, wait a moment for page to stabilize
+                            try:
+                                await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+                            except Exception:
+                                pass
+                        return False
+
+                    # ── Step 1: Ensure we're on /chat/ and handle error pages ──
+                    logger.info(f"[{adapter_name} ImageGen] navigating to /chat/...")
+                    await page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=60000)
+                    await asyncio.sleep(5)
+                    await _handle_error_page(timeout=60000)
+
+                    # ── Step 2: Wait for chat page fully loaded ──
+                    logger.info(f"[{adapter_name} ImageGen] waiting for chat page to fully load...")
+                    for _load in range(30):
+                        load_state = await page.evaluate("""() => {
+                            const hasInput = !!document.querySelector('[contenteditable=true][role=textbox]') || !!document.querySelector('[contenteditable="true"]') || !!document.querySelector('textarea');
+                            const hasSendBtn = !!document.getElementById('flow-end-msg-send') || !![...document.querySelectorAll('button')].find(b=>(b.textContent||'').trim()==='发送');
+                            const bodyLen = (document.body?.innerText || '').length;
+                            return { hasInput, hasSendBtn, bodyLen, url: location.href };
+                        }""")
+                        if load_state.get('hasInput') or load_state.get('hasSendBtn'):
+                            logger.info(f"[{adapter_name} ImageGen] chat page loaded: input={load_state.get('hasInput')} sendBtn={load_state.get('hasSendBtn')}")
+                            break
+                        await asyncio.sleep(2)
+                    else:
+                        logger.warning(f"[{adapter_name} ImageGen] chat page load timeout, continuing anyway")
+
+                    # ── Step 3: Click "图像生成" button ──
+                    logger.info(f"[{adapter_name} ImageGen] looking for '图像生成' button...")
+                    create_img_ok = False
+                    for _btn_retry in range(15):
+                        await _handle_error_page()
+                        create_img_ok = await page.evaluate("""() => {
+                            const all = document.querySelectorAll('*');
+                            for (const el of all) {
+                                if (el.childElementCount > 2) continue;
+                                const txt = (el.textContent || '').trim();
+                                if (txt === '图像生成') {
+                                    el.click();
+                                    return el.tagName + ':' + el.className.substring(0,30);
+                                }
+                            }
+                            const navs = document.querySelectorAll('[class*="nav"] *, [class*="side"] *, [class*="menu"] *, [class*="tab"] *');
+                            for (const item of navs) {
+                                const txt = (item.textContent || '').trim();
+                                if (txt === '图像生成' || txt === '图片生成') {
+                                    item.click();
+                                    return 'nav:' + item.tagName;
+                                }
+                            }
+                            return '';
+                        }""")
+                        if create_img_ok:
+                            logger.info(f"[{adapter_name} ImageGen] clicked '图像生成': {create_img_ok}")
+                            break
+                        await asyncio.sleep(1)
+
+                    if not create_img_ok:
+                        logger.warning(f"[{adapter_name} ImageGen] '图像生成' button not found")
+                        all_btns_text = await page.evaluate("""() => {
+                            const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                            return btns.slice(0, 50).map(b => b.textContent.trim().substring(0, 40)).filter(t => t);
+                        }""")
+                        logger.warning(f"[{adapter_name} ImageGen] visible buttons: {all_btns_text}")
+                        last_error = "Could not find '图像生成' button"
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(5)
+                            continue
+                        break
+
+                    # Screenshot after clicking 图像生成 button
+                    try:
+                        await page.screenshot(path="images/debug_after_click_imgbtn.png", timeout=10000)
+                    except Exception:
+                        pass
+
+                    # ── Step 4: Click the new conversation in sidebar (image gen creates a new conv) ──
+                    logger.info(f"[{adapter_name} ImageGen] clicking new conversation in sidebar...")
+                    sidebar_clicked = await page.evaluate("""() => {
+                        // Find sidebar conversation items (usually in a list)
+                        const sidebarItems = Array.from(document.querySelectorAll('[class*="sidebar"] *, [class*="side"] *, [class*="nav"] *, [class*="history"] *'));
+                        for (const item of sidebarItems) {
+                            const txt = (item.textContent || '').trim().substring(0, 50);
+                            if (txt && item.offsetParent !== null) {
+                                item.click();
+                                return { clicked: true, text: txt };
+                            }
+                        }
+                        // Fallback: find any clickable list item that's not the old one
+                        const allItems = Array.from(document.querySelectorAll('li, div[class*="item"], div[class*="row"], [role="listitem"]'));
+                        for (const item of allItems) {
+                            const txt = (item.textContent || '').trim().substring(0, 50);
+                            if (txt && item.offsetParent !== null && item.getBoundingClientRect().width > 0) {
+                                item.click();
+                                return { clicked: true, text: txt };
+                            }
+                        }
+                        return { clicked: false };
+                    }""")
+                    logger.info(f"[{adapter_name} ImageGen] sidebar click result: {sidebar_clicked}")
+                    await asyncio.sleep(3)
+
+                    # ── Step 5: Wait for image generation mode to activate ──
+                    logger.info(f"[{adapter_name} ImageGen] waiting for image generation mode...")
+                    
+                    # Record initial textarea state
+                    initial_ta = await page.evaluate("""() => {
+                        const ta = document.querySelector('textarea');
+                        return ta ? {
+                            placeholder: ta.placeholder,
+                            value: ta.value,
+                            className: ta.className?.toString() || '',
+                            rect: ta.getBoundingClientRect().toString()
+                        } : null;
+                    }""")
+                    logger.info(f"[{adapter_name} ImageGen] initial textarea: {initial_ta}")
+                    
+                    # Wait for textarea placeholder to change (indicates mode switch)
+                    for _mode_wait in range(60):
+                        await _handle_error_page()
+                        
+                        current_ta = await page.evaluate("""() => {
+                            const ta = document.querySelector('textarea');
+                            return ta ? {
+                                placeholder: ta.placeholder,
+                                value: ta.value,
+                                className: ta.className?.toString() || '',
+                                rect: ta.getBoundingClientRect().toString()
+                            } : null;
+                        }""")
+                        
+                        if current_ta:
+                            # Check if placeholder changed (indicates mode switch)
+                            if current_ta['placeholder'] != initial_ta['placeholder']:
+                                logger.info(f"[{adapter_name} ImageGen] MODE SWITCH DETECTED! placeholder: '{current_ta['placeholder']}'")
+                                break
+                            
+                            # Check if textarea moved significantly (layout change)
+                            if current_ta['rect'] != initial_ta['rect']:
+                                logger.info(f"[{adapter_name} ImageGen] LAYOUT CHANGE DETECTED! rect: {current_ta['rect']}")
+                                break
+                            
+                            # Check for image-generation-specific elements
+                            img_ui = await page.evaluate("""() => {
+                                const hasGenBtn = !![...document.querySelectorAll('button')].find(b => {
+                                    const txt = (b.textContent || '').trim();
+                                    return txt === '生成' || txt === '开始生成' || txt === '立即生成';
+                                });
+                                const hasImageGenTitle = !![...document.querySelectorAll('h1,h2,h3')].find(h => (h.textContent||'').includes('图像生成'));
+                                const ce = document.querySelector('[contenteditable=true]');
+                                return { hasGenBtn, hasImageGenTitle, hasCE: !!ce };
+                            }""")
+                            if img_ui.get('hasGenBtn') or img_ui.get('hasImageGenTitle'):
+                                logger.info(f"[{adapter_name} ImageGen] IMAGE UI DETECTED! {img_ui}")
+                                break
+                        
+                        if _mode_wait % 10 == 9:
+                            logger.info(f"[{adapter_name} ImageGen] waiting for mode switch... (#{_mode_wait}) current_placeholder='{current_ta['placeholder'] if current_ta else 'N/A'}'")
+                        
+                        await asyncio.sleep(2)
+                    else:
+                        logger.warning(f"[{adapter_name} ImageGen] mode switch timeout, continuing anyway")
+                        try:
+                            await page.screenshot(path="images/debug_mode_switch_timeout.png", timeout=10000)
+                        except Exception:
+                            pass
+
+                    # ── Step 7: Scroll textarea into view and type prompt ──
+                    logger.info(f"[{adapter_name} ImageGen] scrolling textarea into view...")
+                    ta_rect = await page.evaluate("""() => {
+                        const ta = document.querySelector('textarea') || document.querySelector('[contenteditable=true]');
+                        if (!ta) return null;
+                        ta.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        ta.focus();
+                        ta.click();
+                        const r = ta.getBoundingClientRect();
+                        return { top: r.top, left: r.left, width: r.width, height: r.height, placeholder: ta.placeholder };
+                    }""")
+                    logger.info(f"[{adapter_name} ImageGen] textarea rect: {ta_rect}")
+                    await asyncio.sleep(0.5)
+                    
+                    # Type using keyboard events
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await asyncio.sleep(0.2)
+                    await page.keyboard.type(prompt, delay=30)
+                    logger.info(f"[{adapter_name} ImageGen] typed {len(prompt)} chars")
+                    await asyncio.sleep(1)
+
+                    # Verify text in input
+                    text_check = await page.evaluate("""() => {
+                        const el = document.querySelector('textarea') || document.querySelector('[contenteditable=true]');
+                        if (!el) return { ok: false };
+                        const text = el.tagName === 'TEXTAREA' ? el.value : (el.textContent || el.innerText || '');
+                        return { ok: text.trim().length > 0, text: text.trim().substring(0, 50) };
+                    }""")
+                    logger.info(f"[{adapter_name} ImageGen] text in input: {text_check}")
+                    
+                    if not text_check.get('ok'):
+                        logger.warning(f"[{adapter_name} ImageGen] text not entered! Trying JS value set...")
+                        await page.evaluate("""(p) => {
+                            const el = document.querySelector('textarea') || document.querySelector('[contenteditable=true]');
+                            if (el) {
+                                el.focus();
+                                el.value = p;
+                                el.dispatchEvent(new Event('input', {bubbles: true}));
+                            }
+                        }""", prompt)
+                        await asyncio.sleep(1)
+
+                    # Send - try multiple strategies
+                    send_result = await page.evaluate("""() => {
+                        // Strategy 1: 生成 button
+                        const genBtn = [...document.querySelectorAll('button')].find(b => {
+                            const txt = (b.textContent || '').trim();
+                            return txt === '生成' || txt === '开始生成' || txt === '立即生成';
+                        });
+                        if (genBtn && genBtn.offsetParent !== null) {
+                            genBtn.click();
+                            return 'gen-btn';
+                        }
+                        
+                        // Strategy 2: flow-end-msg-send button
+                        const sendBtn = document.getElementById('flow-end-msg-send');
+                        if (sendBtn && !sendBtn.disabled && sendBtn.offsetParent !== null) {
+                            sendBtn.click();
+                            return 'send-btn';
+                        }
+                        
+                        // Strategy 3: 发送 button
+                        const sendTxt = [...document.querySelectorAll('button')].find(b => (b.textContent||'').trim() === '发送' && !b.disabled);
+                        if (sendTxt) { sendTxt.click(); return 'send-text'; }
+                        
+                        return 'none';
+                    }""")
+                    logger.info(f"[{adapter_name} ImageGen] send result: {send_result}")
+                    
+                    if send_result == 'none':
+                        logger.info(f"[{adapter_name} ImageGen] trying Enter key...")
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(1)
+
+                    # Verify generation started
+                    await asyncio.sleep(3)
+                    gen_status = await page.evaluate("""() => {
+                        const bodyText = (document.body?.innerText || '');
+                        const hasLoading = bodyText.includes('生成中') || bodyText.includes('正在生成') || bodyText.includes('loading') || bodyText.includes('Loading');
+                        const hasGenerating = !!document.querySelector('[class*="loading"]') || !!document.querySelector('[class*="generating"]') || !!document.querySelector('[class*="progress"]');
+                        const inputNow = (() => {
+                            const el = document.querySelector('textarea') || document.querySelector('[contenteditable=true]');
+                            if (!el) return '';
+                            return el.tagName === 'TEXTAREA' ? el.value : (el.textContent || el.innerText || '');
+                        })();
+                        return {
+                            hasLoading, hasGenerating,
+                            inputCleared: inputNow.trim().length === 0,
+                            inputText: inputNow.trim().substring(0, 30)
+                        };
+                    }""")
+                    logger.info(f"[{adapter_name} ImageGen] generation status: {gen_status}")
+                    
+                    if not gen_status.get('hasLoading') and not gen_status.get('hasGenerating') and not gen_status.get('inputCleared'):
+                        logger.warning(f"[{adapter_name} ImageGen] generation may not have started! Retrying...")
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(3)
+
+                    # ── Step 6: Record existing images, then poll for new ones (up to 5 minutes) ──
+                    await asyncio.sleep(3)
+                    old_img_srcs = await page.evaluate("""() => {
+                        const imgs = Array.from(document.querySelectorAll('img'));
+                        return imgs.filter(img => {
+                            const src = img.src || '';
+                            return (src.includes('image_generation') || src.includes('rc_gen_image'))
+                                   && src.includes('byteimg.com');
+                        }).map(i => i.src || '');
+                    }""")
+                    logger.info(f"[{adapter_name} ImageGen] {len(old_img_srcs)} existing images, waiting for new ones (up to 5min)...")
+
+                    prev_new_count = 0
+                    stable_count = 0
+                    MAX_POLL = 150  # 150 × 2s = 300s = 5 minutes
+                    for poll_i in range(MAX_POLL):
+                        await asyncio.sleep(2)
+                        await _handle_error_page()
+                        img_info = await page.evaluate("""() => {
+                            const imgs = Array.from(document.querySelectorAll('img'));
+                            const genImgs = imgs.filter(img => {
+                                const src = img.src || '';
+                                return (src.includes('image_generation') || src.includes('rc_gen_image'))
+                                       && src.includes('byteimg.com');
+                            });
+                            const bodyText = document.body?.innerText || '';
+                            const isRateLimit = bodyText.includes('请求过于频繁') || bodyText.includes('rate limit');
+                            return {
+                                totalImgs: imgs.length,
+                                genImgCount: genImgs.length,
+                                genImgSrcs: genImgs.map(i => i.src || ''),
+                                isRateLimit: isRateLimit
+                            };
+                        }""")
+
+                        if img_info.get('isRateLimit'):
+                            rate_limit_error = "Rate limit detected on page"
+                            logger.warning(f"[{adapter_name} ImageGen] rate limit detected")
+                            handled = await self._handle_rate_limit(attempt, max_retries, rate_limit_error)
+                            if handled:
+                                break
+                            break
+
+                        # Count only NEW images (not in old_img_srcs)
+                        all_srcs = img_info.get('genImgSrcs', [])
+                        new_srcs = [s for s in all_srcs if s and s not in old_img_srcs]
+                        new_count = len(new_srcs)
+
+                        if new_count > 0:
+                            if new_count == prev_new_count:
+                                stable_count += 1
+                            else:
+                                stable_count = 0
+                                prev_new_count = new_count
+                                logger.info(f"[{adapter_name} ImageGen] new images appearing: {new_count} at {(poll_i+1)*2}s")
+
+                            if stable_count >= 5:
+                                for src in new_srcs:
+                                    if src not in all_image_urls:
+                                        all_image_urls.append(src)
+                                logger.info(f"[{adapter_name} ImageGen] images stable: {len(all_image_urls)} new after {(poll_i+1)*2}s")
+                                break
+
+                        if poll_i % 15 == 14:
+                            logger.info(f"[{adapter_name} ImageGen] poll {(poll_i+1)*2}s: newImgs={new_count} totalGenImgs={img_info.get('genImgCount',0)} totalImgs={img_info.get('totalImgs',0)}")
+
+                    # Final extraction
+                    if not all_image_urls:
+                        final_info = await page.evaluate("""() => {
+                            const imgs = Array.from(document.querySelectorAll('img'));
+                            const genImgs = imgs.filter(img => {
+                                const src = img.src || '';
+                                return (src.includes('image_generation') || src.includes('rc_gen_image'))
+                                       && src.includes('byteimg.com');
+                            });
+                            return genImgs.map(i => i.src || '');
+                        }""")
+                        for src in final_info:
+                            if src and src not in all_image_urls and src not in old_img_srcs:
+                                all_image_urls.append(src)
+
+                    # Try to get conversation_id from page URL
+                    page_url = page.url
+                    if "/chat/" in page_url:
+                        parts = page_url.split("/chat/", 1)[1].split("?")[0].split("#")[0]
+                        if parts and parts != "create-image" and parts != "":
+                            conversation_id = parts
+                            self._last_conversation_id = conversation_id
+
+                    logger.info(f"[{adapter_name} ImageGen] attempt {attempt+1}: {len(all_image_urls)} URLs from DOM")
+
+                except Exception as e:
+                    logger.error(f"[{adapter_name} ImageGen] browser error: {e}")
+                    last_error = str(e)
+
+                if all_image_urls:
+                    logger.info(f"[{adapter_name} ImageGen] downloading {len(all_image_urls)} images: {[u[:100] for u in all_image_urls[:3]]}")
+                    downloaded = []
+                    try:
+                        downloaded = await browser_client.download_images_from_urls(all_image_urls, n)
+                        logger.info(f"[{adapter_name} ImageGen] download completed: {len(downloaded)}/{n}")
+                    except Exception as dl_e:
+                        import traceback as _tb
+                        logger.warning(f"[{adapter_name} ImageGen] download error: {dl_e}\n{_tb.format_exc()}")
+
+                    await self._delete_conversation()
+                    if downloaded:
+                        result = {"created": int(time.time()), "data": []}
+                        for local_url in downloaded[:n]:
+                            result["data"].append({"url": local_url, "revised_prompt": prompt, "size": size})
+                        return result
+                    else:
+                        return {"created": int(time.time()), "data": [{"url": "", "revised_prompt": prompt, "size": size, "error": "Download failed"}]}
+
+                await self._delete_conversation()
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                break
+
+            error_msg = last_error or "图片生成功能暂时不可用，请稍后再试。"
+            return {
+                "created": int(time.time()),
+                "data": [{"url": "", "revised_prompt": prompt, "size": size, "error": error_msg}]
+            }
+        except Exception as e:
+            logger.error(f"[{adapter_name} ImageGen] fatal error: {e}")
+            return {
+                "created": int(time.time()),
+                "data": [{"url": "", "revised_prompt": prompt, "size": size, "error": str(e)}]
+            }
+        finally:
+            lock.release()
 
     # ═══════════════════════════════════════════════════════════════════════
     # 流式与非流式接口

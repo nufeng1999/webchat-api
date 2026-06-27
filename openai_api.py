@@ -929,6 +929,46 @@ async def generate_images(prompt: str, n: int = 1, size: str = "1024x1024"):
     return result
 
 
+async def generate_images_via_browser(prompt: str, n: int = 1, size: str = "1024x1024"):
+    from browser_client import browser_client
+    import time
+
+    all_image_urls = []
+    conversation_id = "0"
+
+    img_prompt = prompt
+
+    logger.info(f"[ImageGen] browser proxy: prompt={prompt[:50]}...")
+    async for kind, value in browser_client.stream_doubao_chat_via_type(text=prompt, image_generation=True):
+        if kind == "image_url":
+            if value not in all_image_urls:
+                all_image_urls.append(value)
+        elif kind == "conversation_id":
+            conversation_id = value
+        elif kind == "error":
+            logger.warning(f"[ImageGen] browser error: {value}")
+
+    logger.info(f"[ImageGen] first pass: {len(all_image_urls)} URLs, conv_id={conversation_id}")
+
+    if not all_image_urls and conversation_id != "0":
+        retry_prompt = "请直接生成图片，不需要文字说明。"
+        logger.warning("[ImageGen] No images on first attempt, retrying in same conversation")
+        async for kind, value in browser_client.stream_doubao_chat_via_type(text=retry_prompt, image_generation=True):
+            if kind == "image_url" and value not in all_image_urls:
+                all_image_urls.append(value)
+
+    result = {"created": int(time.time()), "data": []}
+    for url in all_image_urls[:n]:
+        result["data"].append({"url": url, "revised_prompt": prompt})
+
+    if not result["data"]:
+        result["data"] = [{"url": "", "revised_prompt": prompt,
+                          "error": "图片生成功能暂时不可用，请稍后再试，或直接在对话中尝试。"}]
+
+    logger.info(f"[ImageGen] Generated {len(result.get('data', []))} images for prompt: {prompt[:50]}...")
+    return result
+
+
 async def delete_conversation(conversation_id: str, skip_browser: bool = False) -> tuple[bool, str]:
     if not conversation_id or conversation_id == "0":
         return True, "No conversation to delete"

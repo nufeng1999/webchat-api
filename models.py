@@ -106,3 +106,18 @@ class AnthropicMessageRequest(BaseModel):
     stop_sequences: Optional[list[str]] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
+
+
+class ImageGenerationRequest(BaseModel):
+    """OpenAI 兼容的图片生成请求模型。"""
+    model: str = "doubao-image"
+    prompt: str
+    n: int = Field(default=1, ge=1, le=10)
+    size: str = "1024x1024"
+    quality: Optional[str] = None
+    style: Optional[str] = None
+    response_format: str = "url"
+    user: Optional[str] = None
+    metadata: Optional[dict] = None
+
+    model_config = ConfigDict(extra='allow')

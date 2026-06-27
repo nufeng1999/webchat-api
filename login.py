@@ -99,34 +99,11 @@ async def do_login(show_browser: bool = True) -> dict:
         await page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
         await asyncio.sleep(2)
 
-        # 检查 session cookie；如果 persistent context 恢复的 cookies 不包含有效会话，尝试从 config.json 补充注入
+        # 检查 session cookie；如果 persistent context 恢复的 cookies 不包含有效会话，说明未登录
         async def _is_logged_in() -> bool:
             cks = await browser.cookies()
             names = {c["name"] for c in cks if c.get("value")}
             return bool(names & {"sessionid", "sessionid_ss", "sid_guard", "sid_tt"})
-
-        if not await _is_logged_in():
-            cookie_str = CONFIG.get('cookie', '')
-            if cookie_str and 'sessionid' in cookie_str:
-                logger.info("Session cookie missing after page load, trying config.json cookie string...")
-                cookies_to_add = []
-                for part in cookie_str.split(';'):
-                    part = part.strip()
-                    if '=' in part:
-                        name, value = part.split('=', 1)
-                        # 检查是否已存在同名 cookie
-                        if not any(c.get("name") == name for c in await browser.cookies()):
-                            cookies_to_add.append({
-                                'name': name.strip(),
-                                'value': value.strip(),
-                                'domain': '.doubao.com',
-                                'path': '/'
-                            })
-                if cookies_to_add:
-                    await browser.add_cookies(cookies_to_add)
-                    logger.info(f"Added {len(cookies_to_add)} missing cookies from config.json")
-                    if await _is_logged_in():
-                        logger.info("Login state restored from config.json cookies")
 
         if await _is_logged_in():
             logger.info("Already logged in (valid session cookie found)")
@@ -209,13 +186,12 @@ async def do_login(show_browser: bool = True) -> dict:
             except Exception:
                 pass
 
-        # 更新 config.json
-        _update_config(cookie_str, device_id, web_id, tea_uuid)
+        # 更新 config.json (cookie 已由 profile 自动管理，不再写入 config.json)
+        _update_config(device_id, web_id, tea_uuid)
 
-        logger.info(f"Login successful. Cookie length: {len(cookie_str)}")
+        logger.info(f"Login successful. Cookie saved to profile directory.")
         print("=" * 50)
-        print("登录成功！配置已保存到 config.json")
-        print(f"Cookie 长度: {len(cookie_str)} 字符")
+        print("登录成功！Cookie 已保存到 doubao_profile 目录。")
         if device_id:
             print(f"device_id: {device_id}")
         print("=" * 50)
@@ -259,10 +235,9 @@ async def do_login(show_browser: bool = True) -> dict:
         return {"success": False, "message": str(e)}
 
 
-def _update_config(cookie_str: str, device_id: str, web_id: str, tea_uuid: str):
+def _update_config(device_id: str, web_id: str, tea_uuid: str):
     """将登录结果写入 config.json，保留其他字段不变。"""
     config = CONFIG.copy()
-    config["cookie"] = cookie_str
     if device_id:
         config["device_id"] = device_id
     if web_id:

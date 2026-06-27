@@ -11,20 +11,21 @@ from urllib.parse import urlparse, unquote
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from config import (
     BASE_DIR, CONFIG, SIGN_METHOD, signer, cookie_pool,
     load_accounts, save_accounts, load_conversation_state,
     LOG_DIR, ACCOUNTS_PATH, rate_limiter, request_limiter
 )
-from models import ChatCompletionRequest, AnthropicMessageRequest, MODEL_CONFIG
-from openai_api import stream_chat_completion, non_stream_chat_completion, generate_images, delete_conversation
+from models import ChatCompletionRequest, AnthropicMessageRequest, ImageGenerationRequest, MODEL_CONFIG
+from openai_api import stream_chat_completion, non_stream_chat_completion, generate_images, generate_images_via_browser, delete_conversation
 from anthropic_api import stream_anthropic_messages, non_stream_anthropic_messages
 from podcast import start_podcast_generation, get_podcast_status, get_podcast_audio, get_podcast_script, list_podcasts, AUDIO_DIR
 from music import start_music_generation, get_music_status, get_music_audio, get_music_lyric, list_music, get_music_styles
 from exporter import fetch_user_info, fetch_conversation_list, export_conversation_full
 from storage import init_db, save_conversation, list_conversations as db_list_conversations, get_conversation as db_get_conversation, save_message, get_messages as db_get_messages, delete_conversation as db_delete_conversation, search_conversations
-from adapters import init_all as adapters_init_all, close_all as adapters_close_all, get_adapter, get_models as get_adapter_models
+from adapters import init_all as adapters_init_all, close_all as adapters_close_all, get_adapter, get_image_adapter, get_models as get_adapter_models
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("webchat-api")
@@ -188,6 +189,10 @@ async def lifespan(app: FastAPI):
     loop.set_exception_handler(_original_handler if _original_handler else None)
 
 app = FastAPI(title="WebChat Free API", version="3.3.0", lifespan=lifespan)
+
+IMAGES_DIR = os.path.join(BASE_DIR, "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
+app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
 
 app.add_middleware(
     CORSMiddleware,
@@ -377,19 +382,40 @@ async def upload_image_endpoint(file: UploadFile = File(...)):
 @app.post("/v1/images/generations")
 async def generate_images_endpoint(request: Request):
     """
-    OpenAI 兼容的图片生成 API
-    请求体示例: { "prompt": "一只可爱的小猫", "n": 1, "size": "1024x1024" }
+    OpenAI 兼容的图片生成 API（适配器架构）
+    请求体示例: { "prompt": "一只可爱的小猫", "model": "doubao-image", "n": 1, "size": "1024x1024" }
+    
+    路由逻辑：
+    1. 从请求体中提取 model 字段
+    2. 根据 model 查找对应图片生成适配器
+    3. 调用适配器的 generate_images 方法
+    4. 返回 OpenAI 兼容格式
+    
+    适配器扩展：
+    - doubao：通过浏览器代理调用豆包"图像生成"模式
+    - 新增适配器只需在 adapters/xxx.py 中覆盖 generate_images 方法
+      并在 adapters/__init__.py 的 _IMAGE_ADAPTER_MAP 中注册
     """
     try:
         body = await request.json()
         prompt = body.get("prompt", "")
+        model = body.get("model", "doubao-image")
         n = body.get("n", 1)
         size = body.get("size", "1024x1024")
-        
+
         if not prompt:
-            raise HTTPException(status_code=400, detail="Missing 'prompt' is required")
-        
-        result = await generate_images(prompt, n=n, size=size)
+            raise HTTPException(status_code=400, detail="'prompt' is required")
+
+        adapter = get_image_adapter(model)
+        if not adapter:
+            raise HTTPException(status_code=400, detail=f"No image adapter found for model: {model}")
+
+        result = await adapter.generate_images(prompt=prompt, n=n, size=size)
+
+        has_error = any(item.get("error") for item in result.get("data", []))
+        if has_error:
+            logger.warning(f"Image generation returned errors for model={model}, prompt={prompt[:50]}")
+
         return JSONResponse(content=result)
     except HTTPException:
         raise
@@ -1054,13 +1080,13 @@ if __name__ == "__main__":
     if args.browser is None:
         args.browser = "edge" if sys.platform.startswith("win") else "chromium"
     CONFIG['_browser_channel'] = _browser_channel_map.get(args.browser, "msedge" if sys.platform.startswith("win") else None)
-    # 各站点独立配置（优先级：--show-xxx > --show > 默认 headless）
-    CONFIG['_doubao_headless'] = not (args.show or args.show_doubao)
-    CONFIG['_qianwen_headless'] = not (args.show or args.show_qianwen)
-    CONFIG['_deepseek_headless'] = not (args.show or args.show_deepseek)
-    CONFIG['_zai_headless'] = not (args.show or args.show_zai)
-    CONFIG['_mimo_headless'] = not (args.show or args.show_mimo)
-    CONFIG['_minimax_headless'] = not (args.show or args.show_minimax)
+    # 各站点独立配置（优先级：--show-xxx > --show > config.json > 默认 headless）
+    CONFIG['_doubao_headless'] = args.show_doubao if args.show_doubao else (args.show if args.show else CONFIG.get('_doubao_headless', True))
+    CONFIG['_qianwen_headless'] = args.show_qianwen if args.show_qianwen else (args.show if args.show else CONFIG.get('_qianwen_headless', True))
+    CONFIG['_deepseek_headless'] = args.show_deepseek if args.show_deepseek else (args.show if args.show else CONFIG.get('_deepseek_headless', True))
+    CONFIG['_zai_headless'] = args.show_zai if args.show_zai else (args.show if args.show else CONFIG.get('_zai_headless', True))
+    CONFIG['_mimo_headless'] = args.show_mimo if args.show_mimo else (args.show if args.show else CONFIG.get('_mimo_headless', True))
+    CONFIG['_minimax_headless'] = args.show_minimax if args.show_minimax else (args.show if args.show else CONFIG.get('_minimax_headless', True))
     CONFIG['_xinghuo_headless'] = not (args.show or args.show_xinghuo)
     CONFIG['_keep_conversations'] = args.keep_conversations
 

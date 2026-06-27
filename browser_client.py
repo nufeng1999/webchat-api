@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import uuid
+import re
 import httpx
 import ctypes
 import time
@@ -47,19 +48,70 @@ STORAGE_STATE_PATH = os.path.join(BASE_DIR, "storage_state.json")
 DOUBAO_USER_DATA_DIR = os.path.join(BASE_DIR, "doubao_profile")
 
 
-def _get_latest_cookie_from_storage() -> str:
-    """从 storage_state.json 或 doubao_profile 读取最新 cookie 字符串"""
+def _read_cookie_from_profile_db() -> str:
+    """从 doubao_profile 的 Chrome Cookie SQLite 数据库读取 doubao.com cookie 字符串。"""
+    cookie_db = os.path.join(DOUBAO_USER_DATA_DIR, "Default", "Cookies")
+    if not os.path.exists(cookie_db):
+        return ""
     try:
-        if os.path.exists(STORAGE_STATE_PATH):
-            with open(STORAGE_STATE_PATH, 'r', encoding='utf-8') as f:
-                state = json.load(f)
-            cookies = state.get('cookies', [])
-            cookie_str = '; '.join(f"{c['name']}={c['value']}" for c in cookies if 'doubao.com' in c.get('domain', ''))
+        import sqlite3
+        import shutil
+        import tempfile
+        tmp = os.path.join(tempfile.gettempdir(), f"doubao_cookie_{int(time.time())}.db")
+        shutil.copy2(cookie_db, tmp)
+        conn = sqlite3.connect(tmp)
+        rows = conn.execute(
+            "SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%doubao.com%'"
+        ).fetchall()
+        conn.close()
+        os.remove(tmp)
+        if not rows:
+            return ""
+        parts = []
+        for name, enc_val in rows:
+            try:
+                if not enc_val:
+                    continue
+                if enc_val[:3] == b'v10' or enc_val[:3] == b'v11':
+                    import win32crypt
+                    val = win32crypt.CryptUnprotectData(enc_val, None, None, None, 0)[1]
+                else:
+                    val = enc_val
+                parts.append(f"{name}={val.decode('utf-8', errors='replace')}")
+            except Exception:
+                continue
+        return "; ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
+async def _get_latest_cookie_async() -> str:
+    """从当前 browser context 获取 cookie，fallback 到 profile DB 读取。"""
+    try:
+        from browser_client import browser_client
+        bc = browser_client
+        if bc._doubao_browser and not bc._doubao_browser.is_closed():
+            cks = await bc._doubao_browser.cookies()
+            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cks if c.get("value"))
             if cookie_str:
                 return cookie_str
     except Exception:
         pass
-    return CONFIG.get('cookie', '')
+    return _read_cookie_from_profile_db()
+
+
+def _get_latest_cookie_from_storage() -> str:
+    """同步获取 cookie：优先从 browser context（如果事件循环运行中），fallback 到 profile DB。"""
+    try:
+        loop = asyncio.get_running_loop()
+        if loop and not loop.is_closed():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _get_latest_cookie_async())
+                return future.result(timeout=5)
+    except RuntimeError:
+        pass
+    return _read_cookie_from_profile_db()
 COMPLETION_URL_BASE = "https://www.doubao.com/chat/completion"
 
 
@@ -223,22 +275,29 @@ class BrowserClient:
             self._doubao_page = self._doubao_browser.pages[0] if self._doubao_browser.pages else await self._doubao_browser.new_page()
             await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
 
-            # 优先从旧 storage_state.json 恢复完整 cookie 集合，兼容旧登录流程
-            try:
-                if os.path.exists(STORAGE_STATE_PATH):
-                    with open(STORAGE_STATE_PATH, 'r', encoding='utf-8') as f:
-                        state = json.load(f)
-                    cookies = state.get('cookies', [])
-                    doubao_cookies = [c for c in cookies if 'doubao.com' in c.get('domain', '')]
-                    if doubao_cookies:
-                        await self._doubao_browser.add_cookies(doubao_cookies)
-                        logger.info(f"Doubao: restored {len(doubao_cookies)} cookies from storage_state.json")
-            except Exception as e:
-                logger.warning(f"Doubao: storage_state restore failed: {e}")
-
             logger.info("Doubao: navigating to doubao.com/chat/ ...")
-            await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=60000)
+            try:
+                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=15000)
+            except Exception:
+                logger.warning("[Doubao] initial goto timed out, trying reload...")
+                try:
+                    await self._doubao_page.reload(wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
             await asyncio.sleep(2)
+
+            # 检查并处理错误页（"该页面暂时不可用" -> 点击"刷新页面"）
+            try:
+                err_buttons = await self._doubao_page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button');
+                    return Array.from(btns).map(b => (b.textContent || '').trim()).filter(t => t);
+                }""")
+                if len(err_buttons) >= 1 and err_buttons[0] == '刷新页面':
+                    logger.info("[Doubao] error page at init, clicking '刷新页面'...")
+                    await self._doubao_page.evaluate("document.querySelector('button').click()")
+                    await asyncio.sleep(5)
+            except Exception as e:
+                logger.debug(f"[Doubao] error page check failed: {e}")
 
             try:
                 await self._doubao_page.wait_for_function(
@@ -249,39 +308,18 @@ class BrowserClient:
             except Exception as e:
                 logger.warning(f"Doubao: bdms.frontierSign not available: {e}")
 
-            body_text = await self._doubao_page.text_content("body") or ""
-            if any(kw in body_text for kw in ["登录", "请先登录", "扫码登录", "验证", "人机验证", "需要验证", "安全验证", "captcha", "verify"]):
+            has_chat_ui = await self._doubao_page.evaluate("""() => {
+                const hasInput = !!document.querySelector('textarea') || !!document.querySelector('[contenteditable=true]');
+                const hasSend = !!document.getElementById('flow-end-msg-send') ||
+                                !!document.querySelector('button[data-testid*="send"]') ||
+                                !!document.querySelector('button[class*="send"]');
+                const bodyText = document.body.innerText || '';
+                const hasLoginPrompt = bodyText.includes('请先登录') || bodyText.includes('扫码登录');
+                return { hasInput, hasSend, hasLoginPrompt };
+            }""") or {}
+            if has_chat_ui.get('hasLoginPrompt') and not has_chat_ui.get('hasSend'):
                 logger.warning("Doubao: login required - session expired. Opening visible browser...")
                 await self._doubao_login_recovery()
-            else:
-                # 检查 session cookie；如果 persistent context 恢复的 cookies 不包含有效会话，从 config.json 补充注入
-                try:
-                    cks = await self._doubao_browser.cookies()
-                    names = {c["name"] for c in cks if c.get("value")}
-                    if not (names & {"sessionid", "sessionid_ss", "sid_guard", "sid_tt"}):
-                        cookie_str = CONFIG.get('cookie', '')
-                        if cookie_str and 'sessionid' in cookie_str:
-                            logger.info("Doubao: session cookie missing, restoring from config.json...")
-                            cookies_to_add = []
-                            for part in cookie_str.split(';'):
-                                part = part.strip()
-                                if '=' in part:
-                                    name, value = part.split('=', 1)
-                                    if not any(c.get("name") == name for c in cks):
-                                        cookies_to_add.append({
-                                            'name': name.strip(),
-                                            'value': value.strip(),
-                                            'domain': '.doubao.com',
-                                            'path': '/'
-                                        })
-                            if cookies_to_add:
-                                await self._doubao_browser.add_cookies(cookies_to_add)
-                                logger.info(f"Doubao: added {len(cookies_to_add)} cookies from config.json")
-                                # 重新导航使新 cookie 生效
-                                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
-                                await asyncio.sleep(2)
-                except Exception as e:
-                    logger.warning(f"Doubao: cookie restore failed: {e}")
 
             logger.info("Doubao browser ready")
             return True
@@ -355,6 +393,184 @@ class BrowserClient:
         except Exception as e:
             logger.error(f"Doubao login recovery failed: {e}")
             raise
+
+    async def _download_images_via_contextmenu(self) -> list:
+        """使用 page.request.get() 在浏览器上下文中下载图片，自动携带 Cookie 和正确 Headers。"""
+        import uuid as _uuid
+        local_urls = []
+        images_dir = os.path.join(BASE_DIR, "images")
+        os.makedirs(images_dir, exist_ok=True)
+        try:
+            # 获取页面上的图片（rc_gen_image）
+            img_elements = await self._doubao_page.query_selector_all('img')
+            if not img_elements:
+                logger.warning("[Doubao] no img elements found for download")
+                return []
+            targets = []
+            for img_el in img_elements:
+                try:
+                    src = await img_el.get_attribute('src') or ''
+                    visible = await img_el.is_visible()
+                    if not visible or not src or not src.startswith('http'):
+                        continue
+                    if 'rc_gen_image' in src and 'byteimg.com' in src:
+                        targets.append(src)
+                except Exception:
+                    continue
+            if not targets:
+                logger.warning("[Doubao] no visible generated images found")
+                return []
+            # 去重
+            seen_hashes = set()
+            base_urls = []
+            import re as _re
+            for src in targets:
+                m = _re.search(r'rc_gen_image/([a-f0-9]+)\.jpeg', src)
+                if not m:
+                    continue
+                base_hash = m.group(1)
+                if base_hash in seen_hashes:
+                    continue
+                seen_hashes.add(base_hash)
+                base_urls.append((base_hash, src))
+            # 并行下载（使用浏览器上下文）
+            async def download_one(url: str, base_hash: str) -> str | None:
+                try:
+                    resp = await self._doubao_page.request.get(url)
+                    if resp.status != 200:
+                        logger.warning(f"[Doubao] page.request.get {base_hash}: HTTP {resp.status}")
+                        return None
+                    content = await resp.body()
+                    if not content or len(content) < 1024:  # 至少 1KB
+                        logger.warning(f"[Doubao] image {base_hash} too small: {len(content) if content else 0} bytes")
+                        return None
+                    # 确定扩展名
+                    ct = resp.headers.get('content-type', '').lower()
+                    ext = '.jpg' if 'jpeg' in ct or 'jpg' in ct else '.png' if 'png' in ct else '.webp'
+                    filename = f"{base_hash[:8]}_{_uuid.uuid4().hex[:6]}{ext}"
+                    filepath = os.path.join(images_dir, filename)
+                    with open(filepath, 'wb') as f:
+                        f.write(content)
+                    local_url = f"http://localhost:8765/images/{filename}"
+                    logger.info(f"[Doubao] downloaded via page.request: {local_url} ({len(content)} bytes)")
+                    return local_url
+                except Exception as e:
+                    logger.warning(f"[Doubao] page.request error for {base_hash}: {e}")
+                    return None
+            import asyncio as _asyncio
+            tasks = [download_one(url, h) for h, url in base_urls]
+            results = await _asyncio.gather(*tasks)
+            for r in results:
+                if r:
+                    local_urls.append(r)
+        except Exception as e:
+            logger.warning(f"[Doubao] _download_images_via_contextmenu error: {e}")
+        return local_urls
+
+    async def download_images_from_urls(self, urls: list, n: int = 1) -> list:
+        """从 URL 列表下载图片到本地。
+        支持两种 URL 格式：
+        1. rc_gen_image URL（来自 /chat/ 页面的 image_generation 模式）
+        2. ocean-cloud-tos/image_generation URL（来自 /chat/create-image 页面）
+        """
+        import uuid as _uuid
+        import httpx as _httpx
+        from urllib.parse import unquote
+        import hashlib
+
+        local_urls = []
+        images_dir = os.path.join(BASE_DIR, "images")
+        os.makedirs(images_dir, exist_ok=True)
+
+        logger.info(f"[Doubao] download_images_from_urls called with {len(urls)} URLs")
+
+        # Build deduplicated list preserving order
+        seen_hashes = set()
+        unique_urls = []
+        for url in urls:
+            # Extract a unique identifier from the URL
+            m_rc = re.search(r'rc_gen_image/([a-f0-9]+)\.jpeg', url)
+            if m_rc:
+                uid = f"rc:{m_rc.group(1)}"
+            else:
+                # For ocean-cloud-tos URLs, extract the hash before the timestamp
+                m_oc = re.search(r'image_generation/([a-f0-9]+)_(\d+)', url)
+                if m_oc:
+                    uid = f"oc:{m_oc.group(1)}"
+                else:
+                    # Fallback: use URL hash
+                    uid = f"hash:{hashlib.md5(url.encode()).hexdigest()[:8]}"
+
+            if uid not in seen_hashes:
+                seen_hashes.add(uid)
+                unique_urls.append((uid, url))
+
+        logger.info(f"[Doubao] download: {len(unique_urls)} unique images, requesting {n}")
+
+        # Determine quality preference for rc_gen_image URLs
+        quality_order = ['image_dld_watermark', 'image_ori_raw', 'image_raw_b', 'image_pre_watermark', 'downsize_watermark', 'image_thumb']
+
+        selected = []
+        for uid, url in unique_urls[:n]:
+            if uid.startswith("oc:"):
+                # ocean-cloud-tos URL: use directly
+                selected.append((uid, url))
+            elif uid.startswith("rc:"):
+                # rc_gen_image URL: pick best quality if multiple variants
+                base_hash = uid.split(":")[1]
+                # Already deduplicated, just pick the first one
+                selected.append((uid, url))
+
+        # Download images
+        async with _httpx.AsyncClient(timeout=60, follow_redirects=True, headers={
+            'accept': '*/*',
+            'origin': 'https://www.doubao.com',
+            'referer': 'https://www.doubao.com/',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0',
+            'sec-fetch-site': 'cross-site',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-dest': 'empty',
+        }) as client:
+            for uid, target_url in selected:
+                try:
+                    logger.info(f"[Doubao] downloading {uid}: {target_url[:120]}...")
+                    resp = await client.get(target_url)
+                    logger.info(f"[Doubao] download {uid}: HTTP {resp.status_code}, {len(resp.content)} bytes, ct={resp.headers.get('content-type','')}")
+                    if resp.status_code == 200 and len(resp.content) > 1024:
+                        ct = resp.headers.get('content-type', '').lower()
+                        ext = '.jpg' if 'jpeg' in ct else '.png' if 'png' in ct else '.webp'
+
+                        # Generate filename from the URL
+                        if uid.startswith("oc:"):
+                            # ocean-cloud-tos: extract hash from URL
+                            m_oc = re.search(r'image_generation/([a-f0-9]+)', target_url)
+                            if m_oc:
+                                base_hash = m_oc.group(1)
+                            else:
+                                base_hash = uid.split(":")[1]
+                        else:
+                            m_rc = re.search(r'rc_gen_image/([a-f0-9]+)', target_url)
+                            if m_rc:
+                                base_hash = m_rc.group(1)
+                            else:
+                                base_hash = uid.split(":")[1]
+
+                        filename = f"{base_hash[:8]}_{_uuid.uuid4().hex[:6]}{ext}"
+                        filepath = os.path.join(images_dir, filename)
+                        with open(filepath, 'wb') as f:
+                            f.write(resp.content)
+                        local_url = f"http://localhost:8765/images/{filename}"
+                        local_urls.append(local_url)
+                        logger.info(f"[Doubao] saved: {local_url} ({len(resp.content)} bytes)")
+                    elif resp.status_code == 200:
+                        logger.warning(f"[Doubao] image too small for {uid}: {len(resp.content)} bytes")
+                    else:
+                        logger.warning(f"[Doubao] download failed for {uid}: HTTP {resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"[Doubao] download error for {uid}: {e}")
+
+        logger.info(f"[Doubao] download completed: {len(local_urls)}/{n} success")
+        return local_urls
 
     async def ensure_qianwen_ready(self, headless=True):
         """确保 Qianwen 浏览器就绪，使用持久化 user_data_dir 保留登录状态。"""
@@ -787,10 +1003,11 @@ class BrowserClient:
                 except Exception:
                     pass
 
-    async def stream_doubao_chat_via_type(self, text: str, attachments: list | None = None, inline_file_content: str | None = None):
+    async def stream_doubao_chat_via_type(self, text: str, attachments: list | None = None, inline_file_content: str | None = None, image_generation: bool = False, timeout: int = 60):
         """Route interception for doubao API response + DOM typing.
         attachments: 文档附件列表 (type=3)，注入 attachment_block + input_skill + chat_ability。
         inline_file_content: 如果提供，直接作为 text_block 内容注入（不上传云存储）。
+        image_generation: 如果为 True，注入图像生成所需的 chat_ability 字段，并自动添加 "生成图片：" 前缀。
         """
         headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
         await self.ensure_doubao_ready(headless=headless)
@@ -799,13 +1016,58 @@ class BrowserClient:
         self._doubao_queues[stream_id] = q
         _attachments = attachments or []
 
+        # 闭包共享状态：跨多个 /chat/completion 请求传递图片生成状态
+        _shared_image_found = False
+        _shared_image_urls = set()
+        _request_num = 0
+
+        # 通用图片 URL 提取器：递归搜索 JSON 对象中所有类图片 URL
+        def _extract_image_urls_from_json(obj):
+            """从任意 JSON 对象中递归提取所有类图片 URL（http/https + 常见图片扩展名）"""
+            urls = set()
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    urls.update(_extract_image_urls_from_json(k))
+                    urls.update(_extract_image_urls_from_json(v))
+            elif isinstance(obj, list):
+                for item in obj:
+                    urls.update(_extract_image_urls_from_json(item))
+            elif isinstance(obj, str):
+                # 匹配 http/https URL 且以常见图片扩展名结尾，或包含 /image/ 路径
+                matches = re.findall(
+                    r'https?://[^\s"\'<>]+(?:\.(?:jpg|jpeg|png|gif|webp|bmp|svg|tiff|ico)(?:\?|$|&))',
+                    obj, re.IGNORECASE
+                )
+                for m in matches:
+                    urls.add(m)
+                # 额外匹配：已知图片域名或路径特征（如 p16-tiktok、p9-doubao 等）
+                matches2 = re.findall(
+                    r'https?://[^\s"\'<>]*(?:p\d+-|image|img|pic|photo|media)[^\s"\'<>]*\.(?:jpg|jpeg|png|gif|webp|bmp|svg|tiff|ico)(?:\?|$|&)',
+                    obj, re.IGNORECASE
+                )
+                for m in matches2:
+                    urls.add(m)
+            return urls
+
+        # 清除所有旧的 route handler（防止旧 handler 拦截请求）
+        try:
+            await self._doubao_page.unroute("**/chat/completion**")
+        except Exception:
+            pass
+
+        # ⚠️ route handler 定义，但不在此时注册
+        # 页面导航（goto/reload）会自动清除 route，所以必须在导航完成后才注册
         async def handle_route(route):
-            #logger.info(f"[Doubao] handle_route called for URL: {route.request.url}")
+            logger.info(f"[Doubao] handle_route: {route.request.method} {route.request.url[:150]}")
             if 'doubao.com/chat/completion' not in route.request.url:
                 logger.info("[Doubao] URL not target, continuing normally")
                 await route.continue_()
                 return
             logger.info("[Doubao] Target URL intercepted, processing request")
+            nonlocal _request_num, _shared_image_found, _shared_image_urls
+            _image_found = False
+            _request_num += 1
+            logger.info(f"[Doubao] handle_route call #{_request_num}")
             try:
                 modify_body = False
                 body_dict = {}
@@ -815,55 +1077,76 @@ class BrowserClient:
                     try:
                         body_dict = json.loads(orig_body)
                         logger.info(f"[Doubao] Request body keys: {list(body_dict.keys())}")
+                        # Save request body for debugging
+                        try:
+                            debug_dir = os.path.join(os.path.dirname(__file__), "logs")
+                            os.makedirs(debug_dir, exist_ok=True)
+                            with open(os.path.join(debug_dir, f"intercepted_request_{_request_num}.json"), 'w', encoding='utf-8') as f:
+                                json.dump(body_dict, f, ensure_ascii=False, indent=2)
+                            logger.info(f"[Doubao] saved request body to logs/intercepted_request_{_request_num}.json")
+                        except Exception:
+                            pass
+                        
+                        messages = body_dict.get("messages", [])
+                        if messages:
+                            msg = messages[0]
+                            cbs = msg.get("content_block", [])
+                            
+                            # Inject attachment block if provided
+                            if _attachments:
+                                file_block = {
+                                    "block_type": 10052,
+                                    "content": {
+                                        "attachment_block": {"attachments": _attachments},
+                                        "pc_event_block": ""
+                                    },
+                                    "block_id": str(uuid.uuid4()),
+                                    "parent_id": "", "meta_info": [], "append_fields": []
+                                }
+                                cbs.insert(0, file_block)
+                                body_dict["chat_ability"] = {"ability_type": 16}
+                                body_dict.setdefault("ext", {})["input_skill"] = '{"skill_id":"16","skill_type":16,"template_key":""}'
+                                modify_body = True
+                                msg["content_block"] = cbs
+                            
+                            # Inject inline file content as additional text_block
+                            if inline_file_content:
+                                file_text_block = {
+                                    "block_type": 10000,
+                                    "content": {
+                                        "text_block": {"text": inline_file_content, "icon_url": "", "icon_url_dark": "", "summary": ""},
+                                        "pc_event_block": ""
+                                    },
+                                    "block_id": str(uuid.uuid4()),
+                                    "parent_id": "", "meta_info": [], "append_fields": []
+                                }
+                                cbs.append(file_text_block)
+                                modify_body = True
+                                msg["content_block"] = cbs
+                        
+                        # Inject chat_ability for image generation if not already present
+                        if image_generation and 'chat_ability' not in body_dict:
+                            body_dict["chat_ability"] = {
+                                "ability_type": 3,
+                                "ability_param": json.dumps({
+                                    "ability_param": {"model": "Seedream 4.5"},
+                                    "ability_type": 1
+                                }, ensure_ascii=False)
+                            }
+                            modify_body = True
+                            logger.info("[Doubao] injected chat_ability for image generation")
+                        elif image_generation and 'chat_ability' in body_dict:
+                            logger.info(f"[Doubao] chat_ability already present: {json.dumps(body_dict['chat_ability'], ensure_ascii=False)[:100]}")
                     except Exception as json_e:
                         logger.warning(f"[Doubao] Failed to parse request body: {json_e}")
-                        # Continue with empty dict
                         body_dict = {}
-                    messages = body_dict.get("messages", [])
-                    if messages:
-                        msg = messages[0]
-                        cbs = msg.get("content_block", [])
-                        logger.info(f"[Doubao] Original content_block count: {len(cbs)}")
-                        
-                        # Inject attachment block if provided
-                        if _attachments:
-                            file_block = {
-                                "block_type": 10052,
-                                "content": {
-                                    "attachment_block": {"attachments": _attachments},
-                                    "pc_event_block": ""
-                                },
-                                "block_id": str(uuid.uuid4()),
-                                "parent_id": "", "meta_info": [], "append_fields": []
-                            }
-                            cbs.insert(0, file_block)
-                            body_dict["chat_ability"] = {"ability_type": 16}
-                            body_dict.setdefault("ext", {})["input_skill"] = '{"skill_id":"16","skill_type":16,"template_key":""}'
-                            logger.info(f"[Doubao] injected {len(_attachments)} attachment(s)")
-                        
-                        # Inject inline file content as additional text_block
-                        if inline_file_content:
-                            file_text_block = {
-                                "block_type": 10000,
-                                "content": {
-                                    "text_block": {"text": inline_file_content, "icon_url": "", "icon_url_dark": "", "summary": ""},
-                                    "pc_event_block": ""
-                                },
-                                "block_id": str(uuid.uuid4()),
-                                "parent_id": "", "meta_info": [], "append_fields": []
-                            }
-                            cbs.append(file_text_block)
-                            logger.info(f"[Doubao] injected inline file content ({len(inline_file_content)} chars)")
-                        
-                        if _attachments or inline_file_content:
-                            msg["content_block"] = cbs
-                            modify_body = True
                 
                 if modify_body:
                     modified_body = json.dumps(body_dict, ensure_ascii=False)
                     resp = await route.fetch(timeout=180000, post_data=modified_body)
                 else:
                     resp = await route.fetch(timeout=180000)
+
                 body = await resp.body()
                 raw_text = body.decode("utf-8", errors="replace")
                 logger.info(f"[Doubao] API: {len(raw_text)} bytes")
@@ -907,6 +1190,19 @@ class BrowserClient:
 
                     if event_type == "STREAM_ERROR":
                         msg = json.dumps(data, ensure_ascii=False)
+                        if image_generation:
+                            error_code = data.get("error_code")
+                            error_msg_text = data.get("error_msg", "")
+                            is_rate_limit = (error_code == 710022004 or
+                                             "rate" in error_msg_text.lower() and "limit" in error_msg_text.lower())
+                            if is_rate_limit:
+                                logger.warning(f"[Doubao] STREAM_ERROR rate-limit in image gen mode, emitting error for retry: {msg[:200]}")
+                                q.put_nowait(("error", msg))
+                                q.put_nowait(("done", ""))
+                                await route.fulfill(response=resp)
+                                return
+                            logger.warning(f"[Doubao] STREAM_ERROR in image gen mode (non-rate-limit, will wait for images): {msg[:200]}")
+                            continue
                         q.put_nowait(("error", msg))
                         q.put_nowait(("done", ""))
                         await route.fulfill(response=resp)
@@ -917,6 +1213,14 @@ class BrowserClient:
                         if delta:
                             count += 1
                             q.put_nowait(("chunk", delta))
+                            # 图片生成模式：从 CHUNK_DELTA 文本中提取 Markdown 图片链接
+                            img_matches = re.findall(r'!\[[^\]]*\]\((https?://[^\s)]+)\)', delta)
+                            for img_url in img_matches:
+                                q.put_nowait(("image_url", img_url))
+                                _image_found = True
+                                _shared_image_found = True
+                                _shared_image_urls.add(img_url)
+                                logger.info(f"[Doubao] extracted image URL from CHUNK_DELTA: {img_url}")
                         continue
 
                     content_blocks = []
@@ -927,7 +1231,32 @@ class BrowserClient:
                             pv = op.get("patch_value", {})
                             content_blocks.extend(pv.get("content_block", []))
 
+                    # 通用提取：如果还没找到图片，搜索整个 JSON 结构
+                    if image_generation and not _image_found:
+                        for url in _extract_image_urls_from_json(data):
+                            if url not in _shared_image_urls:
+                                q.put_nowait(("image_url", url))
+                                _image_found = True
+                                _shared_image_found = True
+                                _shared_image_urls.add(url)
+                                logger.info(f"[Doubao] extracted image URL from JSON search: {url}")
+
                     for cb in content_blocks:
+                        if cb.get("block_type") == 2074:
+                            cb_content = cb.get("content", {})
+                            creation_data = cb_content.get("creation_block", cb_content)
+                            creations = creation_data.get("creations", [])
+                            for creation in creations:
+                                img_info = creation.get("image", {}) or creation
+                                img_url = (img_info.get("image_raw", {}).get("url") or
+                                           img_info.get("image_thumb", {}).get("url") or
+                                           img_info.get("image_ori", {}).get("url"))
+                                if img_url:
+                                    q.put_nowait(("image_url", img_url))
+                                    _image_found = True
+                                    _shared_image_found = True
+                                    _shared_image_urls.add(img_url)
+                            continue
                         if cb.get("block_type") != 10000:
                             continue
                         block_id = cb.get("block_id", "") or "default"
@@ -941,15 +1270,39 @@ class BrowserClient:
                         if delta:
                             count += 1
                             q.put_nowait(("chunk", delta))
+                        if cb.get("is_finish"):
+                            img_urls = re.findall(r'!\[[^\]]*\]\((https?://[^\s)]+)\)', current)
+                            for img_url in img_urls:
+                                q.put_nowait(("image_url", img_url))
+                                _image_found = True
+                                _shared_image_found = True
+                                _shared_image_urls.add(img_url)
+                                logger.info(f"[Doubao] extracted image URL from text block: {img_url}")
 
                     if event_type == "SSE_REPLY_END" and data.get("end_type") == 3:
+                        if image_generation:
+                            if _image_found or _request_num >= 2:
+                                q.put_nowait(("image_urls_sse", list(_shared_image_urls)))
+                                q.put_nowait(("done", ""))
+                            # else: first request without images, wait for second without emitting done
+                            await route.fulfill(response=resp)
+                            return
                         q.put_nowait(("done", ""))
                         logger.info(f"[Doubao] parsed {count} chunks")
                         await route.fulfill(response=resp)
                         return
 
-                logger.info(f"[Doubao] parsed {count} chunks")
-                q.put_nowait(("done", ""))
+                logger.info(f"[Doubao] parsed {count} chunks (end of response), image_found={_image_found}, request_num={_request_num}")
+                if not image_generation:
+                    q.put_nowait(("done", ""))
+                elif _image_found:
+                    logger.info("[Doubao] image found at end of response (no SSE_REPLY_END end_type=3), emitting done")
+                    q.put_nowait(("image_urls_sse", list(_shared_image_urls)))
+                    q.put_nowait(("done", ""))
+                elif _request_num >= 2:
+                    logger.info("[Doubao] no image found in tool result (no SSE_REPLY_END), emitting done to close attempt")
+                    q.put_nowait(("image_urls_sse", list(_shared_image_urls)))
+                    q.put_nowait(("done", ""))
                 try:
                     await route.fulfill(response=resp)
                 except Exception as inner_e:
@@ -968,18 +1321,520 @@ class BrowserClient:
                 except Exception:
                     pass
 
-        await self._doubao_page.route("**/chat/completion**", handle_route)
-
         # 确保页面在新对话状态（而非旧对话）
         current_url = self._doubao_page.url
         if not current_url.endswith("/chat/") and "/chat/" in current_url:
             # 页面在旧对话中，导航到新对话
             logger.info("[Doubao] navigating to new chat (was in existing conversation)")
-            await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
+            try:
+                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
+            except Exception as nav_err:
+                logger.warning(f"[Doubao] navigation to /chat/ failed (will retry): {nav_err}")
+                try:
+                    await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
+                except Exception as nav_err2:
+                    logger.warning(f"[Doubao] second navigation attempt also failed: {nav_err2}")
             await asyncio.sleep(1)
 
         try:
-            # 检查是否有遮罩层阻挡输入
+            # 图像生成模式：在 /chat/ 页面点击"图像生成"按钮，再通过 contenteditable 输入提示词
+            if image_generation:
+                logger.info("[Doubao] switching to image generation mode on /chat/ page")
+                # 确保在新对话页面
+                current = self._doubao_page.url
+                need_navigate = "/chat/" not in current or "/chat/create-image" in current or not current.rstrip('/').endswith('/chat')
+                if need_navigate:
+                    try:
+                        await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=15000)
+                    except Exception:
+                        logger.warning("[Doubao] navigate to /chat/ timed out, force reloading...")
+                        try:
+                            await self._doubao_page.reload(wait_until="domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(2)
+
+                 # 等待"图像生成"按钮出现（最多30秒）
+                clicked_btn = False
+                for _poll in range(30):
+                    # 1) 检查错误页
+                    page_buttons = await self._doubao_page.evaluate("""() => {
+                        const btns = document.querySelectorAll('button');
+                        return Array.from(btns).map(b => (b.textContent || '').trim()).filter(t => t);
+                    }""")
+                    # 检查页面是否需要刷新（错误页通常含"刷新页面"按钮）
+                    has_refresh = any(t == '刷新页面' for t in page_buttons)
+                    if has_refresh:
+                        logger.info(f"[Doubao] page error (found '刷新页面'), attempting refresh cycle...")
+                        # 点击第一个"刷新页面"按钮
+                        await self._doubao_page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button');
+                            for (const b of btns) {
+                                if ((b.textContent || '').trim() === '刷新页面') {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""")
+                        await asyncio.sleep(5)  # 等待刷新操作
+                        continue
+
+                    # 2) Playwright 原生点击（触发 React 合成事件）
+                    try:
+                        img_btn = self._doubao_page.locator('[data-skill-id="skill_bar_button_3"]')
+                        if await img_btn.count() > 0:
+                            await img_btn.click(force=True, timeout=3000)
+                            clicked_btn = True
+                            logger.info("[Doubao] clicked '图像生成' via Playwright native click")
+                            break
+                    except Exception as e:
+                        logger.info(f"[Doubao] Playwright click failed: {e}")
+
+                    # 未找到，等待后重试
+                    await asyncio.sleep(1)
+                else:
+                    # 超时且未找到
+                    try:
+                        btns_dump = await self._doubao_page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button[data-component-type="skill-item"]');
+                            return Array.from(btns).map(b => ({
+                                text: (b.textContent || '').trim().substring(0, 30),
+                                skillId: b.getAttribute('data-skill-id') || '',
+                                                               skillType: b.getAttribute('data-skill-type') || '',
+                                visible: b.offsetParent !== null,
+                                disabled: b.disabled
+                            }));
+                        }""")
+                        logger.warning(f"[Doubao] image gen button not found. skill-item dump: {json.dumps(btns_dump, ensure_ascii=False)}")
+                    except Exception:
+                        pass
+                    yield ("error", "Cannot find '图像生成' button on /chat/ page")
+                    yield ("done", "")
+                    return
+
+                # ⚠️ 按钮点击完成、页面导航结束后，在输入/发送之前注册 route
+                await self._doubao_page.route("**/chat/completion**", handle_route)
+                logger.info("[Doubao] route **/chat/completion** registered (after navigation, before input)")
+
+                # 等待 UI 稳定：点击按钮 + 关闭 modal 后，输入框可能延迟出现
+                # 等 3 秒基础时间，再轮询 30 次（每次 1 秒）
+                await asyncio.sleep(3)
+                page_state = {}
+                for _wait in range(30):
+                    page_state = await self._doubao_page.evaluate("""() => {
+                        const textarea = document.querySelector('textarea');
+                        const contenteditable = document.querySelector('[contenteditable=true][role=textbox]');
+                        const visibleTextarea = document.querySelector('textarea:not([aria-hidden="true"])');
+                        const anyContenteditable = document.querySelector('[contenteditable="true"]');
+                        const sendBtn = document.getElementById('flow-end-msg-send');
+                        const sendBtnAny = document.querySelector('button[data-testid*="send"], button[class*="send"]');
+                        const ariaHidden = textarea ? textarea.getAttribute('aria-hidden') : 'none';
+                        return {
+                            hasTextarea: !!textarea,
+                            textareaVisible: textarea ? (textarea.offsetParent !== null && ariaHidden !== 'true') : false,
+                            textareaAriaHidden: ariaHidden,
+                            visibleTextareaExists: !!visibleTextarea,
+                            hasContenteditable: !!contenteditable,
+                            hasAnyContenteditable: !!anyContenteditable,
+                            hasSendBtn: !!sendBtn,
+                            sendBtnVisible: sendBtn ? (sendBtn.offsetParent !== null && !sendBtn.disabled) : false,
+                            hasAnySendBtn: !!sendBtnAny,
+                            url: location.href
+                        };
+                    }""")
+                    if page_state.get('hasContenteditable') or page_state.get('visibleTextareaExists') or page_state.get('hasAnyContenteditable') or page_state.get('textareaVisible'):
+                        break
+                    await asyncio.sleep(1)
+                logger.info(f"[Doubao] page state after click: {json.dumps(page_state, ensure_ascii=False)}")
+
+                # 即使 textarea aria-hidden=true，也强制尝试输入（有时候它其实是可用的）
+                send_text = text
+                input_used = None
+                send_result = None
+
+                if page_state.get('hasContenteditable'):
+                    input_used = "contenteditable"
+                    logger.info(f"[Doubao] typing prompt into contenteditable: {send_text[:60]}...")
+                    await self._doubao_page.evaluate("""(send_text) => {
+                        const el = document.querySelector('[contenteditable=true][role=textbox]');
+                        if (!el) return;
+                        el.focus();
+                        el.innerHTML = '';
+                        el.textContent = send_text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""", send_text)
+                    await asyncio.sleep(0.5)
+                    send_result = await self._doubao_page.evaluate("""() => {
+                        const btn = document.getElementById('flow-end-msg-send');
+                        if (btn && !btn.disabled && btn.offsetParent !== null) {
+                            btn.click();
+                            return 'send-btn';
+                        }
+                        return '';
+                    }""")
+
+                elif page_state.get('visibleTextareaExists') or page_state.get('textareaVisible'):
+                    input_used = "textarea(visible)"
+                    logger.info(f"[Doubao] typing prompt into visible textarea: {send_text[:60]}...")
+                    await self._doubao_page.evaluate("""(send_text) => {
+                        const ta = document.querySelector('textarea');
+                        if (!ta) return;
+                        ta.focus();
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                        nativeSetter.call(ta, send_text);
+                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                        ta.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""", send_text)
+                    await asyncio.sleep(0.5)
+                    send_result = await self._doubao_page.evaluate("""() => {
+                        const btn = document.getElementById('flow-end-msg-send');
+                        if (btn && !btn.disabled && btn.offsetParent !== null) {
+                            btn.click();
+                            return 'send-btn';
+                        }
+                        return '';
+                    }""")
+
+                elif page_state.get('hasAnyContenteditable'):
+                    input_used = "contenteditable(any)"
+                    logger.info(f"[Doubao] typing prompt into any contenteditable: {send_text[:60]}...")
+                    await self._doubao_page.evaluate("""(send_text) => {
+                        const el = document.querySelector('[contenteditable="true"]');
+                        if (!el) return;
+                        el.focus();
+                        el.innerText = send_text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }""", send_text)
+                    await asyncio.sleep(0.5)
+                    send_result = 'eval-fallback'
+
+                elif page_state.get('hasTextarea'):
+                    # textarea 存在但 aria-hidden=true，强制尝试
+                    input_used = "textarea(force)"
+                    logger.info(f"[Doubao] forcing textarea input (aria-hidden={page_state.get('textareaAriaHidden')}): {send_text[:60]}...")
+                    await self._doubao_page.evaluate("""(send_text) => {
+                        const ta = document.querySelector('textarea');
+                        if (!ta) return;
+                        ta.removeAttribute('aria-hidden');
+                        ta.focus();
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                        nativeSetter.call(ta, send_text);
+                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                        ta.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""", send_text)
+                    await asyncio.sleep(0.5)
+                    # 尝试点击发送或按 Enter
+                    send_result = await self._doubao_page.evaluate("""() => {
+                        const btn = document.getElementById('flow-end-msg-send');
+                        if (btn && !btn.disabled) {
+                            btn.click();
+                            return 'send-btn';
+                        }
+                        return '';
+                    }""")
+
+                if input_used:
+                    logger.info(f"[Doubao] input method: {input_used}")
+                    if send_result == 'send-btn':
+                        logger.info("[Doubao] image gen: sent via send-btn")
+                    else:
+                        await self._doubao_page.keyboard.press("Enter")
+                        logger.info("[Doubao] image gen: sent via Enter")
+                else:
+                    logger.warning("[Doubao] No viable input method found after image gen button click")
+                    logger.warning(f"[Doubao] page_state: {json.dumps(page_state, ensure_ascii=False)}")
+                    yield ("error", "No input found after clicking '图像生成' button")
+                    yield ("done", "")
+                    return
+            else:
+                # 原有逻辑：使用 textarea
+                ok = await self._doubao_page.evaluate("""() => {
+                    const ta = document.querySelector('textarea');
+                    if (!ta) return false;
+                    ta.focus();
+                    ta.click();
+                    return true;
+                }""")
+                if not ok:
+                    yield ("error", "No editor")
+                    yield ("done", "")
+                    return
+                await self._doubao_page.evaluate("""(text) => {
+                    const ta = document.querySelector('textarea');
+                    if (!ta) return;
+                    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                    nativeSetter.call(ta, text);
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    ta.dispatchEvent(new Event('change', { bubbles: true }));
+                }""", text)
+                await asyncio.sleep(0.5)
+                
+                # 发送消息：先按 Enter（绕过 UI 状态检查），再点按钮保底
+                await self._doubao_page.keyboard.press("Enter")
+                await asyncio.sleep(0.3)
+                send_clicked = await self._doubao_page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button, [role="button"], [data-testid]');
+                    for (const btn of btns) {
+                        const svg = btn.querySelector('svg');
+                        const cls = btn.className || '';
+                        const testId = btn.getAttribute('data-testid') || '';
+                        if (testId.includes('send') || testId.includes('submit') || 
+                            cls.includes('send') || cls.includes('submit') ||
+                            (btn.title && (btn.title.includes('发送') || btn.title.includes('Send')))) {
+                            if (!btn.disabled && btn.offsetParent !== null) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }""")
+
+                if send_clicked:
+                    logger.info("[Doubao] typed + Enter + clicked send button")
+                else:
+                    logger.info("[Doubao] typed + Enter (keyboard)")
+            # 等待 1 秒确认请求已发出
+            await asyncio.sleep(3)
+        except Exception as e:
+            yield ("error", f"Keyboard: {e}")
+            yield ("done", "")
+            return
+
+        try:
+            while True:
+                kind, value = await asyncio.wait_for(q.get(), timeout=timeout)
+                if kind == "done":
+                    if image_generation:
+                        logger.info("[Doubao] image gen done (SSE URLs already emitted, skipping DOM extraction)")
+                    yield ("done", "")
+                    break
+                if kind == "error":
+                    yield ("error", value)
+                    continue
+                if kind == "conversation_id":
+                    yield ("conversation_id", value)
+                    continue
+                if kind == "image_url":
+                    yield ("image_url", value)
+                    continue
+                if kind == "local_image_url":
+                    yield ("local_image_url", value)
+                    continue
+                if kind == "image_urls_sse":
+                    yield ("image_urls_sse", value)
+                    continue
+                yield ("chunk", value)
+        except asyncio.TimeoutError:
+            logger.warning(f"[Doubao] timeout after {timeout}s - no response from server, resetting page")
+            yield ("error", "Timeout")
+            yield ("done", "")
+            try:
+                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
+                await asyncio.sleep(1)
+                logger.info("[Doubao] page reset after timeout")
+            except Exception as nav_err:
+                logger.warning(f"[Doubao] page reset failed: {nav_err}")
+        finally:
+            self._doubao_queues.pop(stream_id, None)
+            try:
+                if self._doubao_page and not self._doubao_page.is_closed():
+                    await self._doubao_page.unroute("**/chat/completion**", handle_route)
+            except Exception:
+                pass
+
+    async def stream_doubao_create_image(self, text: str):
+        """Navigate to create-image page, type prompt, send, and extract image URLs.
+        Uses route interception on chat/completion to capture SSE response.
+        Enhanced: handles CHUNK_DELTA text, creation_block 2074, rate-limit detection,
+        recursive JSON URL search, and longer timeouts.
+        """
+        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        await self.ensure_doubao_ready(headless=headless)
+        stream_id = uuid.uuid4().hex
+        q = asyncio.Queue()
+        self._doubao_queues[stream_id] = q
+
+        # Shared state for image URL extraction
+        _found_image_urls = set()
+
+        def _extract_image_urls_from_json(obj):
+            """Recursively search any JSON object for image URLs."""
+            urls = set()
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    urls.update(_extract_image_urls_from_json(k))
+                    urls.update(_extract_image_urls_from_json(v))
+            elif isinstance(obj, list):
+                for item in obj:
+                    urls.update(_extract_image_urls_from_json(item))
+            elif isinstance(obj, str):
+                matches = re.findall(
+                    r'https?://[^\s"\'<>]+(?:\.(?:jpg|jpeg|png|gif|webp|bmp|svg|tiff|ico)(?:\?|$|&))',
+                    obj, re.IGNORECASE
+                )
+                for m in matches:
+                    urls.add(m)
+                matches2 = re.findall(
+                    r'https?://[^\s"\'<>]*(?:p\d+-|image|img|pic|photo|media)[^\s"\'<>]*\.(?:jpg|jpeg|png|gif|webp|bmp|svg|tiff|ico)(?:\?|$|&)',
+                    obj, re.IGNORECASE
+                )
+                for m in matches2:
+                    urls.add(m)
+                # Also match rc_gen_image URLs (the Doubao image generation pattern)
+                matches3 = re.findall(
+                    r'(https?://[^\s"\'<>]*rc_gen_image[^\s"\'<>]*)',
+                    obj, re.IGNORECASE
+                )
+                for m in matches3:
+                    urls.add(m)
+            return urls
+
+        async def handle_route(route):
+            if 'doubao.com/chat/completion' not in route.request.url:
+                await route.continue_()
+                return
+            try:
+                resp = await route.fetch(timeout=180000)
+                body = await resp.body()
+                raw_text = body.decode("utf-8", errors="replace")
+
+                last_block_text = {}
+
+                for block in raw_text.split("\n\n"):
+                    block = block.strip()
+                    if not block:
+                        continue
+
+                    event_type = ""
+                    data_str = ""
+                    for line in block.split("\n"):
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                        elif line.startswith("data:"):
+                            data_str = line[5:].strip()
+
+                    if not data_str:
+                        continue
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event_type == "SSE_ACK":
+                        cid = data.get("ack_client_meta", {}).get("conversation_id", "")
+                        if cid:
+                            q.put_nowait(("conversation_id", cid))
+                        continue
+
+                    if event_type == "STREAM_ERROR":
+                        error_code = data.get("error_code")
+                        error_msg_text = data.get("error_msg", "")
+                        is_rate_limit = (error_code == 710022004 or
+                                         "rate" in error_msg_text.lower() and "limit" in error_msg_text.lower())
+                        if is_rate_limit:
+                            q.put_nowait(("error", json.dumps(data, ensure_ascii=False)))
+                            q.put_nowait(("done", ""))
+                            await route.fulfill(response=resp)
+                            return
+                        continue
+
+                    if event_type == "CHUNK_DELTA":
+                        delta = data.get("text", "")
+                        if delta:
+                            # Extract markdown image links
+                            img_matches = re.findall(r'!\[[^\]]*\]\((https?://[^\s)]+)\)', delta)
+                            for img_url in img_matches:
+                                if img_url not in _found_image_urls:
+                                    _found_image_urls.add(img_url)
+                                    q.put_nowait(("image_url", img_url))
+                            # Also recursive search
+                            for url in _extract_image_urls_from_json(data):
+                                if url not in _found_image_urls:
+                                    _found_image_urls.add(url)
+                                    q.put_nowait(("image_url", url))
+                        continue
+
+                    content_blocks = []
+                    if event_type == "STREAM_MSG_NOTIFY":
+                        content_blocks = data.get("content", {}).get("content_block", [])
+                    elif event_type == "STREAM_CHUNK":
+                        for op in data.get("patch_op", []):
+                            pv = op.get("patch_value", {})
+                            content_blocks.extend(pv.get("content_block", []))
+
+                    for cb in content_blocks:
+                        # Handle creation_block (block_type 2074)
+                        if cb.get("block_type") == 2074:
+                            cb_content = cb.get("content", {})
+                            creation_data = cb_content.get("creation_block", cb_content)
+                            creations = creation_data.get("creations", [])
+                            for creation in creations:
+                                img_info = creation.get("image", {}) or creation
+                                img_url = (img_info.get("image_raw", {}).get("url") or
+                                           img_info.get("image_thumb", {}).get("url") or
+                                           img_info.get("image_ori", {}).get("url"))
+                                if img_url and img_url not in _found_image_urls:
+                                    _found_image_urls.add(img_url)
+                                    q.put_nowait(("image_url", img_url))
+                                    logger.info(f"[Doubao create-image] extracted creation image: {img_url[:120]}")
+                            continue
+                        # Handle text_block (block_type 10000)
+                        if cb.get("block_type") != 10000:
+                            continue
+                        block_id = cb.get("block_id", "") or "default"
+                        text_block = cb.get("content", {}).get("text_block", {})
+                        current = text_block.get("text", "")
+                        if not current:
+                            continue
+                        previous = last_block_text.get(block_id, "")
+                        delta = current[len(previous):] if current.startswith(previous) else current
+                        last_block_text[block_id] = current
+                        if delta:
+                            q.put_nowait(("chunk", delta))
+                        if cb.get("is_finish"):
+                            img_urls = re.findall(r'!\[[^\]]*\]\((https?://[^\s)]+)\)', current)
+                            for img_url in img_urls:
+                                if img_url not in _found_image_urls:
+                                    _found_image_urls.add(img_url)
+                                    q.put_nowait(("image_url", img_url))
+                                    logger.info(f"[Doubao create-image] extracted from finished text block: {img_url[:120]}")
+
+                    if event_type == "SSE_REPLY_END" and data.get("end_type") == 3:
+                        if _found_image_urls:
+                            q.put_nowait(("image_urls_sse", list(_found_image_urls)))
+                        q.put_nowait(("done", ""))
+                        await route.fulfill(response=resp)
+                        return
+
+                # End of SSE response
+                if _found_image_urls:
+                    q.put_nowait(("image_urls_sse", list(_found_image_urls)))
+                q.put_nowait(("done", ""))
+                try:
+                    await route.fulfill(response=resp)
+                except Exception:
+                    pass
+            except Exception as e:
+                if "already handled" in str(e).lower():
+                    return
+                logger.warning(f"[Doubao create-image] route err: {e}")
+                q.put_nowait(("error", str(e)))
+                q.put_nowait(("done", ""))
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await self._doubao_page.route("**/chat/completion**", handle_route)
+
+        try:
+            await self._doubao_page.goto("https://www.doubao.com/chat/create-image", wait_until="load", timeout=30000)
+            await asyncio.sleep(2)
+
             has_overlay = await self._doubao_page.evaluate("""() => {
                 const overlays = document.querySelectorAll('[role="dialog"], [data-testid="modal"], .modal, .overlay');
                 for (const el of overlays) {
@@ -990,68 +1845,48 @@ class BrowserClient:
                 return false;
             }""")
             if has_overlay:
-                logger.warning("[Doubao] overlay detected, attempting to dismiss")
-                # 尝试按 Escape 关闭弹窗
                 await self._doubao_page.keyboard.press("Escape")
                 await asyncio.sleep(0.5)
 
-            ok = await self._doubao_page.evaluate("""() => {
-                const ta = document.querySelector('textarea');
-                if (!ta) return false;
-                ta.focus();
-                ta.click();
+            input_ok = await self._doubao_page.evaluate("""() => {
+                const el = document.querySelector('[contenteditable=true][role=textbox]');
+                if (!el) return false;
+                el.focus();
+                el.click();
                 return true;
             }""")
-            if not ok:
-                yield ("error", "No editor")
+            if not input_ok:
+                yield ("error", "No contenteditable input")
                 yield ("done", "")
                 return
+
             await self._doubao_page.evaluate("""(text) => {
-                const ta = document.querySelector('textarea');
-                if (!ta) return;
-                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                nativeSetter.call(ta, text);
-                ta.dispatchEvent(new Event('input', { bubbles: true }));
-                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                const el = document.querySelector('[contenteditable=true][role=textbox]');
+                if (!el) return;
+                el.textContent = text;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
             }""", text)
             await asyncio.sleep(0.5)
-            
-            # 尝试发送：先点击发送按钮，再按 Enter（双重保险）
+
             send_clicked = await self._doubao_page.evaluate("""() => {
-                // 查找发送按钮（豆包的发送按钮图标）
-                const btns = document.querySelectorAll('button, [role="button"], [data-testid]');
-                for (const btn of btns) {
-                    const svg = btn.querySelector('svg');
-                    const cls = btn.className || '';
-                    const testId = btn.getAttribute('data-testid') || '';
-                    // 发送按钮通常有 send/submit 相关标识
-                    if (testId.includes('send') || testId.includes('submit') || 
-                        cls.includes('send') || cls.includes('submit') ||
-                        (btn.title && (btn.title.includes('发送') || btn.title.includes('Send')))) {
-                        btn.click();
-                        return true;
-                    }
+                const btn = document.getElementById('flow-end-msg-send');
+                if (btn && !btn.disabled && btn.offsetParent !== null) {
+                    btn.click();
+                    return true;
                 }
-                // 没找到按钮，返回 false 让后续按 Enter
                 return false;
             }""")
-            
-            if not send_clicked:
-                await self._doubao_page.keyboard.press("Enter")
-                logger.info("[Doubao] typed + Enter (keyboard)")
+            if send_clicked:
+                logger.info("[Doubao] create-image: typed text and clicked send button")
             else:
-                logger.info("[Doubao] typed + clicked send button")
-            
-            # 等待 1 秒确认请求已发出
+                logger.warning("[Doubao] create-image: send button not found or disabled, trying Enter")
+                await self._doubao_page.keyboard.press("Enter")
             await asyncio.sleep(1)
-        except Exception as e:
-            yield ("error", f"Keyboard: {e}")
-            yield ("done", "")
-            return
 
-        try:
+            # Wait for SSE response - longer timeout for image generation
             while True:
-                kind, value = await asyncio.wait_for(q.get(), timeout=60)
+                kind, value = await asyncio.wait_for(q.get(), timeout=180)
                 if kind == "done":
                     yield ("done", "")
                     break
@@ -1061,17 +1896,23 @@ class BrowserClient:
                 if kind == "conversation_id":
                     yield ("conversation_id", value)
                     continue
-                yield ("chunk", value)
+                if kind == "image_url":
+                    yield ("image_url", value)
+                    continue
+                if kind == "image_urls_sse":
+                    yield ("image_urls_sse", value)
+                    continue
+                yield (kind, value)
+
         except asyncio.TimeoutError:
-            logger.warning("[Doubao] timeout after 60s - no response from server, resetting page")
-            yield ("error", "Timeout")
+            logger.warning("[Doubao create-image] timeout waiting for SSE response")
+            yield ("error", "Timeout waiting for image generation")
             yield ("done", "")
             try:
                 await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
                 await asyncio.sleep(1)
-                logger.info("[Doubao] page reset after timeout")
-            except Exception as nav_err:
-                logger.warning(f"[Doubao] page reset failed: {nav_err}")
+            except Exception:
+                pass
         finally:
             self._doubao_queues.pop(stream_id, None)
             try:
@@ -2974,16 +3815,6 @@ class BrowserClient:
                 if (el) { el.focus(); el.click(); }
             }""")
             return file_name
-
-        except Exception as e:
-            logger.error(f"[Qwen] upload fail: {e}")
-            raise
-        finally:
-            if tmp and os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except:
-                    pass
 
     async def fetch_qianwen_models(self) -> list[dict]:
         """从千问页面模型选择弹窗中获取可用模型列表。"""
@@ -6827,5 +7658,7 @@ class BrowserClient:
 
 
 browser_client = BrowserClient()
+
+
 
 

@@ -32,6 +32,13 @@ _MODEL_ADAPTER_MAP: dict[str, str] = {
 
 _DEFAULT_ADAPTER = "doubao"
 
+_IMAGE_ADAPTER_MAP: dict[str, str] = {
+    "doubao-image": "doubao",
+    "doubao-": "doubao",
+}
+
+_DEFAULT_IMAGE_ADAPTER = "doubao"
+
 
 def _init_adapters():
     """创建所有适配器实例。"""
@@ -114,3 +121,26 @@ async def close_all():
             logger.info(f"Adapter closed: {name}")
         except Exception as e:
             logger.warning(f"Adapter {name} close error: {e}")
+
+
+def get_image_adapter(model: str) -> Optional[BaseAdapter]:
+    """根据模型名称获取支持图片生成的适配器实例。"""
+    _init_adapters()
+
+    # 1. 精确匹配
+    if model in _IMAGE_ADAPTER_MAP:
+        name = _IMAGE_ADAPTER_MAP[model]
+        return _ADAPTER_INSTANCES.get(name)
+
+    # 2. 前缀匹配
+    for prefix, name in _IMAGE_ADAPTER_MAP.items():
+        if prefix.endswith("-") and model.startswith(prefix):
+            return _ADAPTER_INSTANCES.get(name)
+
+    # 3. 遍历所有适配器检查是否实现了 generate_images
+    for adapter in _ADAPTER_INSTANCES.values():
+        if hasattr(adapter, 'generate_images'):
+            return adapter
+
+    # 4. 默认适配器
+    return _ADAPTER_INSTANCES.get(_DEFAULT_IMAGE_ADAPTER)

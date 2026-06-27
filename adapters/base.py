@@ -38,6 +38,29 @@ class BaseAdapter(ABC):
     async def non_stream_chat(self, request: ChatCompletionRequest) -> dict:
         ...
 
+    async def generate_images(self, prompt: str, n: int = 1, size: str = "1024x1024", **kwargs) -> dict:
+        """
+        生成图片。默认实现返回"不支持"错误，具体适配器覆盖此方法。
+        
+        返回 OpenAI 兼容格式:
+        {
+            "created": timestamp,
+            "data": [
+                {"url": "...", "revised_prompt": "...", "size": "..."},
+                ...
+            ]
+        }
+        """
+        return {
+            "created": int(time.time()),
+            "data": [{
+                "url": "",
+                "revised_prompt": prompt,
+                "size": size,
+                "error": f"{self.get_adapter_name()} adapter does not support image generation yet"
+            }]
+        }
+
     async def init(self):
         pass
 
