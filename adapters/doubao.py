@@ -263,14 +263,12 @@ class DoubaoAdapter(BaseAdapter):
         通过浏览器代理生成图片（豆包 "图像生成" 模式）。
         流程：
         1. 导航到 /chat/ 页面
-        2. 点击"新对话"按钮创建新对话
-        3. 等待新对话稳定后，点击"图像生成"按钮切换到文生图模式
+        2. 点击"图像生成"按钮切换到文生图模式
+        3. 等待输入框 placeholder 变为 "描述你想要的图片"（确认进入图像生成模式）
         4. 输入提示词并发送
-        5. 轮询等待图片生成完成并下载到本地
-        - 锁机制：同一时间只有一个图片生成请求
-        - 限流检测 + _handle_rate_limit
-        - conversation_id 追踪 + 对话删除
-        - 下载图片到本地并返回 localhost URL
+        5. 轮询等待图片生成完成
+        6. 右键图片 → 上下文菜单"下载原图" → 拦截带签名的 image_dld_watermark URL
+        7. 用 page.request.get() 下载原图到本地，返回 localhost URL
         """
         from browser_client import browser_client
         import time
@@ -395,7 +393,7 @@ class DoubaoAdapter(BaseAdapter):
                             const childPlaceholder = childP ? childP.getAttribute('data-placeholder') : '';
                             return { found: true, placeholder: placeholder, childPlaceholder: childPlaceholder, tagName: el.tagName };
                         }""")
-                        logger.info(f"[{adapter_name} ImageGen] mode check: {mode_check}")
+                        logger.debug(f"[{adapter_name} ImageGen] mode check: {mode_check}")
                         ph = mode_check.get('placeholder') or ''
                         cph = mode_check.get('childPlaceholder') or ''
                         if '描述你想要的图片' in ph or '描述你想要的图片' in cph:
@@ -440,7 +438,7 @@ class DoubaoAdapter(BaseAdapter):
                         const text = el.tagName === 'TEXTAREA' ? el.value : (el.textContent || el.innerText || '');
                         return { ok: text.trim().length > 0, text: text.trim().substring(0, 50) };
                     }""")
-                    logger.info(f"[{adapter_name} ImageGen] text in input: {text_check}")
+                    logger.debug(f"[{adapter_name} ImageGen] text in input: {text_check}")
                     
                     if not text_check.get('ok'):
                         logger.warning(f"[{adapter_name} ImageGen] text not entered! Trying JS value set...")
@@ -504,7 +502,7 @@ class DoubaoAdapter(BaseAdapter):
                             inputText: inputNow.trim().substring(0, 30)
                         };
                     }""")
-                    logger.info(f"[{adapter_name} ImageGen] generation status: {gen_status}")
+                    logger.debug(f"[{adapter_name} ImageGen] generation status: {gen_status}")
                     
                     if not gen_status.get('hasLoading') and not gen_status.get('hasGenerating') and not gen_status.get('inputCleared'):
                         logger.warning(f"[{adapter_name} ImageGen] generation may not have started! Retrying...")
@@ -574,8 +572,8 @@ class DoubaoAdapter(BaseAdapter):
                                 logger.info(f"[{adapter_name} ImageGen] images stable: {len(all_image_urls)} new after {(poll_i+1)*2}s")
                                 break
 
-                        if poll_i % 15 == 14:
-                            logger.info(f"[{adapter_name} ImageGen] poll {(poll_i+1)*2}s: newImgs={new_count} totalGenImgs={img_info.get('genImgCount',0)} totalImgs={img_info.get('totalImgs',0)}")
+                        if poll_i % 30 == 29:  # Log every 60 seconds
+                            logger.info(f"[{adapter_name} ImageGen] poll {(poll_i+1)*2}s: newImgs={new_count} totalGenImgs={img_info.get('genImgCount',0)}")
 
                     # Final extraction
                     if not all_image_urls:
