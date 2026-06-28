@@ -1447,6 +1447,8 @@ class BrowserClient:
             await asyncio.sleep(1)
 
         try:
+            # 注册 route handler：拦截并注入 request 内容
+            await self._doubao_page.route("**/chat/completion**", handle_route)
             # 图像生成模式：在 /chat/ 页面点击"图像生成"按钮，再通过 contenteditable 输入提示词
             if image_generation:
                 logger.info("[Doubao] switching to image generation mode on /chat/ page")
@@ -1522,10 +1524,6 @@ class BrowserClient:
                     yield ("error", "Cannot find '图像生成' button on /chat/ page")
                     yield ("done", "")
                     return
-
-                # ⚠️ 按钮点击完成、页面导航结束后，在输入/发送之前注册 route
-                await self._doubao_page.route("**/chat/completion**", handle_route)
-                logger.info("[Doubao] route **/chat/completion** registered (after navigation, before input)")
 
                 # 等待 UI 稳定：点击按钮 + 关闭 modal 后，输入框可能延迟出现
                 # 等 3 秒基础时间，再轮询 30 次（每次 1 秒）

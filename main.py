@@ -319,6 +319,7 @@ async def chat_completions(request: ChatCompletionRequest):
     
     try:
         if request.stream:
+            logger.debug(f"[Request] stream {request.model}")
             async def stream_with_cleanup():
                 async for chunk in adapter.stream_chat(request):
                     yield chunk
@@ -333,6 +334,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 }
             )
         else:
+            logger.debug(f"[Request] non_stream {request.model}")
             result = await adapter.non_stream_chat(request)
             await _delete_adapter_conversation(adapter)
             return JSONResponse(content=result)

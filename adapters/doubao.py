@@ -76,7 +76,6 @@ class DoubaoAdapter(BaseAdapter):
         return prompt_text, file_content
 
     def _build_stream_kwargs(self, prompt_text: str, file_content, is_agent: bool, current_prompt: str) -> dict:
-        """构建传给 _call_stream 的 kwargs。"""
         kwargs = {"text": current_prompt}
         if is_agent and file_content:
             kwargs["inline_file_content"] = f"[文件 request.json 内容]\n{file_content}\n[/文件内容]"
