@@ -1082,14 +1082,16 @@ if __name__ == "__main__":
         _console_min_level = _level_map.get(args.log_level.upper(), logging.INFO)
         _console_filter_quiet = False
 
-    # 各站点独立配置（优先级：--show-xxx 参数 > config.json）
-    CONFIG['_doubao_headless'] = not args.show_doubao if args.show_doubao else CONFIG.get('_doubao_headless', True)
-    CONFIG['_qianwen_headless'] = not args.show_qianwen if args.show_qianwen else CONFIG.get('_qianwen_headless', True)
-    CONFIG['_deepseek_headless'] = not args.show_deepseek if args.show_deepseek else CONFIG.get('_deepseek_headless', True)
-    CONFIG['_zai_headless'] = not args.show_zai if args.show_zai else CONFIG.get('_zai_headless', True)
-    CONFIG['_mimo_headless'] = not args.show_mimo if args.show_mimo else CONFIG.get('_mimo_headless', True)
-    CONFIG['_minimax_headless'] = not args.show_minimax if args.show_minimax else CONFIG.get('_minimax_headless', True)
-    CONFIG['_xinghuo_headless'] = not args.show_xinghuo if args.show_xinghuo else CONFIG.get('_xinghuo_headless', True)
+    # 各站点独立配置
+    # 优先级：--show-xxx 参数 > config.json；若传了任何 --show-xxx，未指定的站点强制 headless
+    _any_show = any([args.show_doubao, args.show_qianwen, args.show_deepseek, args.show_zai, args.show_mimo, args.show_minimax, args.show_xinghuo])
+    CONFIG['_doubao_headless'] = not args.show_doubao if args.show_doubao else (True if _any_show else CONFIG.get('_doubao_headless', True))
+    CONFIG['_qianwen_headless'] = not args.show_qianwen if args.show_qianwen else (True if _any_show else CONFIG.get('_qianwen_headless', True))
+    CONFIG['_deepseek_headless'] = not args.show_deepseek if args.show_deepseek else (True if _any_show else CONFIG.get('_deepseek_headless', True))
+    CONFIG['_zai_headless'] = not args.show_zai if args.show_zai else (True if _any_show else CONFIG.get('_zai_headless', True))
+    CONFIG['_mimo_headless'] = not args.show_mimo if args.show_mimo else (True if _any_show else CONFIG.get('_mimo_headless', True))
+    CONFIG['_minimax_headless'] = not args.show_minimax if args.show_minimax else (True if _any_show else CONFIG.get('_minimax_headless', True))
+    CONFIG['_xinghuo_headless'] = not args.show_xinghuo if args.show_xinghuo else (True if _any_show else CONFIG.get('_xinghuo_headless', True))
     # 浏览器通道映射：Playwright channel 参数
     _browser_channel_map = {"chromium": None, "chrome": "chrome", "edge": "msedge"}
     if args.browser is None:
