@@ -471,9 +471,11 @@ async def non_stream_chat_completion(request):
         for m in request.messages
     ) if request.messages else False
     
-    # 1. Agent 请求时，不复用旧对话 ID，每次创建新对话
-    mapping = load_conversation_mapping()
     last_msg = request.messages[-1] if request.messages else None
+    # 有 system prompt 也视为 agent 请求
+    has_system = any(getattr(m, 'role', None) == 'system' for m in request.messages)
+    if has_system and not is_agent_request:
+        is_agent_request = True
     last_is_tool = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
     if is_agent_request:
         conversation_id = "0"
