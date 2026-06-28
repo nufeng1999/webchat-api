@@ -44,7 +44,20 @@ _qianwen_model_refresh_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global signer, SIGN_METHOD, _cleanup_task
+    global signer, SIGN_METHOD, _cleanup_task, _qianwen_model_refresh_task
+    loop = asyncio.get_running_loop()
+    _original_handler = getattr(loop, '_exception_handler', None)
+
+    def _silent_playwright_errors(loop, context):
+        exc = context.get('exception')
+        if exc and 'Connection closed while reading from the driver' in str(exc):
+            return
+        if _original_handler:
+            _original_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_silent_playwright_errors)
     if SIGN_METHOD == 'b2' and signer:
         logger.info("Initializing B2 Playwright signer (this may take 30-60s)...")
         success = await signer.initialize()
@@ -71,7 +84,7 @@ async def lifespan(app: FastAPI):
     preload_names = [name for name in _preload_map if CONFIG.get(f"_preload_{name}")]
     if preload_names:
         async def _do_preload(name):
-            headless = CONFIG.get(f"_{name}_headless", CONFIG.get("_headless_browser", True))
+            headless = CONFIG.get(f"_{name}_headless", True)
             try:
                 await _preload_map[name](headless=headless)
                 logger.info(f"[Preload] {name} ready")
@@ -87,20 +100,26 @@ async def lifespan(app: FastAPI):
     _qianwen_model_refresh_task = asyncio.create_task(refresh_qianwen_models())
 
     yield
-    # 设置事件循环异常处理器，静默 Playwright 关闭后残留的连接读取错误
-    loop = asyncio.get_running_loop()
-    _original_handler = getattr(loop, '_exception_handler', None)
-
-    def _silent_playwright_errors(loop, context):
-        exc = context.get('exception')
-        if exc and 'Connection closed while reading from the driver' in str(exc):
-            return
-        if _original_handler:
-            _original_handler(loop, context)
+    # Cancel background tasks first to prevent unhandled exceptions during shutdown
+    if _cleanup_task:
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+    if _qianwen_model_refresh_task:
+        # If the task is already done, retrieve result to avoid "Future exception was never retrieved"
+        if _qianwen_model_refresh_task.done():
+            try:
+                _qianwen_model_refresh_task.result()
+            except Exception:
+                pass
         else:
-            loop.default_exception_handler(context)
-
-    loop.set_exception_handler(_silent_playwright_errors)
+            _qianwen_model_refresh_task.cancel()
+            try:
+                await _qianwen_model_refresh_task
+            except asyncio.CancelledError:
+                pass
 
     if not CONFIG.get('_keep_conversations', False):
         logger.info("Cleaning up conversation history before shutdown...")
@@ -175,8 +194,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to delete Xinghuo conversations: {e}")
 
-    if _cleanup_task:
-        _cleanup_task.cancel()
     if signer:
         await signer.close()
     try:
@@ -1030,8 +1047,6 @@ if __name__ == "__main__":
                         help="Server host (default: from config.json)")
     parser.add_argument("--port", type=int, default=None,
                         help="Server port (default: from config.json)")
-    parser.add_argument("--show", action="store_true", default=False,
-                        help="Show browser windows for all sites (default: headless mode)")
     parser.add_argument("--show-doubao", action="store_true", default=False,
                         help="Show Doubao browser window only")
     parser.add_argument("--show-qianwen", action="store_true", default=False,
@@ -1067,27 +1082,19 @@ if __name__ == "__main__":
         _console_min_level = _level_map.get(args.log_level.upper(), logging.INFO)
         _console_filter_quiet = False
 
-    # 全局 headless 配置（旧参数兼容）
-    CONFIG['_headless_browser'] = not args.show
+    # 各站点独立配置（优先级：--show-xxx 参数 > config.json）
+    CONFIG['_doubao_headless'] = not args.show_doubao if args.show_doubao else CONFIG.get('_doubao_headless', True)
+    CONFIG['_qianwen_headless'] = not args.show_qianwen if args.show_qianwen else CONFIG.get('_qianwen_headless', True)
+    CONFIG['_deepseek_headless'] = not args.show_deepseek if args.show_deepseek else CONFIG.get('_deepseek_headless', True)
+    CONFIG['_zai_headless'] = not args.show_zai if args.show_zai else CONFIG.get('_zai_headless', True)
+    CONFIG['_mimo_headless'] = not args.show_mimo if args.show_mimo else CONFIG.get('_mimo_headless', True)
+    CONFIG['_minimax_headless'] = not args.show_minimax if args.show_minimax else CONFIG.get('_minimax_headless', True)
+    CONFIG['_xinghuo_headless'] = not args.show_xinghuo if args.show_xinghuo else CONFIG.get('_xinghuo_headless', True)
     # 浏览器通道映射：Playwright channel 参数
-    # chromium = 不传 channel（使用 Playwright 内置 Chromium），chrome = chrome, edge = msedge
-    _browser_channel_map = {
-        "chromium": None,
-        "chrome": "chrome",
-        "edge": "msedge",
-    }
-    # 未指定 --browser 时，Windows 默认 edge，其他系统默认 chromium
+    _browser_channel_map = {"chromium": None, "chrome": "chrome", "edge": "msedge"}
     if args.browser is None:
         args.browser = "edge" if sys.platform.startswith("win") else "chromium"
     CONFIG['_browser_channel'] = _browser_channel_map.get(args.browser, "msedge" if sys.platform.startswith("win") else None)
-    # 各站点独立配置（优先级：--show-xxx > --show > config.json > 默认 headless）
-    CONFIG['_doubao_headless'] = args.show_doubao if args.show_doubao else (args.show if args.show else CONFIG.get('_doubao_headless', True))
-    CONFIG['_qianwen_headless'] = args.show_qianwen if args.show_qianwen else (args.show if args.show else CONFIG.get('_qianwen_headless', True))
-    CONFIG['_deepseek_headless'] = args.show_deepseek if args.show_deepseek else (args.show if args.show else CONFIG.get('_deepseek_headless', True))
-    CONFIG['_zai_headless'] = args.show_zai if args.show_zai else (args.show if args.show else CONFIG.get('_zai_headless', True))
-    CONFIG['_mimo_headless'] = args.show_mimo if args.show_mimo else (args.show if args.show else CONFIG.get('_mimo_headless', True))
-    CONFIG['_minimax_headless'] = args.show_minimax if args.show_minimax else (args.show if args.show else CONFIG.get('_minimax_headless', True))
-    CONFIG['_xinghuo_headless'] = not (args.show or args.show_xinghuo)
     CONFIG['_keep_conversations'] = args.keep_conversations
 
     if args.login:

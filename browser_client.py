@@ -793,7 +793,7 @@ class BrowserClient:
 
     async def stream_qianwen_chat(self, messages: list, session_id: str, topic_id: str):
         """Route interception for qianwen API response + DOM typing."""
-        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_qianwen_headless', True)
         await self.ensure_qianwen_ready(headless=headless)
         stream_id = uuid.uuid4().hex
         q = asyncio.Queue()
@@ -909,7 +909,7 @@ class BrowserClient:
                 pass
 
     async def get_user_info(self) -> dict:
-        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_doubao_headless', True)
         await self.ensure_doubao_ready(headless=headless)
         async with self._doubao_lock:
             user_info = {}
@@ -959,7 +959,7 @@ class BrowserClient:
             return user_info
 
     async def stream_completion(self, body: dict):
-        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_doubao_headless', True)
         await self.ensure_doubao_ready(headless=headless)
         stream_id = uuid.uuid4().hex
         queue: asyncio.Queue = asyncio.Queue()
@@ -1119,7 +1119,7 @@ class BrowserClient:
         inline_file_content: 如果提供，直接作为 text_block 内容注入（不上传云存储）。
         image_generation: 如果为 True，注入图像生成所需的 chat_ability 字段，并自动添加 "生成图片：" 前缀。
         """
-        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_doubao_headless', True)
         await self.ensure_doubao_ready(headless=headless)
         stream_id = uuid.uuid4().hex
         q = asyncio.Queue()
@@ -1761,7 +1761,7 @@ class BrowserClient:
         Enhanced: handles CHUNK_DELTA text, creation_block 2074, rate-limit detection,
         recursive JSON URL search, and longer timeouts.
         """
-        headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_doubao_headless', True)
         await self.ensure_doubao_ready(headless=headless)
         stream_id = uuid.uuid4().hex
         q = asyncio.Queue()
@@ -2528,7 +2528,7 @@ class BrowserClient:
             self._deepseek_pw = await async_playwright().start()
             self._deepseek_browser = await self._deepseek_pw.chromium.launch_persistent_context(
                 user_data_dir=self._deepseek_user_data_dir,
-                headless=CONFIG.get('_deepseek_headless', CONFIG.get('_headless_browser', True)),
+                headless=CONFIG.get('_deepseek_headless', True),
                 channel=_browser_channel(),
                 args=_linux_safe_args(),
                 user_agent=USER_AGENT,
@@ -2790,7 +2790,7 @@ class BrowserClient:
 
     async def stream_deepseek_chat(self, prompt: str, model_type: str = "default", thinking_enabled: bool = False, search_enabled: bool = True, inline_file_content: str | None = None):
         """Route interception for deepseek chat API, convert custom SSE to OpenAI SSE chunks."""
-        headless = CONFIG.get('_deepseek_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_deepseek_headless', True)
         await self.ensure_deepseek_ready(headless=headless)
         await self._dismiss_deepseek_popups()
         stream_id = uuid.uuid4().hex
@@ -3798,7 +3798,7 @@ class BrowserClient:
             }
 
     async def upload_file_via_qianwen_page(self, file_data: bytes, file_name: str, _retry: bool = False) -> str:
-        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_qianwen_headless', True)
         await self.ensure_qianwen_ready(headless=headless)
         import tempfile
         tmp = None
@@ -3928,7 +3928,7 @@ class BrowserClient:
 
     async def fetch_qianwen_models(self) -> list[dict]:
         """从千问页面模型选择弹窗中获取可用模型列表。"""
-        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_qianwen_headless', True)
         await self.ensure_qianwen_ready(headless=headless)
         page = self._qianwen_page
         if not page:
@@ -4037,7 +4037,7 @@ class BrowserClient:
         Args:
             model_name: 模型ID（如 'qwen-3.7', 'qwen-3.7-max'），会自动映射为页面显示名称。
         """
-        headless = CONFIG.get('_qianwen_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_qianwen_headless', True)
         await self.ensure_qianwen_ready(headless=headless)
         page = self._qianwen_page
         if not page:
@@ -4617,7 +4617,7 @@ class BrowserClient:
 
     async def fetch_zai_models(self) -> list[dict]:
         """从 Zai 页面模型选择器中获取可用模型列表。"""
-        headless = CONFIG.get('_zai_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_zai_headless', True)
         await self.ensure_zai_ready(headless=headless)
         page = self._zai_page
         if not page:
@@ -4676,7 +4676,7 @@ class BrowserClient:
         Args:
             model_name: 模型ID（如 'zai-glm-5.1', 'zai-glm-5.2'），会自动映射为页面显示名称。
         """
-        headless = CONFIG.get('_zai_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_zai_headless', True)
         await self.ensure_zai_ready(headless=headless)
         page = self._zai_page
         if not page:
@@ -4763,7 +4763,7 @@ class BrowserClient:
         Args:
             model_name: 模型ID（如 'zai-glm-5.1', 'zai-glm-5.2'），用于在页面模型选择器中切换模型。
         """
-        headless = CONFIG.get('_zai_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_zai_headless', True)
         await self.ensure_zai_ready(headless=headless)
         await self._dismiss_zai_popups()
         stream_id = uuid.uuid4().hex
@@ -5285,7 +5285,7 @@ class BrowserClient:
 
     async def fetch_mimo_models(self) -> list[dict]:
         """从 MiMo 页面模型下拉面板中获取可用模型列表。"""
-        headless = CONFIG.get('_mimo_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_mimo_headless', True)
         await self.ensure_mimo_ready(headless=headless)
         page = self._mimo_page
         if not page:
@@ -5340,7 +5340,7 @@ class BrowserClient:
 
     async def select_mimo_model(self, model_name: str) -> bool:
         """在 MiMo 页面顶部的模型下拉面板中选择目标模型。"""
-        headless = CONFIG.get('_mimo_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_mimo_headless', True)
         await self.ensure_mimo_ready(headless=headless)
         page = self._mimo_page
         if not page:
@@ -5715,7 +5715,7 @@ class BrowserClient:
         Args:
             model_name: 模型ID（如 'mimo-v2.5-pro'），用于在页面模型选择器中切换模型。
         """
-        headless = CONFIG.get('_mimo_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_mimo_headless', True)
         await self.ensure_mimo_ready(headless=headless)
         stream_id = uuid.uuid4().hex
         q = asyncio.Queue()
@@ -6656,7 +6656,7 @@ class BrowserClient:
         """上传文件到 Minimax：获取策略 → Python oss2 直接上传 OSS → 回调注册。
         返回 {file_id, file_url, file_name, mime_type}。
         """
-        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_minimax_headless', True)
         await self.ensure_minimax_ready(headless=headless)
 
         import hashlib
@@ -6738,7 +6738,7 @@ class BrowserClient:
         """通过页面 UI 上传文件到 Minimax：写入临时文件 → file-input.set_input_files() → 等待页面完成 OSS 上传 → 拦截 policy_callback 响应。
         返回 {file_id, file_url, file_name, mime_type}。
         """
-        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_minimax_headless', True)
         await self.ensure_minimax_ready(headless=headless)
 
         import tempfile
@@ -6833,7 +6833,7 @@ class BrowserClient:
 
     async def create_minimax_session(self, model_name: str = "MiniMax-M3") -> str:
         """创建 Minimax Agent 会话，返回 session_id。"""
-        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_minimax_headless', True)
         await self.ensure_minimax_ready(headless=headless)
 
         agent_id = await self._minimax_page.evaluate("""() => {
@@ -6862,7 +6862,7 @@ class BrowserClient:
         """[备用] 发送消息到 Minimax Agent 并以 SSE 流式返回。通过签名+fetch 直接调用 API。
         Yields (kind, value)。
         """
-        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_minimax_headless', True)
         await self.ensure_minimax_ready(headless=headless)
 
         import uuid as _uuid
@@ -7026,7 +7026,7 @@ class BrowserClient:
         参考MiMo的 stream_mimo_chat 实现。
         Yields (kind, value)。
         """
-        headless = CONFIG.get('_minimax_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_minimax_headless', True)
         await self.ensure_minimax_ready(headless=headless)
 
         q = asyncio.Queue()
@@ -7264,7 +7264,7 @@ class BrowserClient:
             kind: "chat_id", "chunk", "done", "error"
         """
         if not self._xinghuo_page or self._xinghuo_page.is_closed():
-            headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+            headless = CONFIG.get('_xinghuo_headless', True)
             await self.ensure_xinghuo_ready(headless=headless)
         if not self._xinghuo_page or self._xinghuo_page.is_closed():
             yield ("error", "Xinghuo page not available")
@@ -7607,7 +7607,7 @@ class BrowserClient:
 
     async def get_xinghuo_oss_sign(self) -> dict:
         """获取 OSS 上传签名。"""
-        headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_xinghuo_headless', True)
         await self.ensure_xinghuo_ready(headless=headless)
         return await self._xinghuo_page.evaluate("""async () => {
             const resp = await fetch('/iflygpt/oss/sign', {
@@ -7621,7 +7621,7 @@ class BrowserClient:
 
     async def get_xinghuo_chatdoc_sign(self) -> dict:
         """获取 chatdoc 上传签名。"""
-        headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_xinghuo_headless', True)
         await self.ensure_xinghuo_ready(headless=headless)
         return await self._xinghuo_page.evaluate("""async () => {
             const resp = await fetch('/iflygpt/file_chat/getSign', {
@@ -7633,7 +7633,7 @@ class BrowserClient:
 
     async def upload_xinghuo_file_to_oss(self, file_data: bytes, file_name: str) -> dict:
         """上传文件到讯飞 OSS 并返回 OSS 签名结果。"""
-        headless = CONFIG.get('_xinghuo_headless', CONFIG.get('_headless_browser', True))
+        headless = CONFIG.get('_xinghuo_headless', True)
         await self.ensure_xinghuo_ready(headless=headless)
         oss_sign_result = await self.get_xinghuo_oss_sign()
         if oss_sign_result.get("code") != 0:

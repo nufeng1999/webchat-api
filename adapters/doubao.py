@@ -289,7 +289,7 @@ class DoubaoAdapter(BaseAdapter):
                 logger.info(f"[{adapter_name} ImageGen] {Colors.RED}Attempt {attempt+1}/{max_retries}{Colors.RESET}")
 
                 try:
-                    headless = CONFIG.get('_doubao_headless', CONFIG.get('_headless_browser', True))
+                    headless = CONFIG.get('_doubao_headless', True)
                     await browser_client.ensure_doubao_ready(headless=headless)
 
                     page = browser_client._doubao_page
