@@ -417,6 +417,7 @@ async def generate_images_endpoint(request: Request):
     """
     try:
         body = await request.json()
+        logger.debug(f"[ImageGen] request body: {json.dumps(body, ensure_ascii=False)}")
         prompt = body.get("prompt", "")
         model = body.get("model", "doubao-image")
         n = body.get("n", 1)
@@ -435,6 +436,7 @@ async def generate_images_endpoint(request: Request):
         if has_error:
             logger.warning(f"Image generation returned errors for model={model}, prompt={prompt[:50]}")
 
+        logger.debug(f"[ImageGen] response: {json.dumps(result, ensure_ascii=False)}")
         return JSONResponse(content=result)
     except HTTPException:
         raise

@@ -617,7 +617,8 @@ class DoubaoAdapter(BaseAdapter):
                     if downloaded:
                         result = {"created": int(time.time()), "data": []}
                         for local_url in downloaded[:n]:
-                            result["data"].append({"url": local_url, "revised_prompt": prompt, "size": size})
+                            # result["data"].append({"url": local_url, "revised_prompt": prompt, "size": size})
+                            result["data"].append({"url": local_url})
                         return result
                     else:
                         return {"created": int(time.time()), "data": [{"url": "", "revised_prompt": prompt, "size": size, "error": "Download failed"}]}

@@ -479,7 +479,7 @@ class BrowserClient:
                     filepath = os.path.join(images_dir, filename)
                     with open(filepath, 'wb') as f:
                         f.write(content)
-                    local_url = f"http://localhost:8765/images/{filename}"
+                    local_url = f"{CONFIG.get('img_url', 'http://localhost:8765/images')}/{filename}"
                     logger.info(f"[Doubao] downloaded via page.request: {local_url} ({len(content)} bytes)")
                     return local_url
                 except Exception as e:
@@ -554,7 +554,7 @@ class BrowserClient:
                         filepath = os.path.join(images_dir, filename)
                         with open(filepath, 'wb') as f:
                             f.write(content)
-                        local_url = f"http://localhost:8765/images/{filename}"
+                        local_url = f"{CONFIG.get('img_url', 'http://localhost:8765/images')}/{filename}"
                         local_urls.append(local_url)
                         logger.info(f"[Doubao] saved: {local_url} ({len(content)} bytes)")
                     elif resp.status == 200:
@@ -592,7 +592,7 @@ class BrowserClient:
                         filepath = os.path.join(images_dir, filename)
                         with open(filepath, 'wb') as f:
                             f.write(resp.content)
-                        local_url = f"http://localhost:8765/images/{filename}"
+                        local_url = f"{CONFIG.get('img_url', 'http://localhost:8765/images')}/{filename}"
                         local_urls.append(local_url)
                         logger.info(f"[Doubao] saved: {local_url} ({len(resp.content)} bytes)")
                     elif resp.status_code == 200:
