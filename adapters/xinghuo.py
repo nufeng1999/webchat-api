@@ -64,16 +64,7 @@ class XinghuoAdapter(BaseAdapter):
         logger.info(f"[Xinghuo] chat_id: {value}")
 
     async def _delete_conversation(self):
-        chat_id = self._last_chat_id
-        if chat_id:
-            try:
-                from browser_client import browser_client
-                await browser_client.delete_xinghuo_conversation(chat_id)
-                logger.info(f"[Xinghuo] deleted chat {chat_id}")
-            except Exception as e:
-                logger.warning(f"[Xinghuo] delete chat {chat_id} exception: {e}")
-        else:
-            logger.debug("[Xinghuo] no chat to delete (chat_id empty)")
+        """仅清除 adapter 本地状态，不删除 web 对话实例。"""
         self._last_chat_id = ""
 
     async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool):

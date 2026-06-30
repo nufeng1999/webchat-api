@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import asyncio
+import time
 import aiohttp
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from music import start_music_generation, get_music_status, get_music_audio, get
 from exporter import fetch_user_info, fetch_conversation_list, export_conversation_full
 from storage import init_db, save_conversation, list_conversations as db_list_conversations, get_conversation as db_get_conversation, save_message, get_messages as db_get_messages, delete_conversation as db_delete_conversation, search_conversations
 from adapters import init_all as adapters_init_all, close_all as adapters_close_all, get_adapter, get_image_adapter, get_models as get_adapter_models
+from wsession_store import resolve_wsession, get_conversation_id, set_conversation_id, remove_by_conversation_id, clear_all as clear_wsession
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("webchat-api")
@@ -69,6 +71,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Active sign method: {SIGN_METHOD}")
     _cleanup_task = asyncio.create_task(_auto_cleanup_task())
     await init_db()
+    from wsession_store import load_from_db
+    load_from_db()
 
     # 预加载浏览器（根据 _preload_xxx 配置）
     from browser_client import browser_client
@@ -121,78 +125,23 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
 
-    if not CONFIG.get('_keep_conversations', False):
-        logger.info("Cleaning up conversation history before shutdown...")
-        try:
-            from storage import clear_all_conversations
-            await clear_all_conversations()
-            logger.info("SQLite database conversations cleared")
-        except Exception as e:
-            logger.warning(f"Failed to clear SQLite conversations: {e}")
+    # Conversation cleanup based on config:
+    # _keep_conversations: false (default) -> force clear ALL (ignore retention_days)
+    # _keep_conversations: true & conversation_retention_days > 0 -> selective cleanup (only old conversations)
+    # _keep_conversations: true & conversation_retention_days not set/0 -> keep ALL
+    keep_conversations = CONFIG.get('_keep_conversations', False)
+    retention_days = CONFIG.get('conversation_retention_days', 0)
 
-        try:
-            import glob
-            conv_dir = os.path.join(BASE_DIR, "conversations")
-            if os.path.exists(conv_dir):
-                doubao_conv_ids = []
-                for f in glob.glob(os.path.join(conv_dir, "*.json")):
-                    try:
-                        with open(f, 'r', encoding='utf-8') as fh:
-                            state = json.load(fh)
-                        conv_id = state.get("doubao_conversation_id", "")
-                        if conv_id and conv_id != "0":
-                            doubao_conv_ids.append(conv_id)
-                        os.remove(f)
-                    except Exception as e:
-                        logger.warning(f"Failed to process conversation file {f}: {e}")
-                if doubao_conv_ids:
-                    from openai_api import delete_conversation_sync
-                    for conv_id in doubao_conv_ids:
-                        try:
-                            success, err = delete_conversation_sync(conv_id)
-                            if not success:
-                                logger.warning(f"Failed to delete doubao conversation {conv_id}: {err}")
-                        except Exception as e:
-                            logger.warning(f"Error deleting doubao conversation {conv_id}: {e}")
-                    logger.info(f"Deleted {len(doubao_conv_ids)} Doubao conversations from server")
-                logger.info("Conversation JSON files removed")
-        except Exception as e:
-            logger.warning(f"Failed to clean conversation files: {e}")
-
-        try:
-            from browser_client import browser_client
-            await browser_client.delete_all_qianwen_conversations()
-            logger.info("Qianwen conversations deleted from server")
-        except Exception as e:
-            logger.warning(f"Failed to delete Qianwen conversations: {e}")
-
-        try:
-            from browser_client import browser_client
-            await browser_client.delete_all_deepseek_conversations()
-            logger.info("DeepSeek conversations deleted from server")
-        except Exception as e:
-            logger.warning(f"Failed to delete DeepSeek conversations: {e}")
-
-        try:
-            from browser_client import browser_client
-            await browser_client.delete_all_zai_conversations()
-            logger.info("Zai conversations deleted from server")
-        except Exception as e:
-            logger.warning(f"Failed to delete Zai conversations: {e}")
-
-        try:
-            from browser_client import browser_client
-            await browser_client.delete_all_mimo_conversations()
-            logger.info("MiMo conversations deleted from server")
-        except Exception as e:
-            logger.warning(f"Failed to delete MiMo conversations: {e}")
-
-        try:
-            from browser_client import browser_client
-            await browser_client.delete_all_xinghuo_conversations()
-            logger.info("Xinghuo conversations deleted from server")
-        except Exception as e:
-            logger.warning(f"Failed to delete Xinghuo conversations: {e}")
+    if not keep_conversations:
+        # Force clear: delete everything
+        logger.info("Force clearing ALL conversations on shutdown...")
+        await _full_cleanup()
+    elif retention_days > 0:
+        # Selective cleanup: delete only conversations older than retention_days
+        logger.info(f"Selective cleanup: removing conversations older than {retention_days} days...")
+        await _selective_cleanup(retention_days)
+    else:
+        logger.info("Keeping all conversations (no cleanup)")
 
     if signer:
         await signer.close()
@@ -237,93 +186,172 @@ async def rate_limit_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-async def _delete_adapter_conversation(adapter):
+async def _update_wsession_mapping(adapter, wsession: str, model: str):
+    """请求完成后，将 adapter 产生的会话 ID 写入 wsession 映射。不再删除 web 对话。"""
     try:
         adapter_name = adapter.get_adapter_name()
-        if adapter_name == 'doubao':
-            conv_id = getattr(adapter, '_last_conversation_id', '')
-            chat_id = getattr(adapter, '_last_chat_id', '')
-            if conv_id and conv_id != '0':
-                from openai_api import delete_conversation
-                success, err = await delete_conversation(conv_id)
-                if success:
-                    logger.info(f"[Cleanup] deleted doubao conversation {conv_id}")
-                    if chat_id:
-                        try:
-                            from config import CONVERSATION_DIR
-                            state_file = os.path.join(CONVERSATION_DIR, f"{chat_id}.json")
-                            if os.path.exists(state_file):
-                                os.remove(state_file)
-                        except Exception:
-                            pass
-                else:
-                    logger.warning(f"[Cleanup] failed to delete doubao conversation {conv_id}: {err}")
-            adapter._last_conversation_id = ""
-        elif adapter_name == 'qianwen':
-            session_id = getattr(adapter, '_last_session_id', '')
-            if session_id:
-                from browser_client import browser_client
-                await browser_client.delete_qianwen_conversation(session_id)
-                logger.info(f"[Cleanup] deleted qianwen session {session_id}")
-            adapter._last_session_id = ""
-        elif adapter_name == 'deepseek':
-            session_id = getattr(adapter, '_last_session_id', '')
-            if session_id:
-                from browser_client import browser_client
-                await browser_client.delete_deepseek_conversation(session_id)
-                logger.info(f"[Cleanup] deleted deepseek session {session_id}")
-            adapter._last_session_id = ""
-        elif adapter_name == 'zai':
-            session_id = getattr(adapter, '_last_session_id', '')
-            if session_id:
-                from browser_client import browser_client
-                await browser_client.delete_zai_conversation(session_id)
-                logger.info(f"[Cleanup] deleted zai session {session_id}")
-            adapter._last_session_id = ""
-        elif adapter_name == 'mimo':
-            session_id = getattr(adapter, '_last_session_id', '')
-            if session_id:
-                from browser_client import browser_client
-                await browser_client.delete_mimo_conversation(session_id)
-                logger.info(f"[Cleanup] deleted mimo session {session_id}")
-            adapter._last_session_id = ""
-        elif adapter_name == 'minimax':
-            session_id = getattr(adapter, '_last_session_id', '')
-            if session_id:
-                from browser_client import browser_client
-                await browser_client.delete_minimax_conversation(session_id)
-                logger.info(f"[Cleanup] deleted minimax session {session_id}")
-            adapter._last_session_id = ""
-        elif adapter_name == 'xinghuo':
-            chat_id = getattr(adapter, '_last_chat_id', '')
-            if chat_id:
-                from browser_client import browser_client
-                await browser_client.delete_xinghuo_conversation(chat_id)
-                logger.info(f"[Cleanup] deleted xinghuo chat {chat_id}")
-            adapter._last_chat_id = ""
-    except Exception as e:
-        logger.warning(f"[Cleanup] failed to delete conversation: {e}")
 
+        conv_id = (getattr(adapter, '_last_conversation_id', '') or
+                   getattr(adapter, '_last_session_id', '') or
+                   getattr(adapter, '_last_chat_id', ''))
+
+        if not conv_id or conv_id == "0":
+            logger.info(f"[wsession] {adapter_name} 无有效会话 ID，不更新映射")
+            return
+
+        existing = get_conversation_id(model, wsession)
+        if not existing or existing != conv_id:
+            set_conversation_id(model, wsession, conv_id)
+            logger.info(f"[wsession] {adapter_name}: {model}:{wsession} -> {conv_id}")
+        else:
+            logger.info(f"[wsession] {adapter_name}: 映射未变化")
+
+        if hasattr(adapter, '_last_conversation_id'):
+            adapter._last_conversation_id = ""
+        if hasattr(adapter, '_last_session_id'):
+            adapter._last_session_id = ""
+        if hasattr(adapter, '_last_chat_id'):
+            adapter._last_chat_id = ""
+
+    except Exception as e:
+        logger.warning(f"[wsession] {adapter_name} mapping update error: {e}")
+
+
+async def _full_cleanup():
+    """Force clear: delete ALL conversations (local DB + remote server + JSON files + wsession mappings)."""
+    from storage import clear_all_conversations
+    from wsession_store import clear_all as clear_wsession
+    try:
+        await clear_all_conversations()
+        logger.info("SQLite database conversations cleared")
+    except Exception as e:
+        logger.warning(f"Failed to clear SQLite conversations: {e}")
+
+    try:
+        import glob
+        conv_dir = os.path.join(BASE_DIR, "conversations")
+        if os.path.exists(conv_dir):
+            doubao_conv_ids = []
+            for f in glob.glob(os.path.join(conv_dir, "*.json")):
+                try:
+                    with open(f, 'r', encoding='utf-8') as fh:
+                        state = json.load(fh)
+                    conv_id = state.get("doubao_conversation_id", "")
+                    if conv_id and conv_id != "0":
+                        doubao_conv_ids.append(conv_id)
+                    os.remove(f)
+                except Exception as e:
+                    logger.warning(f"Failed to process conversation file {f}: {e}")
+            if doubao_conv_ids:
+                from openai_api import delete_conversation_sync
+                for conv_id in doubao_conv_ids:
+                    try:
+                        success, err = delete_conversation_sync(conv_id)
+                        if not success:
+                            logger.warning(f"Failed to delete doubao conversation {conv_id}: {err}")
+                    except Exception as e:
+                        logger.warning(f"Error deleting doubao conversation {conv_id}: {e}")
+                logger.info(f"Deleted {len(doubao_conv_ids)} Doubao conversations from server")
+            logger.info("Conversation JSON files removed")
+    except Exception as e:
+        logger.warning(f"Failed to clean conversation files: {e}")
+
+    try:
+        from browser_client import browser_client
+        await browser_client.delete_all_qianwen_conversations()
+        logger.info("Qianwen conversations deleted from server")
+    except Exception as e:
+        logger.warning(f"Failed to delete Qianwen conversations: {e}")
+
+    try:
+        from browser_client import browser_client
+        await browser_client.delete_all_deepseek_conversations()
+        logger.info("DeepSeek conversations deleted from server")
+    except Exception as e:
+        logger.warning(f"Failed to delete DeepSeek conversations: {e}")
+
+    try:
+        from browser_client import browser_client
+        await browser_client.delete_all_zai_conversations()
+        logger.info("Zai conversations deleted from server")
+    except Exception as e:
+        logger.warning(f"Failed to delete Zai conversations: {e}")
+
+    try:
+        from browser_client import browser_client
+        await browser_client.delete_all_mimo_conversations()
+        logger.info("MiMo conversations deleted from server")
+    except Exception as e:
+        logger.warning(f"Failed to delete MiMo conversations: {e}")
+
+    try:
+        from browser_client import browser_client
+        await browser_client.delete_all_xinghuo_conversations()
+        logger.info("Xinghuo conversations deleted from server")
+    except Exception as e:
+        logger.warning(f"Failed to delete Xinghuo conversations: {e}")
+
+    clear_wsession()
+    logger.info("[wsession] cleared all mappings (force clear mode)")
+
+
+async def _selective_cleanup(retention_days: int):
+    """Delete only conversations older than retention_days. Local DB + wsession only (no remote deletion)."""
+    from storage import list_conversations_older_than, delete_conversation as db_delete
+    from wsession_store import remove_mapping_by_conv_id
+    import logging
+    logger = logging.getLogger("webchat-api")
+
+    old_convs = await list_conversations_older_than(retention_days)
+    if not old_convs:
+        logger.info(f"No conversations older than {retention_days} days found")
+        return
+
+    logger.info(f"Found {len(old_convs)} conversations older than {retention_days} days")
+
+    for conv in old_convs:
+        conv_id = conv["id"]
+        model = conv.get("model", "unknown")
+        updated_at = conv.get("updated_at", 0)
+        days_old = (time.time() - updated_at) / 86400
+
+        # Delete from local DB
+        try:
+            await db_delete(conv_id)
+            logger.info(f"[selective] deleted conversation {conv_id} ({model}, {days_old:.1f} days old)")
+        except Exception as e:
+            logger.warning(f"[selective] failed to delete {conv_id}: {e}")
+
+        # Remove wsession mapping
+        remove_mapping_by_conv_id(conv_id)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     adapter = get_adapter(request.model)
-    
-    # 尝试获取 adapter 锁
+
+    # wsession 处理
+    wsession = resolve_wsession(request.messages)
+    mapped_conv_id = get_conversation_id(request.model, wsession)
+    if mapped_conv_id:
+        request.conversation_id = mapped_conv_id
+        logger.info(f"[wsession] {request.model}:{wsession} 发现映射: {mapped_conv_id} (复用)")
+    else:
+        logger.info(f"[wsession] {request.model}:{wsession} 无映射 → 创建新对话")
+
     acquired, error_msg = await request_limiter.acquire(request.model)
     if not acquired:
         return JSONResponse(
             status_code=429,
             content={"error": {"message": error_msg, "type": "request_limited_error", "code": 429}}
         )
-    
+
     try:
         if request.stream:
             logger.debug(f"[Request] stream {request.model}")
             async def stream_with_cleanup():
                 async for chunk in adapter.stream_chat(request):
                     yield chunk
-                await _delete_adapter_conversation(adapter)
+                await _update_wsession_mapping(adapter, wsession, request.model)
             return StreamingResponse(
                 stream_with_cleanup(),
                 media_type="text/event-stream",
@@ -336,7 +364,7 @@ async def chat_completions(request: ChatCompletionRequest):
         else:
             logger.debug(f"[Request] non_stream {request.model}")
             result = await adapter.non_stream_chat(request)
-            await _delete_adapter_conversation(adapter)
+            await _update_wsession_mapping(adapter, wsession, request.model)
             return JSONResponse(content=result)
     finally:
         request_limiter.release(request.model)

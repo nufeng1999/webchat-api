@@ -79,6 +79,8 @@ class DoubaoAdapter(BaseAdapter):
         kwargs = {"text": current_prompt}
         if is_agent and file_content:
             kwargs["inline_file_content"] = f"[文件 request.json 内容]\n{file_content}\n[/文件内容]"
+        # Increase timeout to 180 seconds to allow for large request processing
+        kwargs["timeout"] = 180
         return kwargs
 
     async def _call_stream(self, **kwargs):
@@ -93,8 +95,8 @@ class DoubaoAdapter(BaseAdapter):
         logger.info(f"[Doubao] conversation_id: {value}")
 
     async def _delete_conversation(self):
-        """删除当前对话。"""
-        await self._delete_current_conversation()
+        """仅清除 adapter 本地状态，不删除 web 对话实例。"""
+        self._last_conversation_id = ""
 
     async def _handle_rate_limit(self, attempt: int, max_retries: int, error_msg: str = None):
         """处理限流：区分临时限流（自动恢复）和需验证（弹窗用户处理）。返回 True 表示已处理可继续重试。"""

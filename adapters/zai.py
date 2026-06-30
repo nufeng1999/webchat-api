@@ -65,16 +65,7 @@ class ZaiAdapter(BaseAdapter):
         logger.info(f"[Zai] session_id: {value}")
 
     async def _delete_conversation(self):
-        session_id = self._last_session_id
-        if session_id:
-            try:
-                from browser_client import browser_client
-                await browser_client.delete_zai_conversation(session_id)
-                logger.info(f"[Zai] deleted session {session_id}")
-            except Exception as e:
-                logger.warning(f"[Zai] delete session {session_id} exception: {e}")
-        else:
-            logger.debug("[Zai] no session to delete (session_id empty)")
+        """仅清除 adapter 本地状态，不删除 web 对话实例。"""
         self._last_session_id = ""
 
     async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool):

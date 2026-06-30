@@ -192,7 +192,8 @@ class QianwenAdapter(BaseAdapter):
         logger.info(f"[Qwen] session_id: {value}")
 
     async def _delete_conversation(self):
-        await self._delete_qianwen_conversation()
+        """仅清除 adapter 本地状态，不删除 web 对话实例。"""
+        self._session_id = ""
 
     def _use_parse_error_history(self) -> bool:
         return False

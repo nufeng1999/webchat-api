@@ -201,3 +201,21 @@ async def search_conversations(query: str) -> list:
             conn.close()
 
     return await asyncio.to_thread(_search)
+
+
+async def list_conversations_older_than(days: int) -> list:
+    """查询超过指定天数未更新的对话列表 [(id, model, updated_at), ...]。"""
+    threshold = time.time() - days * 86400
+
+    def _query():
+        conn = _get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, model, updated_at FROM conversations WHERE updated_at < ?",
+                (threshold,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_query)

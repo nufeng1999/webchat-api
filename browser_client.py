@@ -233,6 +233,126 @@ class BrowserClient:
             return
         q.put_nowait((kind, value))
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # wsession 对话激活方法
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def activate_doubao_conversation(self, conversation_id: str) -> bool:
+        """导航到豆包指定对话页面，激活该对话实例。"""
+        if not conversation_id or conversation_id == "0":
+            return False
+        try:
+            await self.ensure_doubao_ready()
+            url = f"https://www.doubao.com/chat/{conversation_id}"
+            await self._doubao_page.goto(url, wait_until="load", timeout=60000)
+            logger.info(f"[Doubao] after nav to {url}, actual URL: {self._doubao_page.url}")
+            for _ in range(360):  # 最长等待3分钟
+                found = await self._doubao_page.evaluate("""() => {
+                    const ta = document.querySelector('textarea');
+                    const ce = document.querySelector('[contenteditable="true"]');
+                    return !!(ta || ce);
+                }""")
+                if found:
+                    break
+                await asyncio.sleep(0.5)
+            logger.info(f"[Doubao] activated conversation {conversation_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[Doubao] activate conversation failed: {e}")
+            return False
+
+    async def activate_qianwen_conversation(self, session_id: str) -> bool:
+        """导航到千问指定对话页面。"""
+        if not session_id:
+            return False
+        try:
+            await self.ensure_qianwen_ready()
+            url = f"https://chat2.qianwen.com/chat/{session_id}"
+            await self._qianwen_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
+            logger.info(f"[Qianwen] activated session {session_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[Qianwen] activate conversation failed: {e}")
+            return False
+
+    async def activate_deepseek_conversation(self, session_id: str) -> bool:
+        """导航到 DeepSeek 指定对话页面。"""
+        if not session_id:
+            return False
+        try:
+            await self.ensure_deepseek_ready()
+            url = f"https://chat.deepseek.com/a/chat/s/{session_id}"
+            await self._deepseek_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
+            logger.info(f"[DeepSeek] activated session {session_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[DeepSeek] activate conversation failed: {e}")
+            return False
+
+    async def activate_zai_conversation(self, session_id: str) -> bool:
+        """导航到 z.ai 指定对话页面。"""
+        if not session_id:
+            return False
+        try:
+            await self.ensure_zai_ready()
+            url = f"https://z.ai/c/{session_id}"
+            await self._zai_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
+            logger.info(f"[Zai] activated session {session_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[Zai] activate conversation failed: {e}")
+            return False
+
+    async def activate_mimo_conversation(self, session_id: str) -> bool:
+        """导航到 MiMo 指定对话页面。"""
+        if not session_id:
+            return False
+        try:
+            await self.ensure_mimo_ready()
+            # MiMo SPA hash router: after sending, URL contains '/chat/{session_id}'
+            url = f"https://aistudio.xiaomimimo.com/#/chat/{session_id}"
+            await self._mimo_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
+            logger.info(f"[MiMo] activated session {session_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[MiMo] activate conversation failed: {e}")
+            return False
+
+    async def activate_minimax_conversation(self, session_id: str) -> bool:
+        """导航到 MiniMax 指定对话页面。"""
+        if not session_id:
+            return False
+        try:
+            await self.ensure_minimax_ready()
+            url = f"https://agent.minimaxi.com/mavis/{session_id}"
+            await self._minimax_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
+            logger.info(f"[MiniMax] activated session {session_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[MiniMax] activate conversation failed: {e}")
+            return False
+
+    async def activate_xinghuo_conversation(self, chat_id: str) -> bool:
+        """导航到讯飞星火指定对话页面。URL 格式：https://xinghuo.xfyun.cn/desk?chatId=xxx&botId=4255"""
+        if not chat_id:
+            return False
+        try:
+            await self.ensure_xinghuo_ready()
+            # Xinghuo 使用 desk 页面并带 chatId 参数，botId 固定为 4255（星火 4.0 Ultra）
+            url = f"https://xinghuo.xfyun.cn/desk?chatId={chat_id}&botId=4255"
+            await self._xinghuo_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1)
+            logger.info(f"[Xinghuo] activated chat {chat_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[Xinghuo] activate conversation failed: {e}")
+            return False
+
     def _on_qianwen_push(self, stream_id: str, kind: str, value):
         q = self._qianwen_queues.get(stream_id)
         if q is None:
@@ -1113,7 +1233,7 @@ class BrowserClient:
                 except Exception:
                     pass
 
-    async def stream_doubao_chat_via_type(self, text: str, attachments: list | None = None, inline_file_content: str | None = None, image_generation: bool = False, timeout: int = 60):
+    async def stream_doubao_chat_via_type(self, text: str, attachments: list | None = None, inline_file_content: str | None = None, image_generation: bool = False, timeout: int = 60, reuse_conversation: bool = False):
         """Route interception for doubao API response + DOM typing.
         attachments: 文档附件列表 (type=3)，注入 attachment_block + input_skill + chat_ability。
         inline_file_content: 如果提供，直接作为 text_block 内容注入（不上传云存储）。
@@ -1186,6 +1306,12 @@ class BrowserClient:
                 if orig_body:
                     try:
                         body_dict = json.loads(orig_body)
+                        # 如果是恢复消息，跳过处理，继续发送原始请求
+                        recovery_info = body_dict.get('option', {}).get('recovery_option', {})
+                        if recovery_info.get('is_recovery', False):
+                            logger.info("[Doubao] intercepted recovery request, continuing original request without modification.")
+                            await route.continue_()
+                            return
                         logger.info(f"[Doubao] Request body keys: {list(body_dict.keys())}")
                         # Save request body for debugging
                         try:
@@ -1201,6 +1327,9 @@ class BrowserClient:
                         if messages:
                             msg = messages[0]
                             cbs = msg.get("content_block", [])
+                            logger.info(f"[Doubao] route handler: inline_file_content present: {inline_file_content is not None}, len: {len(inline_file_content) if inline_file_content else 0}")
+                            logger.info(f"[Doubao] route handler: attachments present: {_attachments is not None}, len: {len(_attachments) if _attachments else 0}")
+                            logger.info(f"[Doubao] route handler: image_generation: {image_generation}")
                             
                             # Inject attachment block if provided
                             if _attachments:
@@ -1251,11 +1380,21 @@ class BrowserClient:
                         logger.warning(f"[Doubao] Failed to parse request body: {json_e}")
                         body_dict = {}
                 
-                if modify_body:
-                    modified_body = json.dumps(body_dict, ensure_ascii=False)
-                    resp = await route.fetch(timeout=180000, post_data=modified_body)
-                else:
-                    resp = await route.fetch(timeout=180000)
+                try:
+                    if modify_body:
+                        modified_body = json.dumps(body_dict, ensure_ascii=False)
+                        logger.info(f"[Doubao] route.fetch with modified body (len={len(modified_body)}), request_num={_request_num}")
+                        resp = await route.fetch(timeout=180000, post_data=modified_body)
+                    else:
+                        logger.info(f"[Doubao] route.fetch without modification, request_num={_request_num}")
+                        resp = await route.fetch(timeout=180000)
+                    logger.info(f"[Doubao] route.fetch completed, status={resp.status}")
+                except Exception as fetch_e:
+                    logger.warning(f"[Doubao] route.fetch failed or timed out: {fetch_e}")
+                    q.put_nowait(("error", f"Fetch error: {fetch_e}"))
+                    q.put_nowait(("done", ""))
+                    await route.abort() # Abort the route to prevent further processing
+                    return
 
                 body = await resp.body()
                 raw_text = body.decode("utf-8", errors="replace")
@@ -1431,24 +1570,27 @@ class BrowserClient:
                 except Exception:
                     pass
 
-        # 确保页面在新对话状态（而非旧对话）
-        current_url = self._doubao_page.url
-        if not current_url.endswith("/chat/") and "/chat/" in current_url:
-            # 页面在旧对话中，导航到新对话
-            logger.info("[Doubao] navigating to new chat (was in existing conversation)")
-            try:
-                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
-            except Exception as nav_err:
-                logger.warning(f"[Doubao] navigation to /chat/ failed (will retry): {nav_err}")
+        # 确保页面在新对话状态（而非旧对话），除非明确复用已有对话
+        if not reuse_conversation:
+            current_url = self._doubao_page.url
+            if not current_url.endswith("/chat/") and "/chat/" in current_url:
+                # 页面在旧对话中，导航到新对话
+                logger.info("[Doubao] navigating to new chat (was in existing conversation)")
                 try:
                     await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
-                except Exception as nav_err2:
-                    logger.warning(f"[Doubao] second navigation attempt also failed: {nav_err2}")
-            await asyncio.sleep(1)
+                except Exception as nav_err:
+                    logger.warning(f"[Doubao] navigation to /chat/ failed (will retry): {nav_err}")
+                    try:
+                        await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
+                    except Exception as nav_err2:
+                        logger.warning(f"[Doubao] second navigation attempt also failed: {nav_err2}")
+                await asyncio.sleep(1)
 
         try:
             # 注册 route handler：拦截并注入 request 内容
+            logger.info("[Doubao] registering route handler: **/chat/completion**")
             await self._doubao_page.route("**/chat/completion**", handle_route)
+            logger.info("[Doubao] route handler registered, current URL: " + self._doubao_page.url)
             # 图像生成模式：在 /chat/ 页面点击"图像生成"按钮，再通过 contenteditable 输入提示词
             if image_generation:
                 logger.info("[Doubao] switching to image generation mode on /chat/ page")
@@ -1657,6 +1799,25 @@ class BrowserClient:
                     yield ("done", "")
                     return
             else:
+                # 复用对话时，页面在历史对话，需轮询等待输入框
+                if reuse_conversation:
+                    ta_found = False
+                    for _poll in range(360):  # 最长等待3分钟
+                        ta_found = await self._doubao_page.evaluate("""() => {
+                            const ta = document.querySelector('textarea');
+                            return !!ta;
+                        }""")
+                        if ta_found:
+                            break
+                        await asyncio.sleep(0.5)
+                    if not ta_found:
+                        logger.warning("[Doubao] reuse: textarea not found after polling")
+                        yield ("error", "欲渡黄河冰塞川，将登太行雪满山。")
+                        yield ("done", "")
+                        return
+                    logger.info("[Doubao] reuse: textarea found, typing prompt")
+                    logger.info(f"[Doubao] before typing, current page URL: {self._doubao_page.url}")
+
                 # 原有逻辑：使用 textarea
                 ok = await self._doubao_page.evaluate("""() => {
                     const ta = document.querySelector('textarea');
@@ -1666,6 +1827,7 @@ class BrowserClient:
                     return true;
                 }""")
                 if not ok:
+                    logger.warning("[Doubao] textarea focus failed")
                     yield ("error", "欲渡黄河冰塞川，将登太行雪满山。")
                     yield ("done", "")
                     return
@@ -1679,9 +1841,17 @@ class BrowserClient:
                 }""", text)
                 await asyncio.sleep(0.5)
                 
-                # 发送消息：先按 Enter（绕过 UI 状态检查），再点按钮保底
-                await self._doubao_page.keyboard.press("Enter")
-                await asyncio.sleep(0.3)
+                # 等待发送按钮出现（最多10秒）
+                for _poll_btn in range(20):
+                    btn_exists = await self._doubao_page.evaluate("""() => {
+                        const btn = document.getElementById('flow-end-msg-send');
+                        return btn ? (btn.offsetParent !== null && !btn.disabled) : false;
+                    }""")
+                    if btn_exists:
+                        break
+                    await asyncio.sleep(0.5)
+
+                # 先尝试点击发送按钮，失败再按 Enter（避免重复提交）
                 send_clicked = await self._doubao_page.evaluate("""() => {
                     const btns = document.querySelectorAll('button, [role="button"], [data-testid]');
                     for (const btn of btns) {
@@ -1699,11 +1869,15 @@ class BrowserClient:
                     }
                     return false;
                 }""")
-
                 if send_clicked:
-                    logger.info("[Doubao] typed + Enter + clicked send button")
+                    logger.info("[Doubao] clicked send button")
                 else:
-                    logger.info("[Doubao] typed + Enter (keyboard)")
+                    logger.warning("[Doubao] send button not found, Enter key may not trigger request — retrying")
+                    await self._doubao_page.keyboard.press("Enter")
+                    await asyncio.sleep(0.3)
+                    yield ("error", "Send button not found, Enter may not trigger request")
+                    yield ("done", "")
+                    return
             # 等待 1 秒确认请求已发出
             await asyncio.sleep(3)
         except Exception as e:
@@ -7255,7 +7429,8 @@ class BrowserClient:
                                    search_enabled: bool = False,
                                    inline_file_content: str | None = None,
                                    model_name: str | None = None,
-                                   file_info: list | None = None):
+                                   file_info: list | None = None,
+                                   conversation_id: str = ""):
         """向讯飞星火发送消息并流式返回响应。
 
         Yields: (kind, value) 元组
@@ -7286,21 +7461,25 @@ class BrowserClient:
                 }
                 selected_model = model_map.get(model_type, "4.0Ultra")
 
-                # Step 1: 创建对话
-                chat_id = await self._xinghuo_page.evaluate("""async () => {
-                    try {
-                        const createResp = await fetch('/iflygpt/u/chat-list/v1/create-chat-list', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({title: '新对话', chatType: 1}),
-                            credentials: 'include'
-                        });
-                        const createData = await createResp.json();
-                        return String(createData?.data?.id || '');
-                    } catch(e) {
-                        return '';
-                    }
-                }""")
+                # Step 1: 获取 chat_id（复用已有 或 创建新对话）
+                if conversation_id and conversation_id != "0":
+                    chat_id = conversation_id
+                    logger.info(f"[Xinghuo] reusing existing chat_id: {chat_id}")
+                else:
+                    chat_id = await self._xinghuo_page.evaluate("""async () => {
+                        try {
+                            const createResp = await fetch('/iflygpt/u/chat-list/v1/create-chat-list', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({title: '新对话', chatType: 1}),
+                                credentials: 'include'
+                            });
+                            const createData = await createResp.json();
+                            return String(createData?.data?.id || '');
+                        } catch(e) {
+                            return '';
+                        }
+                    }""")
 
                 if not chat_id:
                     yield ("error", "create chat failed")

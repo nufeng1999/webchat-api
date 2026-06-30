@@ -786,6 +786,34 @@ class BaseAdapter(ABC):
 
                 stream_kwargs = self._build_stream_kwargs(prompt_text, file_content, is_agent, current_prompt)
 
+                # Wsession: 激活已有对话（如果 conversation_id 存在）
+                conv_id = getattr(request, 'conversation_id', None)
+                if conv_id and conv_id != "0":
+                    from browser_client import browser_client
+                    activate_map = {
+                        "doubao": browser_client.activate_doubao_conversation,
+                        "qianwen": browser_client.activate_qianwen_conversation,
+                        "deepseek": browser_client.activate_deepseek_conversation,
+                        "zai": browser_client.activate_zai_conversation,
+                        "mimo": browser_client.activate_mimo_conversation,
+                        "minimax": browser_client.activate_minimax_conversation,
+                        "xinghuo": browser_client.activate_xinghuo_conversation,
+                    }
+                    activate_fn = activate_map.get(adapter_name)
+                    if activate_fn:
+                        activated = await activate_fn(conv_id)
+                        if activated:
+                            # 传递会话 ID 给底层，某些站点（如星火）使用
+                            if adapter_name == "xinghuo":
+                                stream_kwargs["conversation_id"] = conv_id
+                            # 标记复用对话，避免 protocol 再次导航到新对话
+                            stream_kwargs["reuse_conversation"] = True
+                            # 复用对话时，SSE 可能不返回新的 conversation_id，预置 _last_conversation_id
+                            self._last_conversation_id = conv_id
+                        else:
+                            logger.warning(f"[{adapter_name}] conversation activation failed: conv_id={conv_id}, will create new")
+                            request.conversation_id = "0"
+
                 logger.info(f"[{adapter_name} Adapter] {Colors.RED}Attempt {attempt+1}/{max_retries}{Colors.RESET}")
 
                 async for kind, value in self._call_stream(**stream_kwargs):
@@ -795,11 +823,14 @@ class BaseAdapter(ABC):
                             got_rate_limit = True
                             rate_limit_error = str(value)
                             logger.warning(f"{adapter_name} rate limited (attempt {attempt+1}/{max_retries})")
-                            await self._delete_conversation()
+                            break
+                        # Timeout or route not triggered — should retry
+                        if "timeout" in err_str or "fetch error" in err_str:
+                            logger.warning(f"{adapter_name} {err_str} (attempt {attempt+1}/{max_retries}), will retry")
+                            got_rate_limit = True  # reuse retry mechanism
+                            rate_limit_error = str(value)
                             break
                         yield self._format_error(str(value), model, chat_id)
-                        if not self._stream_error_no_delete():
-                            await self._delete_conversation()
                         await self._on_error_yield(chat_id)
                         return
 
@@ -818,7 +849,6 @@ class BaseAdapter(ABC):
                     if should_return and return_value is not None:
                         yield return_value
                         if kind == "error":
-                            await self._delete_conversation()
                             return
 
                     if kind == "done":
@@ -845,13 +875,11 @@ class BaseAdapter(ABC):
                                 if attempt < max_retries - 1:
                                     logger.info(f"{adapter_name} retrying (attempt {attempt+1}/{max_retries}): {err_msg[:200]}")
                                     await asyncio.sleep(5)
-                                    await self._delete_conversation()
                                     is_retry_break = True
                                     break
                                 else:
                                     logger.error(f"{adapter_name} parse failed after {max_retries} attempts")
                                     yield self._format_error("服务器内部错误！", model, chat_id)
-                                    await self._delete_conversation()
                                     return
                             else:
                                 parse_success = True
@@ -865,7 +893,6 @@ class BaseAdapter(ABC):
                                     yield chunk
                                 await self._on_success(chat_id)
                                 await self._on_done_extra()
-                                await self._delete_conversation()
                                 return
                         except Exception as e:
                             logger.error(f"{adapter_name} done handler error: {e}")
@@ -874,12 +901,10 @@ class BaseAdapter(ABC):
                                 parse_error_history.append((err_msg, full_text))
                             if attempt < max_retries - 1:
                                 logger.info(f"{adapter_name} retrying after done handler error: {err_msg}")
-                                await self._delete_conversation()
                                 is_retry_break = True
                                 break
                             else:
                                 yield self._format_error("服务器内部错误！", model, chat_id)
-                                await self._delete_conversation()
                                 return
 
                 if got_rate_limit:
