@@ -187,8 +187,8 @@ class DoubaoAdapter(BaseAdapter):
         request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
 
         msgs = request_dict.get('messages', [])
-        if len(msgs) > 15:
-            new_msgs = msgs[:10] + msgs[-5:]
+        if len(msgs) > 25:
+            new_msgs = msgs[:15] + msgs[-10:]
         else:
             new_msgs = msgs
         request_dict['messages'] = new_msgs

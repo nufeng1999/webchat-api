@@ -868,7 +868,7 @@ class BrowserClient:
                 return false;
             }""")
             if not ok:
-                yield ("error", "No editor")
+                yield ("error", "墙角数枝梅，凌寒独自开。遥知不是雪，为有暗香来。")
                 yield ("done", "")
                 return
             # 聚焦编辑器后逐字输入（\n 用 Shift+Enter 避免提前提交）
@@ -898,7 +898,7 @@ class BrowserClient:
                 yield ("chunk", value)
         except asyncio.TimeoutError:
             logger.warning("[Qwen] timeout")
-            yield ("error", "Timeout")
+            yield ("error", "人间有味是清欢。")
             yield ("done", "")
         finally:
             self._qianwen_queues.pop(stream_id, None)
@@ -1666,7 +1666,7 @@ class BrowserClient:
                     return true;
                 }""")
                 if not ok:
-                    yield ("error", "No editor")
+                    yield ("error", "欲渡黄河冰塞川，将登太行雪满山。")
                     yield ("done", "")
                     return
                 await self._doubao_page.evaluate("""(text) => {
@@ -1737,7 +1737,7 @@ class BrowserClient:
                 yield ("chunk", value)
         except asyncio.TimeoutError:
             logger.warning(f"[Doubao] timeout after {timeout}s - no response from server, resetting page")
-            yield ("error", "Timeout")
+            yield ("error", "行到水穷处，坐看云起时。")
             yield ("done", "")
             try:
                 await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
@@ -2014,7 +2014,7 @@ class BrowserClient:
 
         except asyncio.TimeoutError:
             logger.warning("[Doubao create-image] timeout waiting for SSE response")
-            yield ("error", "Timeout waiting for image generation")
+            yield ("error", "饥来驱我去，不知竟何之。行行至斯里，叩门拙言辞。")
             yield ("done", "")
             try:
                 await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="load", timeout=30000)
@@ -3306,7 +3306,7 @@ class BrowserClient:
                         break
                 except asyncio.TimeoutError:
                     logger.warning("[DeepSeek] timeout waiting for response")
-                    yield ("error", "Timeout")
+                    yield ("error", "千锤万凿出深山，烈火焚烧若等闲。")
                     yield ("done", "")
                     break
         except Exception as e:
@@ -5146,7 +5146,7 @@ class BrowserClient:
                     stable_count += 1
                     if stable_count >= 2500:  # 30 秒无变化
                         logger.warning("[Zai] DOM response timeout (no new content)")
-                        yield ("error", "Timeout")
+                        yield ("error", "念天地之悠悠，独怆然而涕下。")
                         yield ("done", "")
                         break
                     continue
@@ -5171,7 +5171,7 @@ class BrowserClient:
                     stable_count += 1
                     if stable_count >= 150:
                         logger.warning("[Zai] DOM response timeout (no content)")
-                        yield ("error", "Timeout")
+                        yield ("error", "万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。")
                         yield ("done", "")
                         break
 
@@ -5906,7 +5906,7 @@ class BrowserClient:
                     break
             except asyncio.TimeoutError:
                 logger.warning("[MiMo] timeout waiting for response")
-                yield ("error", "Timeout")
+                yield ("error", "时人不识凌云木，直待凌云始道高。")
                 yield ("done", "")
                 break
             except asyncio.CancelledError:
@@ -7184,7 +7184,7 @@ class BrowserClient:
                     break
             except asyncio.TimeoutError:
                 logger.warning("[Minimax] timeout waiting for SSE response")
-                yield ("error", "Timeout")
+                yield ("error", "不见五陵豪杰墓，无花无酒锄作田。")
                 break
 
     # ═══════════════════════════════════════════════════════════════════════

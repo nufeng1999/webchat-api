@@ -894,7 +894,7 @@ class BaseAdapter(ABC):
                     continue
                 break
 
-            yield self._format_error("已进行多次重试！", model, chat_id)
+            yield self._format_error("千淘万漉虽辛苦，吹尽狂沙始到金。", model, chat_id)
         except Exception as e:
             logger.error(f"[{adapter_name}] stream_chat error: {e}")
             yield self._format_error(str(e), model, chat_id)

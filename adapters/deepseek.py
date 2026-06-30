@@ -247,7 +247,7 @@ class DeepseekAdapter(BaseAdapter):
                     continue
                 break
 
-            yield self._format_error("已进行多次重试！", model, chat_id)
+            yield self._format_error("老骥伏枥，志在千里；烈士暮年，壮心不已。", model, chat_id)
         except Exception as e:
             logger.error(f"[DeepSeek] stream_chat error: {e}")
             yield self._format_error(str(e), model, chat_id)
