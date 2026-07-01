@@ -43,7 +43,7 @@ class DoubaoAdapter(BaseAdapter):
     def _get_lock(self):
         return self._doubao_lock
 
-    async def _prepare_messages(self, request, browser_client, is_agent: bool):
+    async def _prepare_messages(self, request, browser_client, is_agent: bool, reuse_conversation: bool = False):
         """准备 Doubao 的请求数据。对于非 agent 请求，提取最后一条消息文本；对于 agent 请求，序列化 request 为 JSON。"""
         if not is_agent:
             last_msg = request.messages[-1] if request.messages else None
@@ -51,10 +51,25 @@ class DoubaoAdapter(BaseAdapter):
             logger.debug(f"{Colors.BLUE}Doubao prepare_messages: non-agent, text_len={len(prompt_text)}{Colors.RESET}")
             return prompt_text, None
 
+        if reuse_conversation:
+            logger.info(f"[Doubao] skipping file upload for reused conversation")
+            request_dict = request.model_dump()
+            last_msg = request.messages[-1] if request.messages else None
+            is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+            if is_tool_return:
+                prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+            else:
+                prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
+            return prompt_text, None
+
         last_msg = request.messages[-1] if request.messages else None
         is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
         file_content = await self._prepare_inline_file_content(request, is_tool_return)
-        prompt_text = get_exectask_prompt(self.get_adapter_name())
+        request_dict = request.model_dump()
+        if is_tool_return:
+            prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+        else:
+            prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
 
         try:
             logs_dir = os.path.join(BASE_DIR, "logs")

@@ -267,9 +267,25 @@ class BrowserClient:
             return False
         try:
             await self.ensure_qianwen_ready()
-            url = f"https://chat2.qianwen.com/chat/{session_id}"
+            url = f"https://www.qianwen.com/chat/{session_id}"
             await self._qianwen_page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1)
+            # 等待编辑器就绪（React 组件渲染完成）
+            editor_found = False
+            for _ in range(60):
+                try:
+                    has_editor = await self._qianwen_page.evaluate("""() => {
+                        const ed = document.querySelector('[contenteditable]') || document.querySelector('textarea');
+                        return !!ed;
+                    }""")
+                    if has_editor:
+                        editor_found = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+            if not editor_found:
+                logger.warning(f"[Qianwen] editor not found after activation (session={session_id})")
+                return False
             logger.info(f"[Qianwen] activated session {session_id}")
             return True
         except Exception as e:
@@ -2333,12 +2349,14 @@ class BrowserClient:
             if not self._qianwen_page:
                 return ""
             url = self._qianwen_page.url
+            logger.debug(f"[Qwen] get_qianwen_session_id: url={url}")
             if "/chat/" in url:
                 sid = url.split("/chat/", 1)[1].split("?")[0].split("#")[0]
                 if sid:
                     return sid
             return ""
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[Qwen] get_qianwen_session_id error: {e}")
             return ""
 
     async def delete_doubao_conversations(self, conversation_ids: list):

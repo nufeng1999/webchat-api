@@ -68,8 +68,30 @@ class MinimaxAdapter(BaseAdapter):
         """仅清除 adapter 本地状态，不删除 web 对话实例。"""
         self._last_session_id = ""
 
-    async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool):
+    async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool, reuse_conversation: bool = False):
         import base64
+
+        if not is_agent:
+            last_msg = request.messages[-1] if request.messages else None
+            prompt_text = extract_text_from_content(getattr(last_msg, 'content', '')) if last_msg else ""
+            logger.debug(f"{Colors.BLUE}Minimax prepare_messages: non-agent, text_len={len(prompt_text)}{Colors.RESET}")
+            self._pending_file_items = None
+            return prompt_text, None
+
+        # For agent mode: extract file items only if NOT reusing conversation
+        if reuse_conversation:
+            logger.info(f"[Minimax] skipping file upload for reused conversation")
+            request_dict = request.model_dump()
+            last_msg = request.messages[-1] if request.messages else None
+            is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+            if is_tool_return:
+                prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+            else:
+                prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
+            self._pending_file_items = None
+            return prompt_text, None
+
+        # New conversation: extract file items
         file_items = []
         if request.messages:
             for msg in request.messages:
@@ -88,17 +110,15 @@ class MinimaxAdapter(BaseAdapter):
                                     file_items.append({"kind": "file", "data": base64.b64decode(file_data_b64), "name": fname})
         self._pending_file_items = file_items if file_items else None
 
-        if not is_agent:
-            last_msg = request.messages[-1] if request.messages else None
-            prompt_text = extract_text_from_content(getattr(last_msg, 'content', '')) if last_msg else ""
-            logger.debug(f"{Colors.BLUE}Minimax prepare_messages: non-agent, text_len={len(prompt_text)}{Colors.RESET}")
-            return prompt_text, None
-
         last_msg = request.messages[-1] if request.messages else None
         is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
         file_content = self._prepare_inline_file_content(request, is_tool_return)
 
-        prompt_text = get_exectask_prompt(self.get_adapter_name())
+        request_dict = request.model_dump()
+        if is_tool_return:
+            prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+        else:
+            prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
 
         try:
             logs_dir = os.path.join(BASE_DIR, "logs")

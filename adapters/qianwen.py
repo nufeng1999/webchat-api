@@ -63,6 +63,7 @@ class QianwenAdapter(BaseAdapter):
     def __init__(self):
         self._session_id = ""
         self._topic_id = ""
+        self._last_session_id = ""
         self._qianwen_lock = asyncio.Lock()
         self._last_model = None
         self._pending_messages: list = []
@@ -86,7 +87,7 @@ class QianwenAdapter(BaseAdapter):
     def _get_lock(self):
         return self._qianwen_lock
 
-    async def _prepare_messages(self, request, browser_client, is_agent: bool):
+    async def _prepare_messages(self, request, browser_client, is_agent: bool, reuse_conversation: bool = False):
         if not is_agent:
             file_items = self._extract_file_items(request)
             if file_items:
@@ -114,6 +115,23 @@ class QianwenAdapter(BaseAdapter):
             }]
             return last_text, None
 
+        if reuse_conversation:
+            logger.info(f"[Qianwen] skipping file upload for reused conversation")
+            request_dict = request.model_dump()
+            last_msg = request.messages[-1] if request.messages else None
+            last_role = getattr(last_msg, 'role', '') if last_msg else ''
+            if last_role == 'tool':
+                prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+            else:
+                prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
+            self._pending_messages = [{
+                "mime_type": "text/plain",
+                "content": prompt_text,
+                "meta_data": {"ori_query": prompt_text},
+                "status": "complete"
+            }]
+            return prompt_text, None
+
         last_msg = request.messages[-1] if request.messages else None
         last_role = getattr(last_msg, 'role', '') if last_msg else ''
         file_name = "request.json"
@@ -138,12 +156,12 @@ class QianwenAdapter(BaseAdapter):
             except Exception as e:
                 logger.error(f"[Qwen] upload toolreturn.json failed: {e}")
                 raise
-            prompt_text = get_exectask_prompt(self.get_adapter_name())
+            prompt_text =get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             logger.info(f"Qianwen tool return: model={request.model}, uploaded {tool_path}")
         else:
             file_name = "request.json"
-            prompt_text = get_exectask_prompt(self.get_adapter_name())
             request_dict = request.model_dump()
+            prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
             request_dict['task'] = get_webchat_task(self.get_adapter_name())
             request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
             request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
@@ -189,11 +207,13 @@ class QianwenAdapter(BaseAdapter):
 
     async def _on_session_id(self, value):
         self._session_id = value
+        self._last_session_id = value
         logger.info(f"[Qwen] session_id: {value}")
 
     async def _delete_conversation(self):
         """仅清除 adapter 本地状态，不删除 web 对话实例。"""
         self._session_id = ""
+        self._last_session_id = ""
 
     def _use_parse_error_history(self) -> bool:
         return False
@@ -202,29 +222,40 @@ class QianwenAdapter(BaseAdapter):
         return True
 
     async def _on_done_extra(self):
-        """done 后重新捕获 session_id。"""
+        """done 后重新捕获 session_id（带重试）。"""
         try:
             from browser_client import browser_client
-            sid = await browser_client.get_qianwen_session_id()
-            if sid:
-                self._session_id = sid
-                logger.info(f"[Qwen] captured session_id after done: {sid}")
-        except Exception:
-            pass
+            for attempt in range(10):
+                sid = await browser_client.get_qianwen_session_id()
+                if sid:
+                    self._session_id = sid
+                    self._last_session_id = sid
+                    logger.info(f"[Qwen] captured session_id after done: {sid}")
+                    return
+                await asyncio.sleep(0.5)
+            logger.debug(f"[Qwen] no session_id captured after done (url may not contain /chat/)")
+        except Exception as e:
+            logger.debug(f"[Qwen] _on_done_extra session_id capture error: {e}")
 
     async def _on_finally_extra(self):
-        """finally 中捕获 session_id。"""
+        """finally 中捕获 session_id（带重试）。"""
         try:
             from browser_client import browser_client
-            sid = await browser_client.get_qianwen_session_id()
-            if sid:
-                self._session_id = sid
-                logger.debug(f"[Qwen] captured session_id in finally: {sid}")
-        except Exception:
-            pass
+            for attempt in range(10):
+                sid = await browser_client.get_qianwen_session_id()
+                if sid:
+                    self._session_id = sid
+                    self._last_session_id = sid
+                    logger.debug(f"[Qwen] captured session_id in finally: {sid}")
+                    return
+                await asyncio.sleep(0.5)
+            logger.debug(f"[Qwen] no session_id captured in finally")
+        except Exception as e:
+            logger.debug(f"[Qwen] _on_finally_extra session_id capture error: {e}")
 
     async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
         self._session_id = ""
+        self._last_session_id = ""
         if request.model != self._last_model:
             from browser_client import browser_client
             model_id = self._get_model_name(request.model)
@@ -284,3 +315,4 @@ class QianwenAdapter(BaseAdapter):
         else:
             logger.debug("[Qianwen] no session to delete (session_id empty)")
         self._session_id = ""
+        self._last_session_id = ""

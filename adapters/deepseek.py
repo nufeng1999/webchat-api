@@ -61,7 +61,7 @@ class DeepseekAdapter(BaseAdapter):
         """仅清除 adapter 本地状态，不删除 web 对话实例。"""
         self._last_session_id = ""
 
-    async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool):
+    async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool, reuse_conversation: bool = False):
         """准备 DeepSeek 的请求数据。对于非 agent 请求，提取最后一条消息文本；对于 agent 请求，序列化 request 为 JSON 并保存日志。"""
         if not is_agent:
             last_msg = request.messages[-1] if request.messages else None
@@ -69,11 +69,25 @@ class DeepseekAdapter(BaseAdapter):
             logger.debug(f"{Colors.BLUE}DeepSeek prepare_messages: non-agent, text_len={len(prompt_text)}{Colors.RESET}")
             return prompt_text, None
 
+        if reuse_conversation:
+            logger.info(f"[DeepSeek] skipping file upload for reused conversation")
+            request_dict = request.model_dump()
+            last_msg = request.messages[-1] if request.messages else None
+            is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+            if is_tool_return:
+                prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+            else:
+                prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
+            return prompt_text, None
+
         last_msg = request.messages[-1] if request.messages else None
         is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
         file_content = self._prepare_inline_file_content(request, is_tool_return)
-
-        prompt_text = get_exectask_prompt(self.get_adapter_name())
+        request_dict = request.model_dump()
+        if is_tool_return:
+            prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+        else:
+            prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
 
         try:
             logs_dir = os.path.join(BASE_DIR, "logs")
@@ -135,9 +149,25 @@ class DeepseekAdapter(BaseAdapter):
         thinking_enabled = self._get_thinking_enabled(model)
         search_enabled = self._get_search_enabled(model) if model_type != "expert" else False
 
+        # Determine conversation reuse BEFORE preparing messages
+        reuse_conversation = False
+        conv_id = getattr(request, 'conversation_id', None)
+        if conv_id and conv_id != "0":
+            try:
+                activated = await browser_client.activate_deepseek_conversation(conv_id)
+                if activated:
+                    reuse_conversation = True
+                    logger.info(f"[DeepSeek] activated conversation {conv_id}, skipping file upload")
+                else:
+                    logger.warning(f"[DeepSeek] conversation activation failed: conv_id={conv_id}, will create new")
+                    request.conversation_id = "0"
+            except Exception as e:
+                logger.warning(f"[DeepSeek] conversation activation error: {e}")
+                request.conversation_id = "0"
+
         await self._deepseek_lock.acquire()
         try:
-            prompt_text, file_content = await self._prepare_messages(request, browser_client, is_agent)
+            prompt_text, file_content = await self._prepare_messages(request, browser_client, is_agent, reuse_conversation=reuse_conversation)
             is_tool_return = getattr(request.messages[-1], 'role', None) == 'tool' if (is_agent and request.messages) else False
 
             max_retries = 6

@@ -315,6 +315,26 @@ class BaseAdapter(ABC):
         return extract_text_from_content(getattr(last_msg, 'content', '')) if last_msg else ""
 
     # ═══════════════════════════════════════════════════════════════════════
+    # 公共工具方法：_get_last_message_as_json
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _get_last_message_as_json(request_dict: dict) -> str:
+        """从 request JSON dict 的 messages 中提取最后一条消息，返回 JSON 字符串。"""
+        messages = request_dict.get("messages", [])
+        if not messages:
+            return "{}"
+        return json.dumps(messages[-1], ensure_ascii=False)
+
+    @staticmethod
+    def _get_last_three_messages_as_json(request_dict: dict) -> str:
+        """从 request JSON dict 的 messages 中提取最后三条消息，返回 JSON 字符串。"""
+        messages = request_dict.get("messages", [])
+        if not messages:
+            return "[]"
+        return json.dumps(messages[-3:], ensure_ascii=False)
+
+    # ═══════════════════════════════════════════════════════════════════════
     # 公共工具方法：_generate_chat_id
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -689,7 +709,7 @@ class BaseAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def _prepare_messages(self, request, browser_client, is_agent: bool):
+    async def _prepare_messages(self, request, browser_client, is_agent: bool, reuse_conversation: bool = False):
         """返回 (prompt_text, file_content)。file_content 非 agent 时为 None。"""
         ...
 
@@ -763,7 +783,33 @@ class BaseAdapter(ABC):
         lock = self._get_lock()
         await lock.acquire()
         try:
-            prompt_text, file_content = await self._prepare_messages(request, browser_client, is_agent)
+            # Determine conversation reuse BEFORE preparing messages
+            reuse_conversation = False
+            conv_id = getattr(request, 'conversation_id', None)
+            if conv_id and conv_id != "0":
+                activate_map = {
+                    "doubao": browser_client.activate_doubao_conversation,
+                    "qianwen": browser_client.activate_qianwen_conversation,
+                    "deepseek": browser_client.activate_deepseek_conversation,
+                    "zai": browser_client.activate_zai_conversation,
+                    "mimo": browser_client.activate_mimo_conversation,
+                    "minimax": browser_client.activate_minimax_conversation,
+                    "xinghuo": browser_client.activate_xinghuo_conversation,
+                }
+                activate_fn = activate_map.get(adapter_name)
+                if activate_fn:
+                    try:
+                        activated = await activate_fn(conv_id)
+                        if activated:
+                            reuse_conversation = True
+                        else:
+                            logger.warning(f"[{adapter_name}] conversation activation failed: conv_id={conv_id}, will create new")
+                            request.conversation_id = "0"
+                    except Exception as e:
+                        logger.warning(f"[{adapter_name}] conversation activation error: {e}")
+                        request.conversation_id = "0"
+
+            prompt_text, file_content = await self._prepare_messages(request, browser_client, is_agent, reuse_conversation=reuse_conversation)
             is_tool_return = getattr(request.messages[-1], 'role', None) == 'tool' if (is_agent and request.messages) else False
             self._last_is_tool_return = is_tool_return
 
@@ -786,33 +832,11 @@ class BaseAdapter(ABC):
 
                 stream_kwargs = self._build_stream_kwargs(prompt_text, file_content, is_agent, current_prompt)
 
-                # Wsession: 激活已有对话（如果 conversation_id 存在）
-                conv_id = getattr(request, 'conversation_id', None)
-                if conv_id and conv_id != "0":
-                    from browser_client import browser_client
-                    activate_map = {
-                        "doubao": browser_client.activate_doubao_conversation,
-                        "qianwen": browser_client.activate_qianwen_conversation,
-                        "deepseek": browser_client.activate_deepseek_conversation,
-                        "zai": browser_client.activate_zai_conversation,
-                        "mimo": browser_client.activate_mimo_conversation,
-                        "minimax": browser_client.activate_minimax_conversation,
-                        "xinghuo": browser_client.activate_xinghuo_conversation,
-                    }
-                    activate_fn = activate_map.get(adapter_name)
-                    if activate_fn:
-                        activated = await activate_fn(conv_id)
-                        if activated:
-                            # 传递会话 ID 给底层，某些站点（如星火）使用
-                            if adapter_name == "xinghuo":
-                                stream_kwargs["conversation_id"] = conv_id
-                            # 标记复用对话，避免 protocol 再次导航到新对话
-                            stream_kwargs["reuse_conversation"] = True
-                            # 复用对话时，SSE 可能不返回新的 conversation_id，预置 _last_conversation_id
-                            self._last_conversation_id = conv_id
-                        else:
-                            logger.warning(f"[{adapter_name}] conversation activation failed: conv_id={conv_id}, will create new")
-                            request.conversation_id = "0"
+                if reuse_conversation:
+                    if adapter_name == "xinghuo":
+                        stream_kwargs["conversation_id"] = conv_id
+                    stream_kwargs["reuse_conversation"] = True
+                    self._last_conversation_id = conv_id
 
                 logger.info(f"[{adapter_name} Adapter] {Colors.RED}Attempt {attempt+1}/{max_retries}{Colors.RESET}")
 

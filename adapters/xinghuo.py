@@ -67,8 +67,7 @@ class XinghuoAdapter(BaseAdapter):
         """仅清除 adapter 本地状态，不删除 web 对话实例。"""
         self._last_chat_id = ""
 
-    async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool):
-        # 提取文件附件（如有）
+    async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool, reuse_conversation: bool = False):
         file_items = []
         if request.messages:
             for msg in request.messages:
@@ -95,9 +94,26 @@ class XinghuoAdapter(BaseAdapter):
 
         last_msg = request.messages[-1] if request.messages else None
         is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+
+        if reuse_conversation:
+            logger.info(f"[Xinghuo] skipping request file upload for reused conversation")
+            request_dict = request.model_dump()
+            last_msg = request.messages[-1] if request.messages else None
+            is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+            if is_tool_return:
+                prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+            else:
+                prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
+            self._pending_file_content = None
+            return prompt_text, None
+
         file_content = self._prepare_inline_file_content(request, is_tool_return)
         self._pending_file_content = file_content
-        prompt_text = get_exectask_prompt(self.get_adapter_name())
+        request_dict = request.model_dump()
+        if is_tool_return:
+            prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
+        else:
+            prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
 
         try:
             logs_dir = os.path.join(BASE_DIR, "logs")
