@@ -1841,43 +1841,50 @@ class BrowserClient:
                 }""", text)
                 await asyncio.sleep(0.5)
                 
-                # 等待发送按钮出现（最多10秒）
-                for _poll_btn in range(20):
-                    btn_exists = await self._doubao_page.evaluate("""() => {
+                # 循环检查发送按钮状态，直到可用（最多15秒）
+                send_clicked = False
+                for _poll_btn in range(30):
+                    result = await self._doubao_page.evaluate("""() => {
                         const btn = document.getElementById('flow-end-msg-send');
-                        return btn ? (btn.offsetParent !== null && !btn.disabled) : false;
+                        if (btn && btn.offsetParent !== null && !btn.disabled) {
+                            btn.click();
+                            return true;
+                        }
+                        return false;
                     }""")
-                    if btn_exists:
+                    if result:
+                        send_clicked = True
+                        logger.info("[Doubao] clicked send button (poll confirmed enabled)")
                         break
                     await asyncio.sleep(0.5)
 
-                # 先尝试点击发送按钮，失败再按 Enter（避免重复提交）
-                send_clicked = await self._doubao_page.evaluate("""() => {
-                    const btns = document.querySelectorAll('button, [role="button"], [data-testid]');
-                    for (const btn of btns) {
-                        const svg = btn.querySelector('svg');
-                        const cls = btn.className || '';
-                        const testId = btn.getAttribute('data-testid') || '';
-                        if (testId.includes('send') || testId.includes('submit') || 
-                            cls.includes('send') || cls.includes('submit') ||
-                            (btn.title && (btn.title.includes('发送') || btn.title.includes('Send')))) {
-                            if (!btn.disabled && btn.offsetParent !== null) {
-                                btn.click();
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
-                }""")
-                if send_clicked:
-                    logger.info("[Doubao] clicked send button")
-                else:
-                    logger.warning("[Doubao] send button not found, Enter key may not trigger request — retrying")
+                if not send_clicked:
+                    logger.warning("[Doubao] send button never became available, trying Enter")
                     await self._doubao_page.keyboard.press("Enter")
                     await asyncio.sleep(0.3)
-                    yield ("error", "Send button not found, Enter may not trigger request")
-                    yield ("done", "")
-                    return
+
+                # 点击发送后检查输入框是否还有内容，有则强制回车发送
+                await asyncio.sleep(0.8)
+                for _verify in range(3):
+                    still_has_text = await self._doubao_page.evaluate("""() => {
+                        const ta = document.querySelector('textarea');
+                        if (ta && ta.value && ta.value.trim().length > 0) return true;
+                        const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                        if (ce && ce.innerText && ce.innerText.trim().length > 0) return true;
+                        return false;
+                    }""")
+                    if not still_has_text:
+                        break
+                    logger.warning("[Doubao] textarea still has text after send, focusing and pressing Enter")
+                    await self._doubao_page.evaluate("""() => {
+                        const ta = document.querySelector('textarea');
+                        if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); return; }
+                        const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                        if (ce) { ce.focus(); }
+                    }""")
+                    await asyncio.sleep(0.2)
+                    await self._doubao_page.keyboard.press("Enter")
+                    await asyncio.sleep(0.8)
             # 等待 1 秒确认请求已发出
             await asyncio.sleep(3)
         except Exception as e:
