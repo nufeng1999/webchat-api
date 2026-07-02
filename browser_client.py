@@ -398,81 +398,98 @@ class BrowserClient:
             if not os.path.exists(self._doubao_user_data_dir):
                 os.makedirs(self._doubao_user_data_dir, exist_ok=True)
 
-            from playwright.async_api import async_playwright
-            self._doubao_pw = await async_playwright().start()
-            self._doubao_browser = await self._doubao_pw.chromium.launch_persistent_context(
-                user_data_dir=self._doubao_user_data_dir,
-                headless=headless,
-                channel=_browser_channel(),
-                args=_linux_safe_args() + ["--disable-blink-features=AutomationControlled"],
-                ignore_default_args=["--enable-automation"],
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 900},
-            )
-            self._doubao_page = self._doubao_browser.pages[0] if self._doubao_browser.pages else await self._doubao_browser.new_page()
-
-            # 反检测：在页面脚本运行前注入
-            await self._doubao_page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            """)
-
-            await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
-
-            logger.info("Doubao: navigating to doubao.com/chat/ ...")
-            try:
-                await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=15000)
-            except Exception:
-                logger.warning("[Doubao] initial goto timed out, trying reload...")
+            _last_exc = None
+            for _rebuild_attempt in range(3):
                 try:
-                    await self._doubao_page.reload(wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-            await asyncio.sleep(2)
+                    from playwright.async_api import async_playwright
+                    self._doubao_pw = await async_playwright().start()
+                    self._doubao_browser = await self._doubao_pw.chromium.launch_persistent_context(
+                        user_data_dir=self._doubao_user_data_dir,
+                        headless=headless,
+                        channel=_browser_channel(),
+                        args=_linux_safe_args() + ["--disable-blink-features=AutomationControlled"],
+                        ignore_default_args=["--enable-automation"],
+                        user_agent=USER_AGENT,
+                        viewport={"width": 1280, "height": 900},
+                    )
+                    self._doubao_page = self._doubao_browser.pages[0] if self._doubao_browser.pages else await self._doubao_browser.new_page()
 
-            # 检查并处理错误页（"该页面暂时不可用" -> 点击"刷新页面"）
-            try:
-                err_buttons = await self._doubao_page.evaluate("""() => {
-                    const btns = document.querySelectorAll('button');
-                    return Array.from(btns).map(b => (b.textContent || '').trim()).filter(t => t);
-                }""")
-                if len(err_buttons) >= 1 and err_buttons[0] == '刷新页面':
-                    logger.info("[Doubao] error page at init, clicking '刷新页面'...")
-                    await self._doubao_page.evaluate("document.querySelector('button').click()")
-                    await asyncio.sleep(5)
-            except Exception as e:
-                logger.debug(f"[Doubao] error page check failed: {e}")
+                    await self._doubao_page.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        window.chrome = { runtime: {} };
+                        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    """)
 
-            try:
-                await self._doubao_page.wait_for_function(
-                    "() => typeof window.bdms?.frontierSign === 'function'",
-                    timeout=30000
-                )
-                logger.info("Doubao: bdms.frontierSign SDK ready")
-            except Exception as e:
-                logger.warning(f"Doubao: bdms.frontierSign not available: {e}")
+                    await self._doubao_page.expose_function("__sse_push", self._on_doubao_push)
 
-            has_chat_ui = await self._doubao_page.evaluate("""() => {
-                const hasInput = !!document.querySelector('textarea') || !!document.querySelector('[contenteditable=true]');
-                const hasSend = !!document.getElementById('flow-end-msg-send') ||
-                                !!document.querySelector('button[data-testid*="send"]') ||
-                                !!document.querySelector('button[class*="send"]');
-                const bodyText = document.body.innerText || '';
-                const hasLoginPrompt = bodyText.includes('请先登录') || bodyText.includes('扫码登录');
-                // Check for blocking modal (Semi UI modal portal)
-                const modal = document.querySelector('.semi-modal-wrap, .semi-modal-wrap-center, .semi-portal');
-                const hasBlockingModal = !!modal;
-                const modalText = modal ? (modal.textContent || '').trim().substring(0, 100) : '';
-                return { hasInput, hasSend, hasLoginPrompt, hasBlockingModal, modalText };
-            }""") or {}
-            if has_chat_ui.get('hasBlockingModal') or (has_chat_ui.get('hasLoginPrompt') and not has_chat_ui.get('hasSend')):
-                logger.warning(f"Doubao: login/modal issue detected. hasBlockingModal={has_chat_ui.get('hasBlockingModal')}, modalText='{has_chat_ui.get('modalText')}'")
-                await self._doubao_login_recovery()
+                    logger.info("Doubao: navigating to doubao.com/chat/ ...")
+                    try:
+                        await self._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=15000)
+                    except Exception:
+                        logger.warning("[Doubao] initial goto timed out, trying reload...")
+                        try:
+                            await self._doubao_page.reload(wait_until="domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(2)
 
-            logger.info("Doubao browser ready")
-            return True
+                    try:
+                        err_buttons = await self._doubao_page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button');
+                            return Array.from(btns).map(b => (b.textContent || '').trim()).filter(t => t);
+                        }""")
+                        if len(err_buttons) >= 1 and err_buttons[0] == '刷新页面':
+                            logger.info("[Doubao] error page at init, clicking '刷新页面'...")
+                            await self._doubao_page.evaluate("document.querySelector('button').click()")
+                            await asyncio.sleep(5)
+                    except Exception as e:
+                        logger.debug(f"[Doubao] error page check failed: {e}")
+
+                    try:
+                        await self._doubao_page.wait_for_function(
+                            "() => typeof window.bdms?.frontierSign === 'function'",
+                            timeout=30000
+                        )
+                        logger.info("Doubao: bdms.frontierSign SDK ready")
+                    except Exception as e:
+                        logger.warning(f"Doubao: bdms.frontierSign not available: {e}")
+
+                    has_chat_ui = await self._doubao_page.evaluate("""() => {
+                        const hasInput = !!document.querySelector('textarea') || !!document.querySelector('[contenteditable=true]');
+                        const hasSend = !!document.getElementById('flow-end-msg-send') ||
+                                        !!document.querySelector('button[data-testid*="send"]') ||
+                                        !!document.querySelector('button[class*="send"]');
+                        const bodyText = document.body.innerText || '';
+                        const hasLoginPrompt = bodyText.includes('请先登录') || bodyText.includes('扫码登录');
+                        const modal = document.querySelector('.semi-modal-wrap, .semi-modal-wrap-center, .semi-portal');
+                        const hasBlockingModal = !!modal;
+                        const modalText = modal ? (modal.textContent || '').trim().substring(0, 100) : '';
+                        return { hasInput, hasSend, hasLoginPrompt, hasBlockingModal, modalText };
+                    }""") or {}
+                    if has_chat_ui.get('hasBlockingModal') or (has_chat_ui.get('hasLoginPrompt') and not has_chat_ui.get('hasSend')):
+                        logger.warning(f"Doubao: login/modal issue detected. hasBlockingModal={has_chat_ui.get('hasBlockingModal')}, modalText='{has_chat_ui.get('modalText')}'")
+                        await self._doubao_login_recovery()
+
+                    logger.info("Doubao browser ready")
+                    return True
+                except Exception as _rebuild_exc:
+                    _last_exc = _rebuild_exc
+                    logger.warning(f"[Doubao] rebuild attempt {_rebuild_attempt+1}/3 failed: {_rebuild_exc}")
+                    for _attr in ('_doubao_page', '_doubao_browser', '_doubao_pw'):
+                        _obj = getattr(self, _attr, None)
+                        if _obj:
+                            try:
+                                if _attr == '_doubao_pw':
+                                    await _obj.stop()
+                                else:
+                                    await _obj.close()
+                            except Exception:
+                                pass
+                            setattr(self, _attr, None)
+                    await asyncio.sleep(2)
+            if _last_exc:
+                raise _last_exc
 
     async def _doubao_login_recovery(self):
         """打开可见浏览器让用户手动登录 Doubao，使用 user_data_dir 持久化状态。"""
@@ -838,79 +855,14 @@ class BrowserClient:
             if not os.path.exists(self._qianwen_user_data_dir):
                 os.makedirs(self._qianwen_user_data_dir, exist_ok=True)
 
-            from playwright.async_api import async_playwright
-            self._qianwen_pw = await async_playwright().start()
-            self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
-                user_data_dir=self._qianwen_user_data_dir,
-                headless=headless,
-                channel=_browser_channel(),
-                args=_linux_safe_args(),
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 900},
-            )
-            self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
-            await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
-            logger.info("Qianwen: navigating to qianwen.com ...")
-            await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
-            await asyncio.sleep(3)
-
-            body_text = await self._qianwen_page.text_content("body") or ""
-            if any(kw in body_text for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
-                logger.warning("Qianwen: login required - session expired. Opening visible browser...")
+            _qwen_last_exc = None
+            for _qwen_attempt in range(3):
                 try:
-                    # 关闭当前 headless 实例
-                    if self._qianwen_page:
-                        try:
-                            await self._qianwen_page.close()
-                        except Exception:
-                            pass
-                        self._qianwen_page = None
-                    if self._qianwen_browser:
-                        try:
-                            await self._qianwen_browser.close()
-                        except Exception:
-                            pass
-                        self._qianwen_browser = None
-                    if self._qianwen_pw:
-                        try:
-                            await self._qianwen_pw.stop()
-                        except Exception:
-                            pass
-                        self._qianwen_pw = None
-
-                    pw = await async_playwright().start()
-                    login_browser = await pw.chromium.launch_persistent_context(
-                        user_data_dir=self._qianwen_user_data_dir,
-                        headless=False,
-                        channel=_browser_channel(),
-                        args=_linux_safe_args(),
-                        user_agent=USER_AGENT,
-                        viewport={"width": 1280, "height": 900},
-                    )
-                    login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
-                    await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
-                    logger.info("Qianwen: visible browser opened for manual login. Please log in...")
-
-                    while True:
-                        await asyncio.sleep(1)
-                        if not login_browser.pages:
-                            break
-                        try:
-                            body = await login_page.text_content("body") or ""
-                            if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
-                                logger.info("Qianwen: login detected")
-                                break
-                        except Exception:
-                            pass
-
-                    await login_browser.close()
-                    await pw.stop()
-
-                    # 重新创建 headless 上下文
+                    from playwright.async_api import async_playwright
                     self._qianwen_pw = await async_playwright().start()
                     self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
                         user_data_dir=self._qianwen_user_data_dir,
-                        headless=True,
+                        headless=headless,
                         channel=_browser_channel(),
                         args=_linux_safe_args(),
                         user_agent=USER_AGENT,
@@ -918,14 +870,99 @@ class BrowserClient:
                     )
                     self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
                     await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
+                    logger.info("Qianwen: navigating to qianwen.com ...")
                     await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
                     await asyncio.sleep(3)
-                except Exception as e:
-                    logger.error(f"Qianwen login recovery failed: {e}")
-                    raise
-            else:
-                logger.info("Qianwen page ready")
-            return True
+
+                    body_text = await self._qianwen_page.text_content("body") or ""
+                    if any(kw in body_text for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
+                        logger.warning("Qianwen: login required - session expired. Opening visible browser...")
+                        try:
+                            # 关闭当前 headless 实例
+                            if self._qianwen_page:
+                                try:
+                                    await self._qianwen_page.close()
+                                except Exception:
+                                    pass
+                                self._qianwen_page = None
+                            if self._qianwen_browser:
+                                try:
+                                    await self._qianwen_browser.close()
+                                except Exception:
+                                    pass
+                                self._qianwen_browser = None
+                            if self._qianwen_pw:
+                                try:
+                                    await self._qianwen_pw.stop()
+                                except Exception:
+                                    pass
+                                self._qianwen_pw = None
+
+                            pw = await async_playwright().start()
+                            login_browser = await pw.chromium.launch_persistent_context(
+                                user_data_dir=self._qianwen_user_data_dir,
+                                headless=False,
+                                channel=_browser_channel(),
+                                args=_linux_safe_args(),
+                                user_agent=USER_AGENT,
+                                viewport={"width": 1280, "height": 900},
+                            )
+                            login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
+                            await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+                            logger.info("Qianwen: visible browser opened for manual login. Please log in...")
+
+                            while True:
+                                await asyncio.sleep(1)
+                                if not login_browser.pages:
+                                    break
+                                try:
+                                    body = await login_page.text_content("body") or ""
+                                    if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
+                                        logger.info("Qianwen: login detected")
+                                        break
+                                except Exception:
+                                    pass
+
+                            await login_browser.close()
+                            await pw.stop()
+
+                            # 重新创建 headless 上下文
+                            self._qianwen_pw = await async_playwright().start()
+                            self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
+                                user_data_dir=self._qianwen_user_data_dir,
+                                headless=True,
+                                channel=_browser_channel(),
+                                args=_linux_safe_args(),
+                                user_agent=USER_AGENT,
+                                viewport={"width": 1280, "height": 900},
+                            )
+                            self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
+                            await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
+                            await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+                            await asyncio.sleep(3)
+                        except Exception as e:
+                            logger.error(f"Qianwen login recovery failed: {e}")
+                            raise
+                    else:
+                        logger.info("Qianwen page ready")
+                    return True
+                except Exception as _qwen_exc:
+                    _qwen_last_exc = _qwen_exc
+                    logger.warning(f"[Qianwen] rebuild attempt {_qwen_attempt+1}/3 failed: {_qwen_exc}")
+                    for _attr in ('_qianwen_page', '_qianwen_browser', '_qianwen_pw'):
+                        _obj = getattr(self, _attr, None)
+                        if _obj:
+                            try:
+                                if _attr == '_qianwen_pw':
+                                    await _obj.stop()
+                                else:
+                                    await _obj.close()
+                            except Exception:
+                                pass
+                            setattr(self, _attr, None)
+                    await asyncio.sleep(2)
+            if _qwen_last_exc:
+                raise _qwen_last_exc
 
     async def stream_qianwen_chat(self, messages: list, session_id: str, topic_id: str):
         """Route interception for qianwen API response + DOM typing."""
@@ -1007,15 +1044,35 @@ class BrowserClient:
                 yield ("error", "墙角数枝梅，凌寒独自开。遥知不是雪，为有暗香来。")
                 yield ("done", "")
                 return
-            # 聚焦编辑器后逐字输入（\n 用 Shift+Enter 避免提前提交）
-            for char in user_text:
-                if char == "\n":
-                    await self._qianwen_page.keyboard.press("Shift+Enter")
-                else:
-                    await self._qianwen_page.keyboard.type(char, delay=5)
+            import sys as _sys
+            if _sys.platform == "darwin":
+                _paste_mod = "Meta"
+            else:
+                _paste_mod = "Control"
+            await self._qianwen_page.keyboard.press(f"{_paste_mod}+a")
+            await self._qianwen_page.keyboard.press("Backspace")
+            pasted = False
+            try:
+                if self._qianwen_browser:
+                    try:
+                        await self._qianwen_browser.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://www.qianwen.com")
+                    except Exception:
+                        pass
+                await edit_frame.evaluate("""async (text) => {
+                    await navigator.clipboard.writeText(text);
+                }""", user_text)
+                await self._qianwen_page.keyboard.press(f"{_paste_mod}+v")
+                pasted = True
+            except Exception as paste_e:
+                logger.warning(f"[Qwen] clipboard paste failed, fallback insert_text: {paste_e}")
+                await self._qianwen_page.keyboard.insert_text(user_text)
             await asyncio.sleep(0.3)
+            await self._qianwen_page.keyboard.press("End")
+            await self._qianwen_page.keyboard.type(" ")
+            await self._qianwen_page.keyboard.press("Backspace")
+            await asyncio.sleep(0.2)
             await self._qianwen_page.keyboard.press("Enter")
-            logger.info("[Qwen] typed + Enter")
+            logger.info(f"[Qwen] {'clipboard pasted' if pasted else 'insert_text'} + Enter")
         except Exception as e:
             yield ("error", f"Keyboard: {e}")
             yield ("done", "")
@@ -1833,76 +1890,132 @@ class BrowserClient:
                         return
                     logger.info("[Doubao] reuse: textarea found, typing prompt")
                     logger.info(f"[Doubao] before typing, current page URL: {self._doubao_page.url}")
+                else:
+                    # 新对话：等待 textarea 或 contenteditable 渲染完成
+                    input_ready = False
+                    for _poll in range(20):  # 最多 20 秒
+                        input_ready = await self._doubao_page.evaluate("""() => {
+                            const ta = document.querySelector('textarea');
+                            const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                            return !!(ta || ce);
+                        }""")
+                        if input_ready:
+                            break
+                        await asyncio.sleep(1)
+                    if not input_ready:
+                        logger.warning("[Doubao] input (textarea/contenteditable) not ready after polling for new conversation")
+                        yield ("error", "欲渡黄河冰塞川，将登太行雪满山。")
+                        yield ("done", "")
+                        return
+                    logger.info("[Doubao] input element found for new conversation")
 
                 # 原有逻辑：使用 textarea
                 ok = await self._doubao_page.evaluate("""() => {
                     const ta = document.querySelector('textarea');
-                    if (!ta) return false;
-                    ta.focus();
-                    ta.click();
-                    return true;
+                    if (ta) {
+                        ta.focus();
+                        ta.click();
+                        return true;
+                    }
+                    const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                    if (ce) {
+                        ce.focus();
+                        ce.click();
+                        return true;
+                    }
+                    return false;
                 }""")
                 if not ok:
                     logger.warning("[Doubao] textarea focus failed")
                     yield ("error", "欲渡黄河冰塞川，将登太行雪满山。")
                     yield ("done", "")
                     return
-                await self._doubao_page.evaluate("""(text) => {
-                    const ta = document.querySelector('textarea');
-                    if (!ta) return;
-                    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                    nativeSetter.call(ta, text);
-                    ta.dispatchEvent(new Event('input', { bubbles: true }));
-                    ta.dispatchEvent(new Event('change', { bubbles: true }));
-                }""", text)
-                await asyncio.sleep(0.5)
-                
-                # 循环检查发送按钮状态，直到可用（最多15秒）
-                send_clicked = False
-                for _poll_btn in range(30):
-                    result = await self._doubao_page.evaluate("""() => {
-                        const btn = document.getElementById('flow-end-msg-send');
-                        if (btn && btn.offsetParent !== null && !btn.disabled) {
-                            btn.click();
-                            return true;
+                import sys as _sys
+                _mod = "Meta" if _sys.platform == "darwin" else "Control"
+                await self._doubao_page.keyboard.press(f"{_mod}+a")
+                await self._doubao_page.keyboard.press("Backspace")
+                pasted = False
+                try:
+                    if self._doubao_browser:
+                        try:
+                            await self._doubao_browser.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://www.doubao.com")
+                        except Exception:
+                            pass
+                    await self._doubao_page.evaluate("""async (text) => {
+                        await navigator.clipboard.writeText(text);
+                    }""", text)
+                    await self._doubao_page.keyboard.press(f"{_mod}+v")
+                    pasted = True
+                except Exception as paste_e:
+                    logger.warning(f"[Doubao] clipboard paste failed, fallback insert_text: {paste_e}")
+                    await self._doubao_page.keyboard.insert_text(text)
+                await asyncio.sleep(0.3)
+                await self._doubao_page.keyboard.press("End")
+                await self._doubao_page.keyboard.type(" ")
+                await self._doubao_page.keyboard.press("Backspace")
+                await asyncio.sleep(0.2)
+                await self._doubao_page.keyboard.press("Enter")
+                logger.info(f"[Doubao] {'clipboard pasted' if pasted else 'insert_text'} + Enter (initial send attempt)")
+
+                # Verification and retry loop
+                max_send_retries = 8
+                for _verify_attempt in range(max_send_retries):
+                    await asyncio.sleep(1) # Wait for UI to react after previous action
+
+                    check_result = await self._doubao_page.evaluate("""() => {
+                        const ta = document.querySelector('textarea');
+                        const hasText = (ta && ta.value && ta.value.trim().length > 0) ||
+                                        (() => {
+                                            const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                                            return ce && ce.innerText && ce.innerText.trim().length > 0;
+                                        })();
+
+                        const getSendBtn = () => {
+                            const btn = document.getElementById('flow-end-msg-send') ||
+                                       document.querySelector('button[data-testid*="send"]') ||
+                                       document.querySelector('button[class*="send"]');
+                            return btn;
+                        };
+                        const btn = getSendBtn();
+                        let sendEnabled = false;
+                        if (btn) {
+                            const isDisabled = btn.disabled === true ||
+                                               btn.getAttribute('aria-disabled') === 'true' ||
+                                               btn.classList.contains('disabled') ||
+                                               btn.getAttribute('disabled') !== null;
+                            sendEnabled = !isDisabled;
                         }
-                        return false;
-                    }""")
-                    if result:
-                        send_clicked = True
-                        logger.info("[Doubao] clicked send button (poll confirmed enabled)")
-                        break
-                    await asyncio.sleep(0.5)
+                        return { hasText, sendEnabled };
+                    }""") or {}
 
-                if not send_clicked:
-                    logger.warning("[Doubao] send button never became available, trying Enter")
-                    await self._doubao_page.keyboard.press("Enter")
-                    await asyncio.sleep(0.3)
+                    still_has_text = bool(check_result.get('hasText'))
+                    send_enabled = bool(check_result.get('sendEnabled'))
 
-                # 点击发送后检查输入框是否还有内容，有则强制回车发送
-                await asyncio.sleep(0.8)
-                for _verify in range(3):
-                    still_has_text = await self._doubao_page.evaluate("""() => {
-                        const ta = document.querySelector('textarea');
-                        if (ta && ta.value && ta.value.trim().length > 0) return true;
-                        const ce = document.querySelector('[contenteditable=true][role=textbox]');
-                        if (ce && ce.innerText && ce.innerText.trim().length > 0) return true;
-                        return false;
-                    }""")
                     if not still_has_text:
-                        break
-                    logger.warning("[Doubao] textarea still has text after send, focusing and pressing Enter")
-                    await self._doubao_page.evaluate("""() => {
-                        const ta = document.querySelector('textarea');
-                        if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); return; }
-                        const ce = document.querySelector('[contenteditable=true][role=textbox]');
-                        if (ce) { ce.focus(); }
-                    }""")
-                    await asyncio.sleep(0.2)
-                    await self._doubao_page.keyboard.press("Enter")
-                    await asyncio.sleep(0.8)
-            # 等待 1 秒确认请求已发出
-            await asyncio.sleep(3)
+                        logger.info("[Doubao] Input cleared, message sent successfully.")
+                        break # Success, input cleared
+
+                    if still_has_text and send_enabled:
+                        logger.warning(f"[Doubao] Input still has text (attempt {_verify_attempt+1}/{max_send_retries}), send button is enabled. Retrying via Playwright click.")
+                        try:
+                            # Use Playwright's click method which is more robust
+                            await self._doubao_page.click('#flow-end-msg-send, button[data-testid*="send"], button[class*="send"]', timeout=5000)
+                            logger.info("[Doubao] Playwright click on send button successful.")
+                        except Exception as click_e:
+                            logger.warning(f"[Doubao] Playwright click on send button failed: {click_e}. Falling back to Enter key for retry.")
+                            await self._doubao_page.keyboard.press("Enter")
+                        # If this was the last attempt and still_has_text is true, the error below will be logged.
+                    elif still_has_text and not send_enabled:
+                        logger.warning(f"[Doubao] Input still has text, but send button is disabled (attempt {_verify_attempt+1}/{max_send_retries}). Will recheck.")
+                else: # This 'else' block executes if the loop completes without a 'break' (i.e., all attempts failed)
+                    if still_has_text: # Last check after all retries
+                        logger.error("[Doubao] Failed to send message after multiple attempts. Input still has text and message was not sent.")
+                        yield ("error", "send timeout - message not sent")
+                        yield ("done", "")
+                        return
+
+                # Final wait before letting the stream proceed
+                await asyncio.sleep(2)
         except Exception as e:
             yield ("error", f"Keyboard: {e}")
             yield ("done", "")

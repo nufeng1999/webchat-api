@@ -489,6 +489,32 @@ class BaseAdapter(ABC):
     # 公共工具方法：_validate_done_response（验证 done 后的响应是否合法）
     # ═══════════════════════════════════════════════════════════════════════
 
+    def _extract_deepest_content(self, obj) -> Optional[str]:
+        """递归搜索对象树，返回最深且最长的非空 content 字符串。"""
+        if isinstance(obj, dict):
+            # 本层有 content 直接返回
+            if "content" in obj and isinstance(obj["content"], str) and obj["content"].strip():
+                return obj["content"]
+            # 递归子对象
+            deepest = None
+            max_len = 0
+            for v in obj.values():
+                found = self._extract_deepest_content(v)
+                if found and len(found) > max_len:
+                    deepest = found
+                    max_len = len(found)
+            return deepest
+        elif isinstance(obj, list):
+            deepest = None
+            max_len = 0
+            for item in obj:
+                found = self._extract_deepest_content(item)
+                if found and len(found) > max_len:
+                    deepest = found
+                    max_len = len(found)
+            return deepest
+        return None
+
     def _validate_done_response(
         self,
         content,
@@ -567,18 +593,12 @@ class BaseAdapter(ABC):
 
                     # tool_return 响应：内容是 JSON 字符串且不是 OpenAI chunk/tool_calls 格式
                     if is_tool_return and not is_openai_chunk and not is_tool_calls:
-                        # 尝试从 JSON 中提取 content 字段
-                        content_val = parsed.get("content")
-                        if not content_val and isinstance(parsed, dict):
-                            # 搜索嵌套字段（如 import.content、choices[0].message.content）
-                            for key, val in parsed.items():
-                                if isinstance(val, dict) and "content" in val:
-                                    content_val = val["content"]
-                                    break
+                        # 深度提取 content 字段（支持任意嵌套）
+                        content_val = self._extract_deepest_content(parsed)
                         if content_val:
                             return False, "", content_val, normalized
-                        # 没有 content 字段，返回整个 JSON 作为回复
-                        return False, "", normalized, normalized
+                        # 未提取到内容，返回 None 走后续流程
+                        return False, "", None, normalized
 
                     # 合法 JSON，finish_reason=stop 或非 agent → 直接放行，作为 content 输出
                     if finish_reason == "stop" or not is_agent:
