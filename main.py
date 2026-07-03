@@ -931,10 +931,9 @@ async def add_account(request: Request):
     new_account = {
         "name": body["name"],
         "cookie": body["cookie"],
-        "device_id": body.get("device_id", CONFIG.get('device_id', '')),
-        "web_id": body.get("web_id", CONFIG.get('web_id', '')),
-        "tea_uuid": body.get("tea_uuid", CONFIG.get('tea_uuid', '')),
-        "room_id": body.get("room_id", CONFIG.get('room_id', '')),
+        "device_id": body.get("device_id", ""),
+        "web_id": body.get("web_id", ""),
+        "tea_uuid": body.get("tea_uuid", ""),
         "fail_count": 0,
         "last_fail": None,
         "enabled": True
@@ -949,7 +948,6 @@ async def add_account(request: Request):
             "device_id": a.get("device_id", ""),
             "web_id": a.get("web_id", ""),
             "tea_uuid": a.get("tea_uuid", ""),
-            "room_id": a.get("room_id", "")
         })
     save_accounts(accounts_data)
 
@@ -966,7 +964,6 @@ async def remove_account(name: str):
             "device_id": a.get("device_id", ""),
             "web_id": a.get("web_id", ""),
             "tea_uuid": a.get("tea_uuid", ""),
-            "room_id": a.get("room_id", "")
         })
     save_accounts(accounts_data)
     return {"status": "ok", "message": f"Account '{name}' removed", "total": len(cookie_pool.accounts)}

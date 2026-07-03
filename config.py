@@ -192,11 +192,11 @@ if SIGN_METHOD == 'b2':
     try:
         from signer import PlaywrightSigner
         signer = PlaywrightSigner(
-            cookie=CONFIG.get('cookie', ''),
-            device_id=CONFIG.get('device_id', ''),
-            web_id=CONFIG.get('web_id', ''),
-            tea_uuid=CONFIG.get('tea_uuid', ''),
-            fp=CONFIG.get('fp', '')
+            cookie="",
+            device_id="",
+            web_id="",
+            tea_uuid="",
+            fp=""
         )
         logger.info("B2 Playwright signer module loaded (will initialize on startup)")
     except ImportError as e:
@@ -216,11 +216,10 @@ class CookiePool:
     def _init_pool(self):
         primary = {
             "name": "primary",
-            "cookie": CONFIG.get('cookie', ''),
-            "device_id": CONFIG.get('device_id', ''),
-            "web_id": CONFIG.get('web_id', ''),
-            "tea_uuid": CONFIG.get('tea_uuid', ''),
-            "room_id": CONFIG.get('room_id', ''),
+            "cookie": "",  # will be filled from browser profile
+            "device_id": "",
+            "web_id": "",
+            "tea_uuid": "",
             "fail_count": 0,
             "last_fail": None,
             "last_success": None,
@@ -231,10 +230,9 @@ class CookiePool:
             self.accounts.append({
                 "name": acc.get("name", "unknown"),
                 "cookie": acc.get("cookie", ""),
-                "device_id": acc.get("device_id", CONFIG.get('device_id', '')),
-                "web_id": acc.get("web_id", CONFIG.get('web_id', '')),
-                "tea_uuid": acc.get("tea_uuid", CONFIG.get('tea_uuid', '')),
-                "room_id": acc.get("room_id", CONFIG.get('room_id', '')),
+                "device_id": acc.get("device_id", ""),
+                "web_id": acc.get("web_id", ""),
+                "tea_uuid": acc.get("tea_uuid", ""),
                 "fail_count": 0,
                 "last_fail": None,
                 "last_success": None,
@@ -243,18 +241,37 @@ class CookiePool:
         logger.info(f"Cookie pool initialized: {len(self.accounts)} accounts")
 
     def get_next(self) -> dict:
-        available = [a for a in self.accounts if a["enabled"] and a["cookie"]]
+        # Get fresh cookie from browser profile
+        try:
+            from browser_client import get_doubao_cookie
+            fresh_cookie = get_doubao_cookie()
+        except Exception:
+            fresh_cookie = ''
+        # Collect enabled accounts (ignore cookie content, we'll override)
+        available = [a for a in self.accounts if a["enabled"]]
         if not available:
             logger.warning("No available accounts, re-enabling all")
             for a in self.accounts:
                 a["enabled"] = True
                 a["fail_count"] = 0
-            available = [a for a in self.accounts if a["cookie"]]
+            available = self.accounts
         if not available:
-            return self.accounts[0] if self.accounts else {}
-
+            return {}
         account = available[self.current_index % len(available)]
         self.current_index = (self.current_index + 1) % len(available)
+        # Override cookie with fresh one
+        account["cookie"] = fresh_cookie
+
+        # Enrich with profile parameters if missing
+        try:
+            from browser_client import browser_client
+            profile = browser_client.get_profile_params()
+            for key in ('device_id', 'web_id', 'tea_uuid', 'fp'):
+                if not account.get(key):
+                    account[key] = profile.get(key, '')
+        except Exception as e:
+            logger.debug(f"[CookiePool] profile enrichment failed: {e}")
+
         return account
 
     def report_fail(self, account: dict, reason: str = ""):

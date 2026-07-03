@@ -100,8 +100,8 @@ async def _get_latest_cookie_async() -> str:
     return _read_cookie_from_profile_db()
 
 
-def _get_latest_cookie_from_storage() -> str:
-    """同步获取 cookie：优先从 browser context（如果事件循环运行中），fallback 到 profile DB。"""
+def get_doubao_cookie() -> str:
+    """公开方法：同步获取 Doubao cookie（优先浏览器上下文，fallback 到 profile DB）。"""
     try:
         loop = asyncio.get_running_loop()
         if loop and not loop.is_closed():
@@ -110,6 +110,7 @@ def _get_latest_cookie_from_storage() -> str:
                 future = pool.submit(asyncio.run, _get_latest_cookie_async())
                 return future.result(timeout=5)
     except RuntimeError:
+        # 没有运行的事件循环，直接走 DB fallback
         pass
     return _read_cookie_from_profile_db()
 COMPLETION_URL_BASE = "https://www.doubao.com/chat/completion"
@@ -182,6 +183,7 @@ class BrowserClient:
         self._doubao_queues = {}
         self._doubao_user_data_dir = DOUBAO_USER_DATA_DIR
         self._visible_browser_started_at = None
+        self._profile_params = {}
 
         # Qianwen 专属
         self._qianwen_pw = None
@@ -393,6 +395,7 @@ class BrowserClient:
             page_closed = self._doubao_page is None or (hasattr(self._doubao_page, 'is_closed') and self._doubao_page.is_closed())
             context_closed = self._doubao_browser is None or (hasattr(self._doubao_browser, 'is_connected') and not self._doubao_browser.is_connected())
             if not page_closed and not context_closed and self._doubao_browser and self._doubao_browser.pages:
+                await self._refresh_profile_params()
                 return True
 
             if not os.path.exists(self._doubao_user_data_dir):
@@ -472,6 +475,7 @@ class BrowserClient:
                         await self._doubao_login_recovery()
 
                     logger.info("Doubao browser ready")
+                    await self._refresh_profile_params()
                     return True
                 except Exception as _rebuild_exc:
                     _last_exc = _rebuild_exc
@@ -490,6 +494,49 @@ class BrowserClient:
                     await asyncio.sleep(2)
             if _last_exc:
                 raise _last_exc
+
+    async def _refresh_profile_params(self):
+        """Refresh profile parameters from the current page's localStorage."""
+        if not self._doubao_page or self._doubao_page.is_closed():
+            return
+        try:
+            params = await self._doubao_page.evaluate("""() => {
+                const get = (k) => {
+                    try { return localStorage.getItem(k) || ''; } catch (e) { return ''; }
+                };
+                return {
+                    device_id: get('device_id') || (window.deviceId || ''),
+                    web_id: get('web_id') || (window.webId || ''),
+                    tea_uuid: get('tea_uuid') || (window.teaUuid || ''),
+                    fp: get('fp') || (window.fp || '')
+                };
+            }""")
+            if params.get('device_id') and params.get('web_id') and params.get('tea_uuid'):
+                self._profile_params.update(params)
+            else:
+                logger.warning(f"[Doubao] Incomplete profile params: {params}")
+        except Exception as e:
+            logger.warning(f"[Doubao] _refresh_profile_params error: {e}")
+
+    async def _ensure_and_refresh(self):
+        await self.ensure_doubao_ready(headless=True)
+        await self._refresh_profile_params()
+
+    def get_profile_params(self) -> dict:
+        """Synchronously get profile parameters, ensuring browser is ready."""
+        if self._profile_params:
+            return dict(self._profile_params)
+        try:
+            loop = asyncio.get_running_loop()
+            if loop and not loop.is_closed():
+                # Schedule the coroutine on the running loop from this thread
+                future = asyncio.run_coroutine_threadsafe(self._ensure_and_refresh(), loop)
+                future.result(timeout=120)
+            else:
+                asyncio.run(self._ensure_and_refresh())
+        except Exception as e:
+            logger.warning(f"[Doubao] get_profile_params error: {e}")
+        return dict(self._profile_params)
 
     async def _doubao_login_recovery(self):
         """打开可见浏览器让用户手动登录 Doubao，使用 user_data_dir 持久化状态。"""
@@ -1277,16 +1324,17 @@ class BrowserClient:
         """
 
         async with self._doubao_lock:
+            profile = self.get_profile_params()
             eval_task = asyncio.create_task(
                 self._doubao_page.evaluate(js, {
                     "body": body,
                     "traceId": trace_id,
                     "spanId": span_id,
                     "streamId": stream_id,
-                    "deviceId": CONFIG.get('device_id', ''),
-                    "webId": CONFIG.get('web_id', ''),
-                    "teaUuid": CONFIG.get('tea_uuid', ''),
-                    "fp": CONFIG.get('fp', ''),
+                    "deviceId": profile.get('device_id', ''),
+                    "webId": profile.get('web_id', ''),
+                    "teaUuid": profile.get('tea_uuid', ''),
+                    "fp": profile.get('fp', ''),
                 })
             )
             try:
@@ -2414,9 +2462,7 @@ class BrowserClient:
                 except Exception:
                     pass
             if not qianwen_cookie:
-                qianwen_cookie = CONFIG.get("qianwen_cookie", "")
-            if not qianwen_cookie:
-                logger.warning("[Qwen] no cookie for delete API, skip")
+                logger.warning("[Qwen] no cookie from browser context for delete API, skip")
                 return
 
             import httpx
@@ -3990,7 +4036,7 @@ class BrowserClient:
         import base64
         import binascii
         
-        cookie = _get_latest_cookie_from_storage()
+        cookie = get_doubao_cookie()
         if not cookie:
             raise RuntimeError("Cannot read cookie from doubao_profile")
 

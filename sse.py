@@ -19,7 +19,7 @@ def generate_x_flow_trace():
 def build_url_params(account: dict):
     return "&".join([
         "aid=497858",
-        f"device_id={account.get('device_id', CONFIG.get('device_id', ''))}",
+        f"device_id={account.get('device_id', '')}",
         "device_platform=web",
         "language=zh",
         "pc_version=3.17.3",
@@ -28,10 +28,10 @@ def build_url_params(account: dict):
         "region=CN",
         "samantha_web=1",
         "sys_region=CN",
-        f"tea_uuid={account.get('tea_uuid', CONFIG.get('tea_uuid', ''))}",
+        f"tea_uuid={account.get('tea_uuid', '')}",
         "use-olympus-account=1",
         "version_code=20800",
-        f"web_id={account.get('web_id', CONFIG.get('web_id', ''))}"
+        f"web_id={account.get('web_id', '')}"
     ])
 
 
@@ -40,9 +40,9 @@ def build_headers(account: dict):
         'content-type': 'application/json',
         'accept': 'text/event-stream',
         'agw-js-conv': 'str',
-        'cookie': account.get('cookie', CONFIG.get('cookie', '')),
+        'cookie': account.get('cookie', ''),
         'origin': 'https://www.doubao.com',
-        'referer': f"https://www.doubao.com/chat/{account.get('room_id', CONFIG.get('room_id', ''))}",
+        'referer': 'https://www.doubao.com/chat/',
         'user-agent': USER_AGENT,
         'x-flow-trace': generate_x_flow_trace()
     }
