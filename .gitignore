@@ -21,7 +21,6 @@ diagnose_*.*
 *.log
 .env
 
-config.json
 accounts.json
 
 logs/
