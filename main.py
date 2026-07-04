@@ -1115,10 +1115,12 @@ if __name__ == "__main__":
     CONFIG['_minimax_headless'] = not args.show_minimax if args.show_minimax else (True if _any_show else CONFIG.get('_minimax_headless', True))
     CONFIG['_xinghuo_headless'] = not args.show_xinghuo if args.show_xinghuo else (True if _any_show else CONFIG.get('_xinghuo_headless', True))
     # 浏览器通道映射：Playwright channel 参数
+    # 优先使用 config.json 中的 _browser_channel，仅在命令行显式指定时覆盖
     _browser_channel_map = {"chromium": None, "chrome": "chrome", "edge": "msedge"}
-    if args.browser is None:
-        args.browser = "edge" if sys.platform.startswith("win") else "chromium"
-    CONFIG['_browser_channel'] = _browser_channel_map.get(args.browser, "msedge" if sys.platform.startswith("win") else None)
+    if args.browser is not None:
+        CONFIG['_browser_channel'] = _browser_channel_map.get(args.browser, "msedge" if sys.platform.startswith("win") else None)
+    elif '_browser_channel' not in CONFIG:
+        CONFIG['_browser_channel'] = "msedge" if sys.platform.startswith("win") else None
     CONFIG['_keep_conversations'] = args.keep_conversations
 
     if args.login:

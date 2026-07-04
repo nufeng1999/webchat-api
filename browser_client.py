@@ -141,11 +141,13 @@ def _build_completion_url():
 
 
 def _browser_channel():
-    """获取 Playwright channel 参数。未配置时 Windows 默认 msedge，其他系统默认 None（内置 Chromium）。"""
+    """获取 Playwright channel 参数。"""
     ch = CONFIG.get("_browser_channel")
-    if ch is not None:
-        return ch
-    return "msedge" if sys.platform.startswith("win") else None
+    if ch is None:
+        return "msedge" if sys.platform.startswith("win") else None
+    # main.py 中 _browser_channel_map 将 "chromium" 映射为 None
+    _channel_map = {"chromium": None, "chrome": "chrome", "edge": "msedge"}
+    return _channel_map.get(ch, ch)
 
 
 def _linux_safe_args():
@@ -884,9 +886,11 @@ class BrowserClient:
                 pass
     async def ensure_qianwen_ready(self, headless=True):
         """确保 Qianwen 浏览器就绪，使用持久化 user_data_dir 保留登录状态。"""
+        logger.info(f"[Qwen] ensure_qianwen_ready entry: headless={headless}")
         page_closed = self._qianwen_page is None or (hasattr(self._qianwen_page, 'is_closed') and self._qianwen_page.is_closed())
         context_closed = self._qianwen_browser is None or (hasattr(self._qianwen_browser, 'is_connected') and not self._qianwen_browser.is_connected())
         if not page_closed and not context_closed and self._qianwen_browser and self._qianwen_browser.pages:
+            logger.info("[Qwen] browser/page already ready, skipping")
             return True
         if page_closed or context_closed:
             logger.info("[Qwen] browser or page closed/crashed, rebuilding...")
@@ -907,14 +911,16 @@ class BrowserClient:
                 try:
                     from playwright.async_api import async_playwright
                     self._qianwen_pw = await async_playwright().start()
+                    logger.info(f"[Qwen] launching persistent context: headless={headless}, channel=chromium, user_data_dir={self._qianwen_user_data_dir}")
                     self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
                         user_data_dir=self._qianwen_user_data_dir,
                         headless=headless,
-                        channel=_browser_channel(),
+                        channel="chromium",
                         args=_linux_safe_args(),
                         user_agent=USER_AGENT,
                         viewport={"width": 1280, "height": 900},
                     )
+                    logger.info(f"[Qwen] browser launched, pages: {len(self._qianwen_browser.pages)}")
                     self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
                     await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
                     logger.info("Qianwen: navigating to qianwen.com ...")
@@ -972,14 +978,16 @@ class BrowserClient:
                 self._qianwen_pw = None
 
             pw = await async_playwright().start()
+            logger.info(f"[Qwen] launching login context: headless=False, channel=chromium, user_data_dir={self._qianwen_user_data_dir}")
             login_browser = await pw.chromium.launch_persistent_context(
                 user_data_dir=self._qianwen_user_data_dir,
                 headless=False,
-                channel=_browser_channel(),
+                channel="chromium",
                 args=_linux_safe_args(),
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
+            logger.info(f"[Qwen] login browser launched, pages: {len(login_browser.pages)}")
             login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
             await login_page.expose_function("__sse_push", self._on_qianwen_push)
             await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
@@ -1002,6 +1010,7 @@ class BrowserClient:
 
             # 重新创建 headless 上下文
             self._qianwen_pw = await async_playwright().start()
+            logger.info(f"[Qwen] launching headless context after login: headless=True, channel=chromium, user_data_dir={self._qianwen_user_data_dir}")
             self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
                 user_data_dir=self._qianwen_user_data_dir,
                 headless=True,
@@ -1010,6 +1019,7 @@ class BrowserClient:
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 900},
             )
+            logger.info(f"[Qwen] headless browser launched after login, pages: {len(self._qianwen_browser.pages)}")
             self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
             await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
             await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
@@ -4618,17 +4628,18 @@ class BrowserClient:
         self._reset_zai_profile_crash()
 
         from playwright.async_api import async_playwright
-        logger.info("[Zai] Starting z.ai browser...")
+        logger.info(f"[Zai] Starting z.ai browser... headless={headless}, channel={_browser_channel()}")
         self._zai_pw = await async_playwright().start()
         self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
             user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
             headless=headless,
             channel=_browser_channel(),
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled", "--headless=new"],
             viewport={"width": 1280, "height": 900},
             user_agent=USER_AGENT,
             ignore_default_args=["--enable-automation"],
         )
+        logger.info(f"[Zai] browser launched, pages: {len(self._zai_browser.pages)}")
         self._zai_page = self._zai_browser.pages[0] if self._zai_browser.pages else await self._zai_browser.new_page()
 
         # 反检测 + fetch 拦截器（必须在页面脚本运行前注入）
