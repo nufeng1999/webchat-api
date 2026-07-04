@@ -121,6 +121,7 @@ class QianwenAdapter(BaseAdapter):
             last_msg = request.messages[-1] if request.messages else None
             last_role = getattr(last_msg, 'role', '') if last_msg else ''
             if last_role == 'tool':
+                logger.debug(f"------------[is_tool_return]-------------")
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             else:
                 prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)

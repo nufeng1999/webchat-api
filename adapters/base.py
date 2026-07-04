@@ -561,7 +561,7 @@ class BaseAdapter(ABC):
                     except ValueError as e:
                         logger.warning(f"{adapter_name} JSON parse failed in validate: {e}")
                         return True, f"Invalid JSON: {e}", None, cleaned
-                    return False, "", cleaned, cleaned
+                    return False, "", None, cleaned
             # suppress_text=False: chunks 已缓冲，但 full_text 仍可能含 think 标签
             cleaned = self._strip_think_tags(full_text)
             return False, "", None, cleaned

@@ -315,7 +315,7 @@ class BrowserClient:
             return False
         try:
             await self.ensure_zai_ready()
-            url = f"https://z.ai/c/{session_id}"
+            url = f"https://chat.z.ai/c/{session_id}"
             await self._zai_page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(1)
             logger.info(f"[Zai] activated session {session_id}")
@@ -922,74 +922,10 @@ class BrowserClient:
                     await asyncio.sleep(3)
 
                     body_text = await self._qianwen_page.text_content("body") or ""
+                    logger.info(f"[Qianwen] body_text[:300]: {body_text[:300]}")
                     if any(kw in body_text for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
                         logger.warning("Qianwen: login required - session expired. Opening visible browser...")
-                        try:
-                            # 关闭当前 headless 实例
-                            if self._qianwen_page:
-                                try:
-                                    await self._qianwen_page.close()
-                                except Exception:
-                                    pass
-                                self._qianwen_page = None
-                            if self._qianwen_browser:
-                                try:
-                                    await self._qianwen_browser.close()
-                                except Exception:
-                                    pass
-                                self._qianwen_browser = None
-                            if self._qianwen_pw:
-                                try:
-                                    await self._qianwen_pw.stop()
-                                except Exception:
-                                    pass
-                                self._qianwen_pw = None
-
-                            pw = await async_playwright().start()
-                            login_browser = await pw.chromium.launch_persistent_context(
-                                user_data_dir=self._qianwen_user_data_dir,
-                                headless=False,
-                                channel=_browser_channel(),
-                                args=_linux_safe_args(),
-                                user_agent=USER_AGENT,
-                                viewport={"width": 1280, "height": 900},
-                            )
-                            login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
-                            await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
-                            logger.info("Qianwen: visible browser opened for manual login. Please log in...")
-
-                            while True:
-                                await asyncio.sleep(1)
-                                if not login_browser.pages:
-                                    break
-                                try:
-                                    body = await login_page.text_content("body") or ""
-                                    if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
-                                        logger.info("Qianwen: login detected")
-                                        break
-                                except Exception:
-                                    pass
-
-                            await login_browser.close()
-                            await pw.stop()
-
-                            # 重新创建 headless 上下文
-                            self._qianwen_pw = await async_playwright().start()
-                            self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
-                                user_data_dir=self._qianwen_user_data_dir,
-                                headless=True,
-                                channel=_browser_channel(),
-                                args=_linux_safe_args(),
-                                user_agent=USER_AGENT,
-                                viewport={"width": 1280, "height": 900},
-                            )
-                            self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
-                            await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
-                            await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
-                            await asyncio.sleep(3)
-                        except Exception as e:
-                            logger.error(f"Qianwen login recovery failed: {e}")
-                            raise
+                        await self._qianwen_login_recovery()
                     else:
                         logger.info("Qianwen page ready")
                     return True
@@ -1010,6 +946,77 @@ class BrowserClient:
                     await asyncio.sleep(2)
             if _qwen_last_exc:
                 raise _qwen_last_exc
+
+    async def _qianwen_login_recovery(self):
+        """千问登录恢复：显示浏览器让用户手动登录，登录后重建 headless 实例。"""
+        from playwright.async_api import async_playwright
+        try:
+            # 关闭当前 headless 实例
+            if self._qianwen_page:
+                try:
+                    await self._qianwen_page.close()
+                except Exception:
+                    pass
+                self._qianwen_page = None
+            if self._qianwen_browser:
+                try:
+                    await self._qianwen_browser.close()
+                except Exception:
+                    pass
+                self._qianwen_browser = None
+            if self._qianwen_pw:
+                try:
+                    await self._qianwen_pw.stop()
+                except Exception:
+                    pass
+                self._qianwen_pw = None
+
+            pw = await async_playwright().start()
+            login_browser = await pw.chromium.launch_persistent_context(
+                user_data_dir=self._qianwen_user_data_dir,
+                headless=False,
+                channel=_browser_channel(),
+                args=_linux_safe_args(),
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+            )
+            login_page = login_browser.pages[0] if login_browser.pages else await login_browser.new_page()
+            await login_page.expose_function("__sse_push", self._on_qianwen_push)
+            await login_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+            logger.info("Qianwen: visible browser opened for manual login. Please log in...")
+
+            while True:
+                await asyncio.sleep(1)
+                if not login_browser.pages:
+                    break
+                try:
+                    body = await login_page.text_content("body") or ""
+                    if not any(kw in body for kw in ["扫码登录", "手机号登录", "账号登录", "登录/注册"]):
+                        logger.info("Qianwen: login detected")
+                        break
+                except Exception:
+                    pass
+
+            await login_browser.close()
+            await pw.stop()
+
+            # 重新创建 headless 上下文
+            self._qianwen_pw = await async_playwright().start()
+            self._qianwen_browser = await self._qianwen_pw.chromium.launch_persistent_context(
+                user_data_dir=self._qianwen_user_data_dir,
+                headless=True,
+                channel="chromium",
+                args=_linux_safe_args(),
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+            )
+            self._qianwen_page = self._qianwen_browser.pages[0] if self._qianwen_browser.pages else await self._qianwen_browser.new_page()
+            await self._qianwen_page.expose_function("__sse_push", self._on_qianwen_push)
+            await self._qianwen_page.goto("https://www.qianwen.com/", wait_until="load", timeout=60000)
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.error(f"Qianwen login recovery failed: {e}")
+            raise
 
     async def stream_qianwen_chat(self, messages: list, session_id: str, topic_id: str):
         """Route interception for qianwen API response + DOM typing."""
@@ -4721,7 +4728,7 @@ class BrowserClient:
 
         # 导航到 z.ai
         logger.info("[Zai] navigating to z.ai/...")
-        await self._zai_page.goto("https://z.ai/", wait_until="domcontentloaded", timeout=60000)
+        await self._zai_page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
         
         # 先处理弹窗（可能遮挡页面元素）
         await self._dismiss_zai_popups()
@@ -4939,7 +4946,7 @@ class BrowserClient:
                 }
             """)
 
-            await self._zai_page.goto("https://z.ai/", wait_until="domcontentloaded", timeout=60000)
+            await self._zai_page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
 
         # 等待用户登录（至少2分钟）
         min_wait = 120  # 最少等待时间
@@ -5113,7 +5120,7 @@ class BrowserClient:
             logger.error(f"[Zai] Failed to select model: {e}")
             return False
 
-    async def stream_zai_chat(self, prompt: str, model_type: str = "glm-4.7", thinking_enabled: bool = False, search_enabled: bool = True, inline_file_content: str | None = None, model_name: str | None = None):
+    async def stream_zai_chat(self, prompt: str, model_type: str = "glm-4.7", thinking_enabled: bool = False, search_enabled: bool = True, inline_file_content: str | None = None, model_name: str | None = None, reuse_conversation: bool = False, conversation_id: str | None = None):
         """z.ai 流式对话：先上传文件等待解析完成，再创建聊天 + SSE 流式解析。
 
         Args:
@@ -5146,8 +5153,14 @@ class BrowserClient:
 
                     if event_type == "chat:completion":
                         delta = event_data.get("delta_content", "")
-                        if delta:
-                            target_q.put_nowait(("chunk", delta))
+                        phase = event_data.get("phase", "answer")
+                        if delta and phase != "thinking":
+                            # 过滤掉 "思考过程" 前缀（z.ai 可能将思考过程和答案拼接）
+                            delta = delta.replace("思考过程", "").replace("reasoning", "").strip()
+                            if delta:
+                                target_q.put_nowait(("chunk", delta))
+                        elif not delta:
+                            pass
                     elif event_type == "chat:completion:done":
                         target_q.put_nowait(("done", ""))
                     elif event_type == "chat:completion:error":
@@ -5156,6 +5169,8 @@ class BrowserClient:
                     else:
                         if event_data.get("done"):
                             target_q.put_nowait(("done", ""))
+                        else:
+                            logger.debug(f"[Zai] SSE callback: event_type={event_type}, data={event_data}")
                 except Exception as e:
                     logger.debug(f"[Zai] sse chunk parse: {e}")
 
@@ -5261,8 +5276,8 @@ class BrowserClient:
             finally:
                 await self._zai_page.unroute("**/api/v1/files/**", handle_upload_route)
 
-        # 3. 执行文件上传（如果需要）
-        if inline_file_content:
+        # 3. 执行文件上传（如果需要） — 仅在新会话且提供文件内容时上传
+        if inline_file_content and not reuse_conversation:
             logger.info("[Zai] starting file upload...")
             upload_ok = await upload_file()
             if not upload_ok:
@@ -5352,7 +5367,7 @@ class BrowserClient:
             cur_url = self._zai_page.url
             if '/auth' in cur_url:
                 logger.warning("[Zai] Still on /auth, navigating to main page...")
-                await self._zai_page.goto("https://z.ai/", wait_until="domcontentloaded", timeout=60000)
+                await self._zai_page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
                 for _ in range(3):
                     await self._dismiss_zai_popups()
                     await asyncio.sleep(0.5)
@@ -5453,94 +5468,73 @@ class BrowserClient:
         # 6. yield session_id
         if session_id:
             yield ("session_id", session_id)
+        
 
-        # 7. 轮询 DOM 中 AI 回复区域的 textContent
-        #    z.ai 将最终回复渲染在 <p dir="auto"> 中，思考过程在独立的折叠区域中
-        logger.info("[Zai] polling DOM for response content...")
+        # 7. 从 SSE 队列消费流式响应（主路径）
+        logger.info("[Zai] consuming SSE queue for response content...")
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        total_timeout = 120  # seconds
+        sse_seen = False
 
-        # 记录发送前页面中 <p dir="auto"> 的数量，作为增长检测的基线
-        pre_p_count = 0
-        try:
-            pre_p_count = await self._zai_page.evaluate("() => document.querySelectorAll('p[dir=\"auto\"]').length")
-        except Exception:
-            pre_p_count = 0
-        logger.debug(f"[Zai] pre_p_count = {pre_p_count}")
+        while True:
+            if loop.time() - start_time > total_timeout:
+                logger.warning("[Zai] total timeout exceeded")
+                yield ("error", "z.ai response timeout")
+                yield ("done", "")
+                break
 
-        prev_text = ""
-        stable_count = 0
-
-        for _ in range(600):  # 最多 2 分钟
-            await asyncio.sleep(0.2)
             try:
-                result = await self._zai_page.evaluate("""() => {
-                    const paras = document.querySelectorAll('p[dir="auto"]');
-                    let lastAssistantText = '';
-                    if (paras.length > 0) {
-                        lastAssistantText = (paras[paras.length - 1].textContent || '').trim();
-                    }
-                    // 退一步：找最后一个有文本内容的 p
-                    if (!lastAssistantText) {
-                        const allPs = document.querySelectorAll('p');
-                        for (let i = allPs.length - 1; i >= 0; i--) {
-                            const t = (allPs[i].textContent || '').trim();
-                            if (t && t.length > 5) { lastAssistantText = t; break; }
-                        }
-                    }
-                    // 检测是否还在生成
-                    const stopBtns = document.querySelectorAll('button[aria-label*="stop"], button[aria-label*="Stop"], button[data-testid="stop"]');
-                    let isGenerating = false;
-                    for (const btn of stopBtns) {
-                        if (btn.getBoundingClientRect().width > 0) { isGenerating = true; break; }
-                    }
-                    return { text: lastAssistantText, count: paras.length, isGenerating };
-                }""")
+                q_item = await asyncio.wait_for(q.get(), timeout=2.0)
+                sse_seen = True
+                event_type, content = q_item
 
-                raw_text = result.get("text", "")
-                cur_p_count = result.get("count", 0)
-                is_generating = result.get("isGenerating", True)
-
-                # 如果 <p> 数量没有增长，且当前文本和先前获取的一样，说明没有增量
-                if cur_p_count <= pre_p_count and raw_text == prev_text:
-                    stable_count += 1
-                    if stable_count >= 2500:  # 30 秒无变化
-                        logger.warning("[Zai] DOM response timeout (no new content)")
-                        yield ("error", "念天地之悠悠，独怆然而涕下。")
+                if event_type == "chunk":
+                    if content.strip():
+                        yield ("chunk", content)
+                elif event_type == "done":
+                    logger.info("[Zai] SSE stream done")
+                    yield ("done", "")
+                    break
+                elif event_type == "error":
+                    logger.error(f"[Zai] SSE stream error: {content}")
+                    yield ("error", content)
+                    yield ("done", "")
+                    break
+                else:
+                    logger.debug(f"[Zai] SSE unexpected event type: {event_type}")
+            except asyncio.TimeoutError:
+                # If SSE never started after 30s, fallback to DOM polling as last resort
+                if not sse_seen and loop.time() - start_time > 30:
+                    logger.warning("[Zai] no SSE events after 30s, using DOM fallback")
+                    try:
+                        # Single DOM snapshot as fallback
+                        result = await self._zai_page.evaluate("""() => {
+                            const all = document.querySelectorAll('[class*="markdown-prose"]');
+                            const candidates = [];
+                            for (const el of all) {
+                                const cls = (el.className || '').toLowerCase();
+                                if (cls.includes('chat-user')) continue;
+                                const txt = (el.textContent || '').trim();
+                                if (txt.length > 0) candidates.push(txt);
+                            }
+                            return candidates.length > 0 ? candidates[0] : '';
+                        }""")
+                        if result:
+                            yield ("chunk", result)
                         yield ("done", "")
                         break
-                    continue
-
-                # 有新内容
-                if raw_text and raw_text != prev_text:
-                    if prev_text and raw_text.startswith(prev_text):
-                        new_part = raw_text[len(prev_text):]
-                        if new_part.strip():
-                            yield ("chunk", new_part)
-                    else:
-                        yield ("chunk", raw_text)
-                    prev_text = raw_text
-                    stable_count = 0
-                elif not is_generating and raw_text:
-                    stable_count += 1
-                    if stable_count >= 10:
-                        logger.info(f"[Zai] DOM response complete, len={len(raw_text)}")
+                    except Exception as e:
+                        logger.debug(f"[Zai] DOM fallback error: {e}")
+                        yield ("error", "z.ai response could not be retrieved")
                         yield ("done", "")
                         break
-                elif not raw_text:
-                    stable_count += 1
-                    if stable_count >= 150:
-                        logger.warning("[Zai] DOM response timeout (no content)")
-                        yield ("error", "万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。")
-                        yield ("done", "")
-                        break
-
-            except Exception as e:
-                logger.debug(f"[Zai] DOM poll error: {e}")
-
-        if prev_text:
-            yield ("done", "")
-
+                # otherwise keep waiting for SSE
+                continue
+        # Cleanup
         self._zai_queues.pop(stream_id, None)
         self._zai_active_stream = None
+
 
     async def get_zai_session_id(self) -> str:
         """从 z.ai 页面 URL 提取当前会话 ID。"""
@@ -5631,7 +5625,6 @@ class BrowserClient:
                 logger.warning(f"[Zai] close page error: {e}")
         self._zai_page = None
         self._zai_bridge_registered = False
-        # Clear any remaining queues
         self._zai_queues.clear()
         logger.info("[Zai] resources cleaned up")
 

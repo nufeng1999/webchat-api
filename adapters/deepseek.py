@@ -19,7 +19,6 @@ class DeepseekAdapter(BaseAdapter):
 
     def __init__(self):
         self._deepseek_lock = asyncio.Lock()
-        self._last_session_id = ""
 
     def get_adapter_name(self) -> str:
         return "deepseek"
@@ -51,7 +50,7 @@ class DeepseekAdapter(BaseAdapter):
 
     async def _delete_conversation(self):
         """仅清除 adapter 本地状态，不删除 web 对话实例。"""
-        self._last_session_id = ""
+        self._last_conversation_id = ""
 
     async def _call_stream(self, **kwargs):
         """抽象方法实现：DeepSeek 使用自定义 stream_chat，不走模板。"""
@@ -59,7 +58,7 @@ class DeepseekAdapter(BaseAdapter):
 
     async def _delete_deepseek_conversation(self):
         """仅清除 adapter 本地状态，不删除 web 对话实例。"""
-        self._last_session_id = ""
+        self._last_conversation_id = ""
 
     async def _prepare_messages(self, request: ChatCompletionRequest, browser_client, is_agent: bool, reuse_conversation: bool = False):
         """准备 DeepSeek 的请求数据。对于非 agent 请求，提取最后一条消息文本；对于 agent 请求，序列化 request 为 JSON 并保存日志。"""
@@ -75,6 +74,7 @@ class DeepseekAdapter(BaseAdapter):
             last_msg = request.messages[-1] if request.messages else None
             is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
             if is_tool_return:
+                logger.debug(f"------------[is_tool_return]-------------")
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             else:
                 prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
@@ -143,7 +143,7 @@ class DeepseekAdapter(BaseAdapter):
         chat_id = self._generate_chat_id()
         model = request.model
         is_agent = self._is_agent_request(request)
-        self._last_session_id = ""
+        self._last_conversation_id = ""
 
         model_type = self._get_model_type(model)
         thinking_enabled = self._get_thinking_enabled(model)
@@ -157,6 +157,7 @@ class DeepseekAdapter(BaseAdapter):
                 activated = await browser_client.activate_deepseek_conversation(conv_id)
                 if activated:
                     reuse_conversation = True
+                    self._last_conversation_id = conv_id
                     logger.info(f"[DeepSeek] activated conversation {conv_id}, skipping file upload")
                 else:
                     logger.warning(f"[DeepSeek] conversation activation failed: conv_id={conv_id}, will create new")
@@ -194,7 +195,7 @@ class DeepseekAdapter(BaseAdapter):
                     inline_file_content=file_content if is_agent else None,
                 ):
                     if kind == "session_id":
-                        self._last_session_id = value
+                        self._last_conversation_id = value
                         logger.info(f"[DeepSeek] session_id: {value}")
                         continue
                     processed = await self._handle_chunk_streaming(

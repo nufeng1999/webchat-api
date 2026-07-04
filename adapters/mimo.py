@@ -77,6 +77,7 @@ class MimoAdapter(BaseAdapter):
             last_msg = request.messages[-1] if request.messages else None
             is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
             if is_tool_return:
+                logger.debug(f"------------[is_tool_return]-------------")
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             else:
                 prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)

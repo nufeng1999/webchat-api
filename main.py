@@ -42,17 +42,20 @@ async def refresh_qianwen_models():
 
 
 _cleanup_task = None
-_qianwen_model_refresh_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global signer, SIGN_METHOD, _cleanup_task, _qianwen_model_refresh_task
+    global signer, SIGN_METHOD, _cleanup_task
     loop = asyncio.get_running_loop()
     _original_handler = getattr(loop, '_exception_handler', None)
 
     def _silent_playwright_errors(loop, context):
         exc = context.get('exception')
+        msg = context.get('message', '')
+        # 抑制 Playwright 连接关闭相关的异步警告
         if exc and 'Connection closed while reading from the driver' in str(exc):
+            return
+        if 'Future exception was never retrieved' in msg and 'Connection closed while reading from the driver' in msg:
             return
         if _original_handler:
             _original_handler(loop, context)
@@ -99,9 +102,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("No browsers preloaded (use _preload_xxx to enable)")
 
-    # 千问模型列表启动时异步刷新，失败则使用默认模型列表
-    global _qianwen_model_refresh_task
-    _qianwen_model_refresh_task = asyncio.create_task(refresh_qianwen_models())
+
+
 
     yield
     # Cancel background tasks first to prevent unhandled exceptions during shutdown
@@ -111,19 +113,8 @@ async def lifespan(app: FastAPI):
             await _cleanup_task
         except asyncio.CancelledError:
             pass
-    if _qianwen_model_refresh_task:
-        # If the task is already done, retrieve result to avoid "Future exception was never retrieved"
-        if _qianwen_model_refresh_task.done():
-            try:
-                _qianwen_model_refresh_task.result()
-            except Exception:
-                pass
-        else:
-            _qianwen_model_refresh_task.cancel()
-            try:
-                await _qianwen_model_refresh_task
-            except asyncio.CancelledError:
-                pass
+
+
 
     # Conversation cleanup based on config:
     # _keep_conversations: false (default) -> force clear ALL (ignore retention_days)
@@ -327,6 +318,7 @@ async def _selective_cleanup(retention_days: int):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
+    logger.debug(f"------------------[new chat_completions]------------------")
     adapter = get_adapter(request.model)
 
     # wsession 处理
@@ -340,6 +332,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
     acquired, error_msg = await request_limiter.acquire(request.model)
     if not acquired:
+        logger.debug(f"[chat_completions] not acquired ")
         return JSONResponse(
             status_code=429,
             content={"error": {"message": error_msg, "type": "request_limited_error", "code": 429}}

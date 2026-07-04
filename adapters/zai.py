@@ -1,5 +1,6 @@
 """z.ai Adapter for webchat-api"""
 import json
+import re
 import uuid
 import time
 import asyncio
@@ -81,6 +82,7 @@ class ZaiAdapter(BaseAdapter):
             last_msg = request.messages[-1] if request.messages else None
             is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
             if is_tool_return:
+                logger.debug(f"------------[is_tool_return]-------------")
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             else:
                 prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
@@ -146,7 +148,78 @@ class ZaiAdapter(BaseAdapter):
     async def _call_stream(self, **kwargs):
         from browser_client import browser_client
         async for kind, value in browser_client.stream_zai_chat(**kwargs):
-            yield kind, value
+            if kind == "chunk":
+                text = value.strip()
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                
+                if match:
+                    json_str = match.group(0)
+                    try:
+                        data = json.loads(json_str)
+                        
+                        # 已是完整的OpenAI格式：直接透传
+                        if "choices" in data and data.get("object") == "chat.completion.chunk":
+                            yield "chunk", json_str
+                            return
+                        
+                        # 需要包装的情况
+                        if data.get("object") == "chat.requests":
+                            # z.ai 完整响应格式：将 message 直接映射到 delta
+                            req_list = data.get("chat.requests", [])
+                            if req_list:
+                                req = req_list[0]
+                                message = req.get("message", {})
+                                finish_reason = req.get("finish_reason", "stop")
+                                sse_chunk = {
+                                    "id": data.get("id", ""),
+                                    "object": "chat.completion.chunk",
+                                    "created": data.get("created", 0),
+                                    "model": data.get("model", ""),
+                                    "choices": [{
+                                        "index": req.get("index", 0),
+                                        "delta": message,
+                                        "finish_reason": finish_reason
+                                    }]
+                                }
+                                yield "chunk", json.dumps(sse_chunk, ensure_ascii=False)
+                                return
+
+                        content = None
+                        tool_calls = None
+                        finish_reason = "stop"
+                        
+                        if "content" in data:
+                            # 简单内容响应
+                            content = data.get("content")
+                        elif "tool_calls" in data:
+                            # tool_calls 响应
+                            tool_calls = data.get("tool_calls")
+                            finish_reason = "tool_calls"
+                        else:
+                            # 未知格式，透传
+                            yield kind, value
+                            return
+                        
+                        # 构建标准 OpenAI SSE chunk
+                        sse_chunk = {
+                            "id": data.get("id", ""),
+                            "object": "chat.completion.chunk",
+                            "created": data.get("created", 0),
+                            "model": data.get("model", ""),
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": content, "tool_calls": tool_calls},
+                                "finish_reason": finish_reason
+                            }]
+                        }
+                        yield "chunk", json.dumps(sse_chunk, ensure_ascii=False)
+                        return
+                    except json.JSONDecodeError:
+                        pass
+
+                yield kind, value
+            else:
+                yield kind, value
 
     async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
         self._last_session_id = ""
