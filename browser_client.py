@@ -161,6 +161,171 @@ def _linux_safe_args():
     return base
 
 
+ZAI_INIT_SCRIPT = """
+// --- 反检测 & 页面增强脚本 ---
+// 在页面脚本运行前注入，确保对 Playwright 的检测有效
+
+// 1. Webdriver 反检测
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// 2. Chrome 对象扩展
+window.chrome = {
+    runtime: {},
+    loadTimes: () => ({}),
+    csi: () => ({}),
+};
+
+// 3. 语言设置
+Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+
+// 4. Plugins & MimeTypes 伪装
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbgmofphofjnbeflankc', description: '' },
+        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+    ],
+});
+Object.defineProperty(navigator, 'mimeTypes', {
+    get: () => [
+        { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: { name: 'Chrome PDF Plugin' } },
+        { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: { name: 'Chrome PDF Viewer' } }
+    ],
+});
+
+// 5. Hardware Concurrency & Device Memory
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+// 6. Touch Support (如果不需要触摸，设为0)
+Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+
+// 7. Automation 标记
+Object.defineProperty(navigator, 'automation', { get: () => false });
+
+// 8. Permissions API 覆盖
+if ('permissions' in navigator) {
+    const originalQuery = navigator.permissions.query;
+    navigator.permissions.query = async (parameters) => {
+        if (parameters.name === 'notifications') {
+            return { state: 'granted' };
+        }
+        return originalQuery.call(navigator.permissions, parameters);
+    };
+}
+
+// 9. SpeechSynthesis 覆盖
+if ('speechSynthesis' in window) {
+    const originalGetVoices = window.speechSynthesis.getVoices;
+    window.speechSynthesis.getVoices = () => {
+        return [];
+    };
+}
+
+// 10. WebGL 指纹覆盖 (简单版，模拟常见显卡信息)
+try {
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(...args) {
+        const param = args[0];
+        // UNMASKED_VENDOR_WEBGL (0x9245)
+        if (param === 0x9245) { return 'Google Inc. (AMD)'; }
+        // UNMASKED_RENDERER_WEBGL (0x9246)
+        if (param === 0x9246) { return 'ANGLE (AMD, AMD Radeon(TM) Graphics (AMD Radeon(TM) Graphics), OpenGL 4.5.0)'; }
+        return getParameter.apply(this, args);
+    };
+} catch (e) {
+    console.warn('[Zai Anti-Detection] Failed to patch WebGL:', e);
+}
+
+// --- SSE 事件缓冲区（在桥接函数注册前暂存事件）---
+window.__zai_sse_events = window.__zai_sse_events || [];
+window.__zai_sse_flushed = false;
+
+// --- fetch 拦截器 ---
+if (!window.__zai_fetch_patched) {
+    window.__zai_fetch_patched = true;
+    const origFetch = window.fetch;
+    const newFetch = async function(...args) {
+        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+        if (url.includes('/chat/completions')) {
+            try {
+                const resp = await origFetch.apply(this, args);
+                const cloned = resp.clone();
+                const reader = cloned.body.getReader();
+                const decoder = new TextDecoder();
+                (async () => {
+                    let buf = '';
+                    while (true) {
+                        const {value, done} = await reader.read();
+                        if (done) {
+                            if (window.zaiOnSseChunk) {
+                                window.zaiOnSseChunk(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
+                            } else {
+                                window.__zai_sse_events.push(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
+                            }
+                            break;
+                        }
+                        buf += decoder.decode(value, {stream: true});
+                        const lines = buf.split('\\n');
+                        buf = lines.pop() || '';
+                        for (const line of lines) {
+                            if (!line.startsWith('data:')) continue;
+                            const raw = line.slice(5).trim();
+                            if (raw === '[DONE]') {
+                                if (window.zaiOnSseChunk) {
+                                    window.zaiOnSseChunk(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
+                                } else {
+                                    window.__zai_sse_events.push(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
+                                }
+                                continue;
+                            }
+                            try {
+                                const parsed = JSON.parse(raw);
+                                const delta = parsed.choices?.[0]?.delta?.content
+                                    || parsed.data?.delta_content
+                                    || parsed.delta_content
+                                    || '';
+                                const phase = parsed.data?.phase || parsed.phase || 'answer';
+                                const done = parsed.data?.done || parsed.choices?.[0]?.finish_reason === 'stop' || false;
+                                if (delta) {
+                                    const event = JSON.stringify({type:'chat:completion',data:{delta_content:delta,phase:phase,done:false}});
+                                    if (window.zaiOnSseChunk) {
+                                        window.zaiOnSseChunk(event);
+                                    } else {
+                                        window.__zai_sse_events.push(event);
+                                    }
+                                }
+                                if (done) {
+                                    const event = JSON.stringify({type:'chat:completion:done',data:{done:true}});
+                                    if (window.zaiOnSseChunk) {
+                                        window.zaiOnSseChunk(event);
+                                    } else {
+                                        window.__zai_sse_events.push(event);
+                                    }
+                                }
+                            } catch(e) {
+                                // 解析失败通常是思考过程纯文本，忽略
+                            }
+                        }
+                    }
+                })().catch(e => console.error('[zai-sse-read]', e));
+                return resp;
+            } catch(e) {
+                console.error('[zai-fetch-intercept]', e);
+                return origFetch.apply(this, args);
+            }
+        }
+        return origFetch.apply(this, args);
+    };
+    window.fetch = newFetch;
+    // 禁止覆盖
+    try {
+        Object.defineProperty(window, 'fetch', { value: newFetch, writable: false, configurable: false });
+    } catch(e) {}
+}
+"""
+
+
 def _browser_launch_kwargs(**kwargs):
     """构建 Playwright chromium.launch_persistent_context 的参数。
     自动处理 channel 参数：如果 CONFIG 中未指定（None），则省略 channel，
@@ -4624,17 +4789,22 @@ class BrowserClient:
         if self._zai_page and not self._zai_page.is_closed():
             return
 
+        original_headless = headless  # 记录原始 headless 状态
+
         # 重置 profile 崩溃标记
         self._reset_zai_profile_crash()
 
         from playwright.async_api import async_playwright
         logger.info(f"[Zai] Starting z.ai browser... headless={headless}, channel={_browser_channel()}")
         self._zai_pw = await async_playwright().start()
+        _args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        if headless:
+            _args.append("--headless=new")
         self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
             user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
             headless=headless,
             channel=_browser_channel(),
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled", "--headless=new"],
+            args=_args,
             viewport={"width": 1280, "height": 900},
             user_agent=USER_AGENT,
             ignore_default_args=["--enable-automation"],
@@ -4643,99 +4813,7 @@ class BrowserClient:
         self._zai_page = self._zai_browser.pages[0] if self._zai_browser.pages else await self._zai_browser.new_page()
 
         # 反检测 + fetch 拦截器（必须在页面脚本运行前注入）
-        await self._zai_page.add_init_script("""
-            // 反检测
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-
-            // SSE 事件缓冲区（在桥接函数注册前暂存事件）
-            window.__zai_sse_events = window.__zai_sse_events || [];
-            window.__zai_sse_flushed = false;
-
-            // fetch 拦截器 - 必须在页面脚本运行前生效，并防止被覆盖
-            if (!window.__zai_fetch_patched) {
-                window.__zai_fetch_patched = true;
-                const origFetch = window.fetch;
-                const newFetch = async function(...args) {
-                    const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-                    if (url.includes('/chat/completions')) {
-                        try {
-                            const resp = await origFetch.apply(this, args);
-                            const cloned = resp.clone();
-                            const reader = cloned.body.getReader();
-                            const decoder = new TextDecoder();
-                            (async () => {
-                                let buf = '';
-                                while (true) {
-                                    const {value, done} = await reader.read();
-                                    if (done) {
-                                        if (window.zaiOnSseChunk) {
-                                            window.zaiOnSseChunk(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                        } else {
-                                            window.__zai_sse_events.push(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                        }
-                                        break;
-                                    }
-                                    buf += decoder.decode(value, {stream: true});
-                                    const lines = buf.split('\\n');
-                                    buf = lines.pop() || '';
-                                    for (const line of lines) {
-                                        if (!line.startsWith('data:')) continue;
-                                        const raw = line.slice(5).trim();
-                                        if (raw === '[DONE]') {
-                                            if (window.zaiOnSseChunk) {
-                                                window.zaiOnSseChunk(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                            } else {
-                                                window.__zai_sse_events.push(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                            }
-                                            continue;
-                                        }
-                                        try {
-                                            const parsed = JSON.parse(raw);
-                                            const delta = parsed.choices?.[0]?.delta?.content
-                                                || parsed.data?.delta_content
-                                                || parsed.delta_content
-                                                || '';
-                                            const phase = parsed.data?.phase || parsed.phase || 'answer';
-                                            const done = parsed.data?.done || parsed.choices?.[0]?.finish_reason === 'stop' || false;
-                                            if (delta) {
-                                                const event = JSON.stringify({type:'chat:completion',data:{delta_content:delta,phase:phase,done:false}});
-                                                if (window.zaiOnSseChunk) {
-                                                    window.zaiOnSseChunk(event);
-                                                } else {
-                                                    window.__zai_sse_events.push(event);
-                                                }
-                                            }
-                                            if (done) {
-                                                const event = JSON.stringify({type:'chat:completion:done',data:{done:true}});
-                                                if (window.zaiOnSseChunk) {
-                                                    window.zaiOnSseChunk(event);
-                                                } else {
-                                                    window.__zai_sse_events.push(event);
-                                                }
-                                            }
-                                        } catch(e) {
-                                            // 解析失败通常是思考过程纯文本，忽略
-                                        }
-                                    }
-                                }
-                            })().catch(e => console.error('[zai-sse-read]', e));
-                            return resp;
-                        } catch(e) {
-                            console.error('[zai-fetch-intercept]', e);
-                            return origFetch.apply(this, args);
-                        }
-                    }
-                    return origFetch.apply(this, args);
-                };
-                window.fetch = newFetch;
-                // 禁止覆盖
-                try {
-                    Object.defineProperty(window, 'fetch', { value: newFetch, writable: false, configurable: false });
-                } catch(e) {}
-            }
-        """)
+        await self._zai_page.add_init_script(ZAI_INIT_SCRIPT)
 
         # 导航到 z.ai
         logger.info("[Zai] navigating to z.ai/...")
@@ -4792,6 +4870,7 @@ class BrowserClient:
                 _bring_window_to_front()
                 if headless:
                     await self._zai_login_recovery()
+                    headless = False  # 更新当前 headless 状态
                 else:
                     for _ in range(72):
                         await asyncio.sleep(5)
@@ -4820,6 +4899,7 @@ class BrowserClient:
                 if '/auth' in cur_url:
                     if headless:
                         await self._zai_login_recovery()
+                        headless = False  # 更新当前 headless 状态
                     else:
                         for _ in range(72):
                             await asyncio.sleep(5)
@@ -4835,129 +4915,108 @@ class BrowserClient:
                 else:
                     logger.warning("[Zai] No token backup available")
 
-        logger.info("[Zai] z.ai browser ready")
-        await self._dismiss_zai_popups()
+        # --- 验证页检测与处理（确保最终就绪）---
+        verification_keywords = ["verification required", "please verify", "just a moment", "access denied", "challenge", "captcha", "checking your browser"]
+        max_wait_verification = 300  # seconds
+        interval = 2  # seconds
+        start_time = time.time()
+        verification_occurred = False
+
+        while True:
+            await self._dismiss_zai_popups()
+            try:
+                body_text = await self._zai_page.text_content("body") or ""
+                current_token = await self._zai_page.evaluate("localStorage.getItem('token') || ''")
+                token_valid = current_token and len(current_token) > 100
+
+                is_verification_page = any(kw in body_text.lower() for kw in verification_keywords)
+
+                if is_verification_page:
+                    verification_occurred = True
+                    logger.warning(f"[Zai] Verification page detected (headless={headless}): {body_text[:100]}...")
+                    if headless:
+                        logger.info("[Zai] Headless mode: calling login recovery for manual verification.")
+                        await self._zai_login_recovery()
+                        headless = False  # now non-headless
+                    else:
+                        logger.info("[Zai] waiting for verification...")
+                elif token_valid:
+                    # 无验证页且 token 有效
+                    if verification_occurred and original_headless and not headless:
+                        # 之前发生过验证，且原始请求是 headless，且当前是非 headless 模式，需要重建 headless 浏览器
+                        logger.info("[Zai] Verification cleared. Rebuilding headless browser...")
+                        await self._rebuild_headless_after_verification()
+                        headless = True  # 已重建为 headless 模式
+                        # 继续循环，确保重建后的 headless 浏览器状态正常
+                        continue
+                    else:
+                        # 无需重建，直接成功
+                        break
+                else:
+                    # 无验证页但 token 仍然无效，继续等待或处理（例如可能正在加载中）
+                    logger.debug("[Zai] No verification page, but token not valid yet. Waiting...")
+
+                # 检查超时
+                if time.time() - start_time > max_wait_verification:
+                    if not token_valid:
+                        raise TimeoutError(f"[Zai] Timeout after {max_wait_verification}s: Token not valid after verification attempts.")
+                    elif is_verification_page:
+                        raise TimeoutError(f"[Zai] Timeout after {max_wait_verification}s: Verification page persisted.")
+                    else:
+                        break  # token valid and no verification, but some logic path still hits here
+            except Exception as e:
+                logger.error(f"[Zai] Error during verification check: {e}")
+                if not token_valid:  # 如果没有 token，认为是致命错误
+                    raise
+            await asyncio.sleep(interval)
+
+        # 确保最终 token 有效
+        final_token = await self._zai_page.evaluate("localStorage.getItem('token') || ''")
+        if not final_token or len(final_token) <= 100:
+            raise Exception("[Zai] Failed to obtain valid token after all attempts.")
+
+        await self._dismiss_zai_popups()  # 最终再处理一次弹窗，确保页面干净
+        logger.info("[Zai] z.ai browser ready and verified.")
+        # 函数结束，隐式返回 None
 
     async def _zai_login_recovery(self):
-        """z.ai 登录恢复：显示浏览器让用户手动登录，登录后直接复用浏览器实例（不关闭重开）。"""
+        """z.ai 登录恢复：显示浏览器让用户手动登录。
+        此函数会强制关闭当前浏览器，并以非 headless 模式重新启动，以便用户进行手动操作。
+        """
         logger.warning("[Zai] Login required, showing browser for manual login...")
 
-        if self._zai_browser and self._zai_page and not self._zai_page.is_closed():
-            # 确保窗口在前台（Win32 API）
-            _bring_window_to_front()
-        else:
-            from playwright.async_api import async_playwright
-            if self._zai_browser:
-                try:
-                    await self._zai_browser.close()
-                except Exception:
-                    pass
-            self._zai_pw = await async_playwright().start()
-            self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
-                user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
-                headless=False,
-                channel=_browser_channel(),
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
-                viewport={"width": 1280, "height": 900},
-                user_agent=USER_AGENT,
-                ignore_default_args=["--enable-automation"],
-            )
-            self._zai_page = self._zai_browser.pages[0] if self._zai_browser.pages else await self._zai_browser.new_page()
+        # 强制关闭现有浏览器实例（包括 headless）
+        if self._zai_browser:
+            try:
+                logger.info("[Zai] Closing existing browser for non-headless restart.")
+                await self._zai_browser.close()
+            except Exception as e:
+                logger.warning(f"[Zai] Error closing existing browser: {e}")
+            self._zai_browser = None
+            self._zai_page = None
+            self._zai_pw = None
 
-            await self._zai_page.add_init_script("""
-                // 反检测
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+        from playwright.async_api import async_playwright
+        logger.info(f"[Zai] Launching non-headless browser for recovery...")
+        self._zai_pw = await async_playwright().start()
+        self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
+            user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
+            headless=False,  # 强制非 headless
+            channel=_browser_channel(),
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 900},
+            user_agent=USER_AGENT,
+            ignore_default_args=["--enable-automation"],
+        )
+        self._zai_page = self._zai_browser.pages[0] if self._zai_browser.pages else await self._zai_browser.new_page()
 
-                // SSE 事件缓冲区（在桥接函数注册前暂存事件）
-                window.__zai_sse_events = window.__zai_sse_events || [];
-                window.__zai_sse_flushed = false;
+        # 注入反检测脚本
+        await self._zai_page.add_init_script(ZAI_INIT_SCRIPT)
 
-                // fetch 拦截器 - 必须在页面脚本运行前生效，并防止被覆盖
-                if (!window.__zai_fetch_patched) {
-                    window.__zai_fetch_patched = true;
-                    const origFetch = window.fetch;
-                    const newFetch = async function(...args) {
-                        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-                        if (url.includes('/chat/completions')) {
-                            try {
-                                const resp = await origFetch.apply(this, args);
-                                const cloned = resp.clone();
-                                const reader = cloned.body.getReader();
-                                const decoder = new TextDecoder();
-                                (async () => {
-                                    let buf = '';
-                                    while (true) {
-                                        const {value, done} = await reader.read();
-                                        if (done) {
-                                            if (window.zaiOnSseChunk) {
-                                                window.zaiOnSseChunk(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                            } else {
-                                                window.__zai_sse_events.push(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                            }
-                                            break;
-                                        }
-                                        buf += decoder.decode(value, {stream: true});
-                                        const lines = buf.split('\\n');
-                                        buf = lines.pop() || '';
-                                        for (const line of lines) {
-                                            if (!line.startsWith('data:')) continue;
-                                            const raw = line.slice(5).trim();
-                                            if (raw === '[DONE]') {
-                                                if (window.zaiOnSseChunk) {
-                                                    window.zaiOnSseChunk(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                                } else {
-                                                    window.__zai_sse_events.push(JSON.stringify({type:'chat:completion:done',data:{done:true}}));
-                                                }
-                                                continue;
-                                            }
-                                            try {
-                                                const parsed = JSON.parse(raw);
-                                                const delta = parsed.choices?.[0]?.delta?.content
-                                                    || parsed.data?.delta_content
-                                                    || parsed.delta_content
-                                                    || '';
-                                                const phase = parsed.data?.phase || parsed.phase || 'answer';
-                                                const done = parsed.data?.done || parsed.choices?.[0]?.finish_reason === 'stop' || false;
-                                                if (delta) {
-                                                    const event = JSON.stringify({type:'chat:completion',data:{delta_content:delta,phase:phase,done:false}});
-                                                    if (window.zaiOnSseChunk) {
-                                                        window.zaiOnSseChunk(event);
-                                                    } else {
-                                                        window.__zai_sse_events.push(event);
-                                                    }
-                                                }
-                                                if (done) {
-                                                    const event = JSON.stringify({type:'chat:completion:done',data:{done:true}});
-                                                    if (window.zaiOnSseChunk) {
-                                                        window.zaiOnSseChunk(event);
-                                                    } else {
-                                                        window.__zai_sse_events.push(event);
-                                                    }
-                                                }
-                                            } catch(e) {
-                                                // 解析失败通常是思考过程纯文本，忽略
-                                            }
-                                        }
-                                    }
-                                })().catch(e => console.error('[zai-sse-read]', e));
-                                return resp;
-                            } catch(e) {
-                                console.error('[zai-fetch-intercept]', e);
-                                return origFetch.apply(this, args);
-                            }
-                        }
-                        return origFetch.apply(this, args);
-                    };
-                    window.fetch = newFetch;
-                    try {
-                        Object.defineProperty(window, 'fetch', { value: newFetch, writable: false, configurable: false });
-                    } catch(e) {}
-                }
-            """)
-
-            await self._zai_page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
+        # 导航到 z.ai
+        logger.info("[Zai] navigating to z.ai/ for recovery...")
+        await self._zai_page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
+        await self._dismiss_zai_popups()
 
         # 等待用户登录（至少2分钟）
         min_wait = 120  # 最少等待时间
@@ -4965,7 +5024,6 @@ class BrowserClient:
         for _ in range(72):  # 最多6分钟
             await asyncio.sleep(5)
             waited += 5
-            # 持续处理弹窗
             await self._dismiss_zai_popups()
             textarea = await self._zai_page.evaluate("!!document.querySelector('textarea')")
             token_len = await self._zai_page.evaluate("(localStorage.getItem('token') || '').length")
@@ -4985,9 +5043,61 @@ class BrowserClient:
             if waited >= min_wait and waited % 30 == 0:
                 logger.info(f"[Zai] still waiting for login... ({waited}s elapsed)")
         else:
-            logger.warning(f"[Zai] Login timed out after {waited}s")
+            logger.warning(f"[Zai] Login timed out after {waited}s during recovery.")
 
-        # 直接复用已登录的浏览器实例，不再关闭重开
+    async def _rebuild_headless_after_verification(self):
+        """在手动验证完成后，重建 headless 浏览器实例。"""
+        logger.info("[Zai] _rebuild_headless_after_verification: Closing non-headless browser...")
+        if self._zai_browser:
+            try:
+                await self._zai_browser.close()
+            except Exception as e:
+                logger.warning(f"[Zai] Error closing browser during headless rebuild: {e}")
+            self._zai_browser = None
+            self._zai_page = None
+            self._zai_pw = None
+
+        from playwright.async_api import async_playwright
+        logger.info("[Zai] _rebuild_headless_after_verification: Launching new headless browser...")
+        self._zai_pw = await async_playwright().start()
+        _args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        _args.append("--headless=new")  # 确保是 headless
+        self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
+            user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
+            headless=True,  # 强制 headless
+            channel=_browser_channel(),
+            args=_args,
+            viewport={"width": 1280, "height": 900},
+            user_agent=USER_AGENT,
+            ignore_default_args=["--enable-automation"],
+        )
+        self._zai_page = self._zai_browser.pages[0] if self._zai_browser.pages else await self._zai_browser.new_page()
+
+        await self._zai_page.add_init_script(ZAI_INIT_SCRIPT)
+        logger.info("[Zai] _rebuild_headless_after_verification: Navigating to z.ai/...")
+        await self._zai_page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
+        await self._dismiss_zai_popups()
+
+        # 验证 token 是否仍然有效（应该已在 profile 中）
+        token = await self._zai_page.evaluate("localStorage.getItem('token') || ''")
+        if token and len(token) > 100:
+            self._save_zai_token(token)
+            logger.info(f"[Zai] Token found after headless rebuild ({len(token)} chars).")
+        else:
+            logger.warning("[Zai] Token NOT found after headless rebuild. Trying backup...")
+            backup_token = self._load_zai_token_backup()
+            if backup_token:
+                await self._zai_page.evaluate("(token) => { localStorage.setItem('token', token); }", backup_token)
+                await self._zai_page.reload(wait_until="domcontentloaded", timeout=60000)
+                await self._dismiss_zai_popups()
+                final_token = await self._zai_page.evaluate("localStorage.getItem('token') || ''")
+                if final_token and len(final_token) > 100:
+                    self._save_zai_token(final_token)
+                    logger.info(f"[Zai] Token restored from backup after headless rebuild ({len(final_token)} chars).")
+                else:
+                    logger.error("[Zai] Failed to restore token from backup after headless rebuild.")
+            else:
+                logger.error("[Zai] No token found or restored after headless rebuild.")
 
     async def fetch_zai_models(self) -> list[dict]:
         """从 Zai 页面模型选择器中获取可用模型列表。"""
