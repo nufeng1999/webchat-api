@@ -19,6 +19,7 @@ _MODEL_ADAPTER_MAP: dict[str, str] = {
     "doubao-": "doubao",
     "qianwen-": "qianwen",
     "deepseek-": "deepseek",
+    "deepseek": "deepseek",
     "zai-": "zai",
     "mimo-": "mimo",
     "minimax-": "minimax",

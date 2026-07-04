@@ -113,8 +113,25 @@ class DoubaoAdapter(BaseAdapter):
         """仅清除 adapter 本地状态，不删除 web 对话实例。"""
         self._last_conversation_id = ""
 
+    async def _refresh_doubao_page_after_rate_limit(self):
+        """限流等待后刷新豆包页面，确保重试时页面状态正确"""
+        try:
+            from browser_client import browser_client
+            bc = browser_client
+            if bc._doubao_page is None or bc._doubao_page.is_closed():
+                logger.info("[Doubao] page is closed, skipping refresh")
+                return False
+            logger.info("[Doubao] refreshing page after rate limit wait...")
+            await bc._doubao_page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            logger.info("[Doubao] page refreshed, ready for retry")
+            return True
+        except Exception as e:
+            logger.warning(f"[Doubao] failed to refresh page: {e}")
+            return False
+
     async def _handle_rate_limit(self, attempt: int, max_retries: int, error_msg: str = None):
-        """处理限流：前6次临时限流静默等待15秒重试，6次后显示浏览器让用户处理5分钟，然后继续重试。返回 True 表示已处理可继续重试。"""
+        """处理限流：前6次临时限流静默等待15秒+刷新页面后重试，6次后显示浏览器让用户处理5分钟+刷新页面，然后继续重试。返回 True 表示已处理可继续重试。"""
         needs_verification = False
         if error_msg:
             try:
@@ -157,14 +174,16 @@ class DoubaoAdapter(BaseAdapter):
                 await browser_client.hide_doubao_browser()
             except Exception as e:
                 logger.warning(f"[Doubao] failed to hide visible browser: {e}")
+            await self._refresh_doubao_page_after_rate_limit()
             logger.info(f"[Doubao] resuming after rate limit handling, retry {attempt+2}/{max_retries}")
             return True
         
         retry_seconds = CONFIG.get('_rate_limit_retry_seconds', 15)
         
         if attempt < max_retries - 1:
-            logger.info(f"[Doubao] temporary rate limit (no verify), waiting {retry_seconds}s then retrying... (attempt {attempt+1}/{max_retries})")
+            logger.info(f"[Doubao] temporary rate limit (no verify), waiting {retry_seconds}s then refreshing page... (attempt {attempt+1}/{max_retries})")
             await asyncio.sleep(retry_seconds)
+            await self._refresh_doubao_page_after_rate_limit()
             logger.info(f"[Doubao] resuming after temporary rate limit, retry {attempt+2}/{max_retries}")
             return True
         else:
@@ -178,6 +197,7 @@ class DoubaoAdapter(BaseAdapter):
             logger.info(f"[Doubao] giving user {wait_seconds} seconds to handle the rate limit/captcha in visible browser...")
             visible_start = browser_client._visible_browser_started_at
             min_wait = get_rate_limit_wait_seconds()
+            user_closed_browser = False
             for sec in range(0, min_wait, 10):
                 await asyncio.sleep(10)
                 try:
@@ -189,15 +209,21 @@ class DoubaoAdapter(BaseAdapter):
                         continue
                     if not page_alive:
                         logger.info(f"[Doubao] browser closed by user after {int(elapsed)}s, stopping wait")
+                        user_closed_browser = True
                         break
                 except Exception:
                     logger.info(f"[Doubao] browser check failed after {sec+10}s, assuming closed")
+                    user_closed_browser = True
                     break
-            try:
-                from browser_client import browser_client
-                await browser_client.hide_doubao_browser()
-            except Exception as e:
-                logger.warning(f"[Doubao] failed to hide visible browser: {e}")
+            
+            if not user_closed_browser:
+                try:
+                    from browser_client import browser_client
+                    await browser_client.hide_doubao_browser()
+                except Exception as e:
+                    logger.warning(f"[Doubao] failed to hide visible browser: {e}")
+            
+            await self._refresh_doubao_page_after_rate_limit()
             logger.info(f"[Doubao] user handled rate limit, resuming request retry...")
             return True
 
