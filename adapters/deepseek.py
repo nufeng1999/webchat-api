@@ -215,7 +215,22 @@ class DeepseekAdapter(BaseAdapter):
                         logger.debug(f"DeepSeek done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview=\n{full_text[:2000]!r}")
                         try:
                             content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls = self._parse_response(full_text)
-                            logger.info(f"DeepSeek done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}")
+                            if tool_calls:
+                                logger.info(f"DeepSeek done: content={content!r}, tool_calls count={len(tool_calls)}, finish_reason={finish_reason!r}")
+                                for i, tc in enumerate(tool_calls):
+                                    if isinstance(tc, dict):
+                                        fn = tc.get("function")
+                                        fn_type = type(fn).__name__ if fn else "MISSING"
+                                        args_preview = ""
+                                        if isinstance(fn, dict):
+                                            args = fn.get("arguments", "")
+                                            if isinstance(args, str):
+                                                args_preview = args[:100]
+                                        logger.debug(f"DeepSeek tc[{i}]: id={tc.get('id','')} name={fn.get('name','') if isinstance(fn, dict) else '?'} fn_type={fn_type} args_preview={args_preview}")
+                                    else:
+                                        logger.warning(f"DeepSeek tc[{i}] 不是 dict: {type(tc).__name__}")
+                            else:
+                                logger.info(f"DeepSeek done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}")
 
                             should_retry, err_msg, tool_return_content, full_text = self._validate_done_response(
                                 content, tool_calls, finish_reason,

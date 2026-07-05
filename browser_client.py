@@ -6472,30 +6472,45 @@ class BrowserClient:
 
     async def close(self):
         """关闭所有浏览器。"""
-        for attr in ['_doubao_browser', '_qianwen_browser', '_deepseek_browser', '_zai_browser', '_mimo_browser', '_minimax_browser', '_xinghuo_browser']:
-            browser = getattr(self, attr, None)
-            if browser:
-                try:
-                    await browser.close()
-                except:
-                    pass
-        for attr in ['_pw', '_doubao_pw', '_qianwen_pw', '_deepseek_pw', '_zai_pw', '_mimo_pw', '_minimax_pw', '_xinghuo_pw']:
-            pw = getattr(self, attr, None)
-            if pw:
-                try:
-                    await pw.stop()
-                except:
-                    pass
-        
-        # 取消所有待处理的页面操作，避免 TargetClosedError
+        # 先关闭页面，再关闭浏览器上下文，最后停止 Playwright，避免 driver 已断开后仍访问 page。
         for attr in ['_doubao_page', '_qianwen_page', '_deepseek_page', '_zai_page', '_mimo_page', '_minimax_page', '_xinghuo_page']:
             page = getattr(self, attr, None)
             if page:
                 try:
                     if not page.is_closed():
                         await page.close()
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing page {attr}: {e}")
+                setattr(self, attr, None)
+
+        for attr in ['_doubao_browser', '_qianwen_browser', '_deepseek_browser', '_zai_browser', '_mimo_browser', '_minimax_browser', '_xinghuo_browser']:
+            browser = getattr(self, attr, None)
+            if browser:
+                try:
+                    await browser.close()
+                except Exception as e:
+                    logger.debug(f"Error closing browser {attr}: {e}")
+                setattr(self, attr, None)
+
+        for attr in ['_pw', '_doubao_pw', '_qianwen_pw', '_deepseek_pw', '_zai_pw', '_mimo_pw', '_minimax_pw', '_xinghuo_pw']:
+            pw = getattr(self, attr, None)
+            if pw:
+                try:
+                    await pw.stop()
+                except Exception as e:
+                    logger.debug(f"Error stopping Playwright {attr}: {e}")
+                setattr(self, attr, None)
+
+        if hasattr(self, '_zai_queues') and self._zai_queues:
+            for stream_id in list(self._zai_queues.keys()):
+                q = self._zai_queues.pop(stream_id, None)
+                if q:
+                    try:
+                        await q.put(("done", ""))
+                    except Exception:
+                        pass
+        if hasattr(self, '_zai_active_stream'):
+            self._zai_active_stream = None
 
 
     # ═══════════════════════════════════════════════════════════════════════

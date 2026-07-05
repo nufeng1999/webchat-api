@@ -112,14 +112,206 @@ class BaseAdapter(ABC):
         return True, ""
 
     # ═══════════════════════════════════════════════════════════════════════
+    # 数据净化：统一规范化 tool_calls 结构
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _sanitize_tool_calls(self, tool_calls: list) -> list:
+        """净化 tool_calls 结构，保证每个 item 为 dict, function 为 dict, arguments 为 JSON 字符串。"""
+        adapter_name = self.get_adapter_name()
+        if not isinstance(tool_calls, list):
+            logger.warning(f"{adapter_name} tool_calls 不是 list，类型: {type(tool_calls)}")
+            return []
+
+        sanitized = []
+        for i, tc in enumerate(tool_calls):
+            if not isinstance(tc, dict):
+                logger.warning(f"{adapter_name} tool_calls[{i}] 不是 dict: {type(tc)}")
+                continue
+
+            # 确保 function 存在且为 dict，否则重构
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                # 尝试恢复：如果 function 是字符串且可能包含 JSON，尝试解析
+                if isinstance(fn, str) and fn.strip().startswith("{"):
+                    try:
+                        parsed_fn = json.loads(fn)
+                        if isinstance(parsed_fn, dict):
+                            fn = parsed_fn
+                        else:
+                            fn = {}
+                    except Exception:
+                        fn = {}
+                else:
+                    fn = {}
+                tc = dict(tc)  # 不要修改原对象
+                tc["function"] = fn
+
+            # 确保 arguments 为字符串（且是合法 JSON）
+            args_val = fn.get("arguments")
+            if not isinstance(args_val, str):
+                # 尝试序列化
+                try:
+                    if isinstance(args_val, (dict, list)):
+                        tc["function"] = dict(fn)
+                        tc["function"]["arguments"] = json.dumps(args_val, ensure_ascii=False)
+                    else:
+                        tc["function"] = dict(fn)
+                        tc["function"]["arguments"] = "{}"
+                except Exception:
+                    tc["function"] = dict(fn)
+                    tc["function"]["arguments"] = "{}"
+            else:
+                # 清理 arguments 中的脏数据：可能混入的 &quot; 和字段提升问题
+                args_str = args_val.strip()
+                if args_str.startswith("{") and args_str.endswith("}"):
+                    # 尝试解析验证，不通过则保留原字符串（后续会被 validate 捕获）
+                    try:
+                        parsed_args = json.loads(args_str)
+                        # 重新序列化确保规范转义
+                        tc["function"]["arguments"] = json.dumps(parsed_args, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        # 不修改，留给 validate 处理
+                        pass
+
+            # 将意外提升到顶层的键迁移回 arguments
+            extra_keys = [k for k in tc.keys() if k not in ("id", "type", "function")]
+            if extra_keys:
+                # 初始化 arguments 对象以便插入
+                if "arguments" not in tc["function"] or not isinstance(tc["function"]["arguments"], str):
+                    tc["function"]["arguments"] = "{}"
+                try:
+                    args_obj = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    args_obj = {}
+                for k in extra_keys:
+                    val = tc.pop(k)
+                    # 清理像 "quot;xxx" 这样的垃圾键
+                    if k.startswith("quot;") or k.startswith("\\quot;") or k.strip().startswith("&quot;"):
+                        continue
+                    if k not in args_obj:
+                        args_obj[k] = val
+                tc["function"]["arguments"] = json.dumps(args_obj, ensure_ascii=False)
+
+            sanitized.append(tc)
+
+        return sanitized
+
+    def _extract_message_content(self, obj: dict) -> Optional[str]:
+        """从 message-like 结构中提取 content。"""
+        if not isinstance(obj, dict):
+            return None
+        
+        # 常见 OpenAI 格式
+        if "choices" in obj and isinstance(obj["choices"], list) and obj["choices"]:
+            choice = obj["choices"][0]
+            if isinstance(choice, dict):
+                msg = choice.get("message") or choice.get("delta")
+                if isinstance(msg, dict):
+                    content = msg.get("content")
+                    if isinstance(content, str) and content:
+                        return content
+        
+        # 非标准格式：直接在顶层或 'message'/'requests'/'response' 等键下找
+        msg = obj.get("message") or obj.get("requests") or obj.get("response")
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                return content
+        elif isinstance(msg, list) and msg: # requests 可能是 list
+            for item in msg:
+                if isinstance(item, dict):
+                    content = item.get("content")
+                    if isinstance(content, str) and content:
+                        return content
+                    # 尝试进一步嵌套的 message
+                    inner_msg = item.get("message")
+                    if isinstance(inner_msg, dict):
+                        inner_content = inner_msg.get("content")
+                        if isinstance(inner_content, str) and inner_content:
+                            return inner_content
+
+        # 尝试直接从顶层对象中提取 "content"
+        content = obj.get("content")
+        if isinstance(content, str) and content:
+            return content
+
+        return None
+
+    def _extract_nonstandard_parsed(self, obj: dict) -> tuple:
+        """从非标准 OpenAI 格式中提取 (content, tool_calls, finish_reason)。
+        
+        支持以下变体：
+        - {"requests": [{"message": {"content": "...", "tool_calls": [...]}, "finish_reason": "..."}]}
+        - {"message": {"content": "...", "tool_calls": [...]}, "finish_reason": "..."}
+        - {"content": "...", "tool_calls": [...], "finish_reason": "..."}
+        """
+        if not isinstance(obj, dict):
+            return None, None, None
+
+        # 1. 顶层有 "requests" 数组（类似 choices）
+        if "requests" in obj and isinstance(obj["requests"], list) and obj["requests"]:
+            req0 = obj["requests"][0]
+            if isinstance(req0, dict):
+                msg = req0.get("message") or req0.get("delta") or {}
+                if isinstance(msg, dict):
+                    content = msg.get("content") or None
+                    if content == "":
+                        content = None
+                    tool_calls = msg.get("tool_calls")
+                    if not tool_calls:
+                        tool_calls = None
+                    else:
+                        tool_calls = self._sanitize_tool_calls(tool_calls)
+                    finish_reason = req0.get("finish_reason") or obj.get("finish_reason")
+                    return content, tool_calls, finish_reason
+
+        # 2. 顶层有 "message" dict
+        if "message" in obj and isinstance(obj["message"], dict):
+            msg = obj["message"]
+            content = msg.get("content") or None
+            if content == "":
+                content = None
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                tool_calls = None
+            else:
+                tool_calls = self._sanitize_tool_calls(tool_calls)
+            finish_reason = obj.get("finish_reason")
+            if content is not None or tool_calls is not None:
+                return content, tool_calls, finish_reason
+
+        # 3. 顶层有 "content" 或 "tool_calls"
+        content = obj.get("content")
+        if content == "":
+            content = None
+        tool_calls = obj.get("tool_calls")
+        if not tool_calls:
+            tool_calls = None
+        else:
+            tool_calls = self._sanitize_tool_calls(tool_calls)
+        if content is not None or tool_calls is not None:
+            return content, tool_calls, obj.get("finish_reason")
+
+        return None, None, None
+
+    # ═══════════════════════════════════════════════════════════════════════
     # 公共工具方法：_validate_tool_calls_arguments
     # ═══════════════════════════════════════════════════════════════════════
 
     def _validate_tool_calls_arguments(self, tool_calls: list) -> tuple[bool, str]:
         """验证 tool_calls 中每个 function 的 arguments 是否为合法 JSON。"""
         adapter_name = self.get_adapter_name()
-        for tc in tool_calls:
-            args_val = tc.get("function", {}).get("arguments", "")
+        for i, tc in enumerate(tool_calls):
+            if not isinstance(tc, dict):
+                logger.warning(f"{adapter_name} _validate_tool_calls_arguments: tc[{i}]不是dict: {type(tc)}")
+                return False, f"tc[{i}]不是dict"
+            
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                logger.warning(f"{adapter_name} _validate_tool_calls_arguments: tc[{i}].function不是dict: {type(fn)}")
+                return False, f"tc[{i}].function不是dict"
+            
+            args_val = fn.get("arguments", "")
             if isinstance(args_val, str) and args_val.strip().startswith("{"):
                 try:
                     # logger.debug(f"----------------2")
@@ -128,6 +320,9 @@ class BaseAdapter(ABC):
                     err_msg = str(ae)[:200]
                     logger.warning(f"{adapter_name} arguments validation failed: {err_msg}")
                     return False, err_msg
+            elif not isinstance(args_val, str):
+                logger.warning(f"{adapter_name} _validate_tool_calls_arguments: tc[{i}].function.arguments不是str: {type(args_val)}")
+                return False, f"tc[{i}].function.arguments不是str"
         return True, ""
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -217,6 +412,8 @@ class BaseAdapter(ABC):
                     tool_calls = delta_or_message.get("tool_calls") or choice.get("tool_calls")
                     if not tool_calls:
                         tool_calls = None
+                    else:
+                        tool_calls = self._sanitize_tool_calls(tool_calls)
                     finish_reason = choice.get("finish_reason") or parsed.get("finish_reason")
                     return content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls
 
@@ -226,12 +423,21 @@ class BaseAdapter(ABC):
             tool_calls = parsed["tool_calls"]
             if not tool_calls:
                 tool_calls = None
+            else:
+                tool_calls = self._sanitize_tool_calls(tool_calls)
             return None, tool_calls, "tool_calls", is_openai_chunk, is_tool_calls
 
         # 单个 tool_call: {id, type, function}
         if parsed.get("id") and parsed.get("type") == "function" and parsed.get("function"):
             is_tool_calls = True
-            return None, [parsed], "tool_calls", is_openai_chunk, is_tool_calls
+            tc = self._sanitize_tool_calls([parsed])
+            return None, tc, "tool_calls", is_openai_chunk, is_tool_calls
+
+        # Fallback：尝试从非标准格式中提取 message.content 以及 tool_calls
+        content, tool_calls, finish_reason = self._extract_nonstandard_parsed(parsed)
+        if content is not None or tool_calls is not None:
+            is_tool_calls_flag = bool(tool_calls)
+            return content, tool_calls, finish_reason or "stop", False, is_tool_calls_flag
 
         return None, None, None, is_openai_chunk, is_tool_calls
 
@@ -241,7 +447,18 @@ class BaseAdapter(ABC):
 
     def _yield_tool_calls(self, tool_calls: list, model: str, chat_id: str, content=None) -> AsyncGenerator[bytes, None]:
         """逐条 yield tool_calls 块。"""
+        adapter_name = self.get_adapter_name()
         for i, tc in enumerate(tool_calls):
+            if not isinstance(tc, dict):
+                logger.warning(f"{adapter_name} _yield_tool_calls: tc[{i}]不是dict: {type(tc)}")
+                continue
+
+            # 确保 function 是 dict
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                logger.warning(f"{adapter_name} _yield_tool_calls: tc[{i}].function不是dict: {type(fn)}")
+                fn = {} # 避免后续崩溃
+
             yield format_openai_chunk(
                 content if i == 0 else None,
                 model, chat_id, "",
@@ -251,12 +468,12 @@ class BaseAdapter(ABC):
                     "id": tc.get("id", ""),
                     "type": tc.get("type", "function"),
                     "function": {
-                        "name": tc.get("function", {}).get("name", ""),
+                        "name": fn.get("name", ""),
                         "arguments": ""
                     }
                 }]
             ).encode()
-            args = tc.get("function", {}).get("arguments", "")
+            args = fn.get("arguments", "")
             if args:
                 yield format_openai_chunk(
                     None, model, chat_id, "",
@@ -942,7 +1159,24 @@ class BaseAdapter(ABC):
                         logger.debug(f"{adapter_name} done: suppress_text={suppress_text}, full_text_len={len(full_text)}, full_text_preview=\n{full_text[:2000]!r}")
                         try:
                             content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls = self._parse_response(full_text)
-                            logger.info(f"{adapter_name} done: content={content!r}, tool_calls={tool_calls!r}, finish_reason={finish_reason!r}")
+                            
+                            # 日志增强：打印 tool_calls 结构摘要
+                            if tool_calls:
+                                logger.info(f"{adapter_name} done: content={content!r}, tool_calls count={len(tool_calls)}, finish_reason={finish_reason!r}")
+                                for i, tc in enumerate(tool_calls):
+                                    if isinstance(tc, dict):
+                                        fn = tc.get("function")
+                                        fn_type = type(fn).__name__ if fn else "MISSING"
+                                        args_preview = ""
+                                        if isinstance(fn, dict):
+                                            args = fn.get("arguments", "")
+                                            if isinstance(args, str):
+                                                args_preview = args[:100]
+                                        logger.debug(f"{adapter_name} tc[{i}]: id={tc.get('id','')} name={fn.get('name','') if isinstance(fn, dict) else '?'} fn_type={fn_type} args_preview={args_preview}")
+                                    else:
+                                        logger.warning(f"{adapter_name} tc[{i}] 不是 dict: {type(tc).__name__}")
+                            else:
+                                logger.info(f"{adapter_name} done: content={content!r}, tool_calls={tool_calls}, finish_reason={finish_reason!r}")
 
                             should_retry, err_msg, tool_return_content, full_text = self._validate_done_response(
                                 content, tool_calls, finish_reason,

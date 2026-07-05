@@ -134,14 +134,24 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Keeping all conversations (no cleanup)")
 
+    # 关闭顺序很重要：适配器依赖 browser_client，必须先关闭适配器，再关闭底层浏览器客户端。
+    try:
+        await adapters_close_all()
+    except Exception as e:
+        logger.warning(f"adapters close error during shutdown: {e}")
+
     if signer:
-        await signer.close()
+        try:
+            await signer.close()
+        except Exception as e:
+            logger.warning(f"signer close error during shutdown: {e}")
+
     try:
         from browser_client import browser_client
         await browser_client.close()
-    except Exception:
-        pass
-    await adapters_close_all()
+    except Exception as e:
+        logger.debug(f"browser client close error during shutdown: {e}")
+
     # 恢复原始异常处理器
     loop.set_exception_handler(_original_handler if _original_handler else None)
 

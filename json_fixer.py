@@ -130,7 +130,9 @@ class JsonFixer:
             import json_repair
             repaired = json_repair.loads(fixed_mb)
             logger.debug(f"json_repair修复的\n{repaired}")
-            repaired = self._merge_repaired(repaired)
+            # 如果 json_repair 返回 list，则尝试合并成 dict
+            if isinstance(repaired, list):
+                repaired = self._merge_repaired(repaired)
             if isinstance(repaired, dict):
                 return self._normalize_arguments(repaired)
         except ImportError:
@@ -807,16 +809,62 @@ class JsonFixer:
 
     @staticmethod
     def _merge_repaired(repaired):
-        """json_repair 返回 list 时合并为 dict（常见于缺 } 导致顶层拆分）。"""
-        if isinstance(repaired, list) and repaired and isinstance(repaired[0], dict):
-            merged = repaired[0]
-            for extra in repaired[1:]:
-                if isinstance(extra, dict):
-                    for k, v in extra.items():
-                        if k not in merged:
-                            merged[k] = v
-            return merged
-        return repaired
+        """json_repair 返回 list 时合并为 dict（常见于缺 } 导致顶层拆分）。
+        
+        但不做跨层级合并：如果第一个 dict 看起来像 OpenAI 格式（有 choices/tool_calls），
+        而额外片段包含的键通常是 arguments 内部的（如 target, text, content 等），
+        则跳过合并，避免把 arguments 内部字段提升到顶层。"""
+        if not isinstance(repaired, list) or len(repaired) == 0:
+            return repaired
+        
+        first = repaired[0]
+        if not isinstance(first, dict):
+            return repaired
+        
+        # 如果第一个 dict 是 OpenAI 格式，谨慎合并
+        is_openai_format = "choices" in first or "tool_calls" in first or "id" in first
+        
+        # 识别 usage-like 片段：包含 prompt_tokens, completion_tokens, total_tokens 等
+        def is_usage_like(d):
+            if not isinstance(d, dict):
+                return False
+            keys = set(d.keys())
+            usage_keys = {"prompt_tokens", "completion_tokens", "total_tokens", "completion_tokens_details", "prompt_tokens_details"}
+            return bool(keys & usage_keys) and len(keys) <= 6  # 典型 usage 字段数
+        
+        merged = first.copy()  # 不修改原对象
+        for extra in repaired[1:]:
+            if not isinstance(extra, dict):
+                continue
+            
+            # 如果额外片段是 usage 结构，合并到 usage 字段
+            if is_usage_like(extra):
+                if "usage" not in merged or not isinstance(merged["usage"], dict):
+                    merged["usage"] = extra
+                continue  # usage 已处理，不需要把 usage 的所有键提升到顶层
+            
+            if is_openai_format:
+                # 额外片段也必须包含 OpenAI 格式键才能合并
+                # 如果包含 arguments 常见键（target, text, url 等），说明是嵌套层级的碎片，不合并
+                extra_keys = set(extra.keys())
+                # 常见于 arguments 内部的键
+                nested_indicators = {"target", "text", "url", "link", "query", "content", "message",
+                                     "command", "file_path", "path", "prompt", "response"}
+                if extra_keys & nested_indicators:
+                    # 额外片段包含 arguments 内部键 → 跳过合并
+                    logger.debug(f"_merge_repaired: 跳过合并片段，键可能属于嵌套层级: {extra_keys}")
+                    continue
+            
+            for k, v in extra.items():
+                if k not in merged:
+                    merged[k] = v
+                else:
+                    # 键冲突：如果是 dict 且都是 dict，递归合并
+                    if isinstance(merged[k], dict) and isinstance(v, dict):
+                        merged[k] = {**merged[k], **v}
+                    # 否则保留 merged 中的值
+        
+        return merged
 
     @staticmethod
     def _fix_tool_calls_list(tool_calls: list) -> list:
