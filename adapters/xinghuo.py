@@ -214,6 +214,9 @@ class XinghuoAdapter(BaseAdapter):
             logger.error(f"[Xinghuo] non_stream_chat error: {e}")
             return {"error": str(e)}
 
+        cleaned = self._strip_json_prefix(full_text)
+        cleaned = self._strip_think_tags(cleaned)
+
         return {
             "id": chat_id,
             "object": "chat.completion",
@@ -221,7 +224,7 @@ class XinghuoAdapter(BaseAdapter):
             "model": request.model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": full_text},
+                "message": {"role": "assistant", "content": cleaned},
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

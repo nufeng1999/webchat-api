@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import uuid
 import logging
@@ -8,7 +9,7 @@ from config import Colors
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Optional
 from models import ChatCompletionRequest
-from sse import format_openai_chunk, format_openai_done, extract_text_from_content
+from sse import format_openai_chunk, extract_text_from_content
 
 logger = logging.getLogger("base-adapter")
 
@@ -32,10 +33,6 @@ class BaseAdapter(ABC):
 
     @abstractmethod
     async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
-        ...
-
-    @abstractmethod
-    async def non_stream_chat(self, request: ChatCompletionRequest) -> dict:
         ...
 
     async def generate_images(self, prompt: str, n: int = 1, size: str = "1024x1024", **kwargs) -> dict:
@@ -137,19 +134,13 @@ class BaseAdapter(ABC):
     # 公共工具方法：_parse_response
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _parse_response(self, full_text: str) -> tuple:
-        """解析 full_text 为 (content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls)。"""
-        adapter_name = self.get_adapter_name()
-        is_openai_chunk = False
-        is_tool_calls = False
-        text_to_parse = full_text.strip()
+    def _normalize_openai_payload_text(self, text: str) -> str:
+        text = (text or "").replace('\x00', '').strip()
+        if not text:
+            return ""
 
-        # 清除空字节
-        text_to_parse = text_to_parse.replace('\x00', '')
-
-        # 去掉 markdown 代码块
-        if text_to_parse.startswith("```"):
-            lines = text_to_parse.split("\n")
+        if text.startswith("```"):
+            lines = text.split("\n")
             json_lines = []
             in_code_block = False
             for line in lines:
@@ -160,12 +151,28 @@ class BaseAdapter(ABC):
                     continue
                 if in_code_block:
                     json_lines.append(line)
-            text_to_parse = "\n".join(json_lines).strip()
+            text = "\n".join(json_lines).strip()
+
+        match = None
+        for pattern in (r'\{[\s\S]*\}', r'\[[\s\S]*\]'):
+            m = re.search(pattern, text)
+            if m:
+                match = m.group(0).strip()
+                break
+        if match:
+            return match
+        return text
+
+    def _parse_response(self, full_text: str) -> tuple:
+        """解析 full_text 为 (content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls)。"""
+        adapter_name = self.get_adapter_name()
+        is_openai_chunk = False
+        is_tool_calls = False
+        text_to_parse = self._normalize_openai_payload_text(full_text)
 
         if not text_to_parse:
             return None, None, None, is_openai_chunk, is_tool_calls
 
-        # 快速判断文本是否可能为 JSON，纯文字直接跳过解析
         first_char = text_to_parse[0]
         if first_char not in ('{', '[', '"'):
             return None, None, None, is_openai_chunk, is_tool_calls
@@ -376,6 +383,9 @@ class BaseAdapter(ABC):
             logger.error(f"[{self.get_adapter_name()}] non_stream_chat error: {e}")
             return {"error": str(e)}
 
+        cleaned = self._strip_json_prefix(full_text)
+        cleaned = self._strip_think_tags(cleaned)
+
         return {
             "id": chat_id,
             "object": "chat.completion",
@@ -383,7 +393,7 @@ class BaseAdapter(ABC):
             "model": request.model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": full_text},
+                "message": {"role": "assistant", "content": cleaned},
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -417,16 +427,33 @@ class BaseAdapter(ABC):
             value = value.replace('\x00', '')
             if not value:
                 return full_text, suppress_text, buffered_chunks, False, None, _think_buf
-            full_text += value
+            # 过滤非 JSON 前缀（如 "思考过程", "reasoning", "json" 等）
+            cleaned_chunk = self._strip_json_prefix(value)
+            full_text += cleaned_chunk
             if not suppress_text:
                 ft = full_text.lstrip()
                 if ft[:1] == "{" or ft[:3] == "```":
                     suppress_text = True
                     adapter_name = self.get_adapter_name()
                     logger.info(f"{adapter_name} suppress_text triggered: ft_start={ft[:100]!r}")
+                else:
+                    # 检测JSON开头的 brace/bracket 是否出现在较前位置
+                    brace_pos = ft.find('{')
+                    bracket_pos = ft.find('[')
+                    if (brace_pos != -1 and brace_pos < 50) or (bracket_pos != -1 and bracket_pos < 50):
+                        suppress_text = True
+                        adapter_name = self.get_adapter_name()
+                        logger.info(f"{adapter_name} suppress_text triggered via brace detection: ft_start={ft[:100]!r}")
+                        # 截断前缀以便后续解析只保留 JSON 部分
+                        pos = brace_pos if brace_pos != -1 else bracket_pos
+                        if brace_pos != -1 and bracket_pos != -1:
+                            pos = min(brace_pos, bracket_pos)
+                        # 计算在原始 full_text 中的实际位置
+                        actual_pos = len(full_text) - len(ft) + pos
+                        full_text = full_text[actual_pos:]
             if not suppress_text:
-                # 合并 _think_buf + value 做跨 chunk think 标签过滤
-                combined = _think_buf + value
+                # 合并 _think_buf + cleaned_chunk 做跨 chunk think 标签过滤
+                combined = _think_buf + cleaned_chunk
                 cleaned, _think_buf = self._strip_think_tags_with_buf(combined)
                 if is_agent and buffered_chunks is not None:
                     if cleaned:
@@ -440,8 +467,24 @@ class BaseAdapter(ABC):
                     else:
                         # 清空缓冲区（可能是空 chunk）
                         return full_text, suppress_text, buffered_chunks, False, None, ""
+            # 如果 suppress_text 已启用，此 chunk 不产生输出，直接累积到 full_text 后继续
 
         return full_text, suppress_text, buffered_chunks, False, None, _think_buf
+
+    def _strip_json_prefix(self, text: str) -> str:
+        text = (text or "").replace('\x00', '')
+        if not text:
+            return ""
+        stripped = text.lstrip()
+        if not stripped:
+            return ""
+        if stripped.startswith('{') or stripped.startswith('[') or stripped.startswith("```"):
+            return stripped
+        if stripped.startswith("思考过程") or stripped.startswith("reasoning") or stripped.startswith("json"):
+            match = re.search(r'\{[\s\S]*|\[[\s\S]*', stripped)
+            if match:
+                return match.group(0).strip()
+        return text
 
     def _strip_think_tags_with_buf(self, text: str) -> tuple[str, str]:
         """
@@ -451,7 +494,6 @@ class BaseAdapter(ABC):
         - 如果检测到未闭合的 ``，将剩余内容暂存到 buf 中
         - 如果 buf 中有残留的 `` 且当前文本包含闭合的 ``，则组合后去除
         """
-        import re
         OPEN_TAG = '<think>'
         CLOSE_TAG = '</think>'
 
@@ -536,6 +578,8 @@ class BaseAdapter(ABC):
         """
         adapter_name = self.get_adapter_name()
 
+        # 先剥离可能的前缀污染（如 "思考过程", "json" 等）
+        full_text = self._strip_json_prefix(full_text)
         if not is_agent and not suppress_text and tool_calls is None:
             cleaned = self._strip_think_tags(full_text)
             if cleaned != full_text:
@@ -841,7 +885,6 @@ class BaseAdapter(ABC):
                 got_rate_limit = False
                 rate_limit_error = None
                 parse_success = False
-                is_retry_break = False
 
                 if use_peh and parse_error_history is not None:
                     current_prompt = self._build_retry_prompt(prompt_text, is_tool_return, parse_error_history)
@@ -919,7 +962,6 @@ class BaseAdapter(ABC):
                                 if attempt < max_retries - 1:
                                     logger.info(f"{adapter_name} retrying (attempt {attempt+1}/{max_retries}): {err_msg[:200]}")
                                     await asyncio.sleep(5)
-                                    is_retry_break = True
                                     break
                                 else:
                                     logger.error(f"{adapter_name} parse failed after {max_retries} attempts")
@@ -945,7 +987,6 @@ class BaseAdapter(ABC):
                                 parse_error_history.append((err_msg, full_text))
                             if attempt < max_retries - 1:
                                 logger.info(f"{adapter_name} retrying after done handler error: {err_msg}")
-                                is_retry_break = True
                                 break
                             else:
                                 yield self._format_error("服务器内部错误！", model, chat_id)
