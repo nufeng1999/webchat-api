@@ -5474,18 +5474,22 @@ class BrowserClient:
                 }""", {"fid": fid, "meta": meta})
                 if file_set:
                     logger.info(f"[Zai] file info set via input")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
 
-            # 4d. 处理弹窗 → 确认textarea → 填入消息 → 发送
+            # 4d. 处理弹窗 → 确认textarea → 填入消息并发送
             logger.info(f"[Zai] dismissing popups before entering message...")
             
-            # 多次处理弹窗，确保页面元素可访问
-            for _ in range(3):
+            # 多次处理弹窗，确保页面元素可访问（减少次数：内部已有超时保护）
+            for i in range(2):
+                logger.debug(f"[Zai] dismiss popups attempt {i+1}/2")
                 await self._dismiss_zai_popups()
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
+            
+            logger.info(f"[Zai] dismiss popups done, checking page state...")
             
             # 确认页面已加载textarea（如果不在主页则导航）
             cur_url = self._zai_page.url
+            logger.info(f"[Zai] current URL: {cur_url}")
             if '/auth' in cur_url:
                 logger.warning("[Zai] Still on /auth, navigating to main page...")
                 await self._zai_page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
@@ -5494,8 +5498,10 @@ class BrowserClient:
                     await asyncio.sleep(0.5)
             
             # 等待textarea出现
+            logger.info(f"[Zai] waiting for textarea selector...")
             try:
                 await self._zai_page.wait_for_selector("textarea", timeout=15000)
+                logger.info(f"[Zai] textarea found")
             except:
                 logger.warning("[Zai] textarea not found, trying dismiss popups and reload...")
                 for _ in range(3):
@@ -5511,67 +5517,54 @@ class BrowserClient:
                     logger.error("[Zai] textarea still not found after reload")
                     raise Exception("z.ai textarea not found")
 
-            # 通过dispatchEvent设置textarea值并触发Svelte的input事件
-            set_ok = await self._zai_page.evaluate("""(text) => {
-                const textarea = document.querySelector('textarea');
-                if (!textarea) return false;
-                // 使用Svelte兼容的方式设置值
-                textarea.focus();
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                nativeInputValueSetter.call(textarea, text);
-                textarea.dispatchEvent(new Event('input', {bubbles:true}));
-                textarea.dispatchEvent(new Event('change', {bubbles:true}));
-                return true;
-            }""", prompt_text)
+            # 输入消息：短文本逐字输入（更像真人），长文本直接粘贴（避免超时）
+            import random as _random
+            textarea = self._zai_page.locator("textarea")
+            await textarea.click()
+            await asyncio.sleep(0.3 + _random.random() * 0.5)
             
-            if not set_ok:
-                raise Exception("z.ai textarea not found")
-            
-            await asyncio.sleep(0.5)
+            # 清空现有内容（如果有）
+            await self._zai_page.keyboard.press("Control+A")
+            await asyncio.sleep(0.1)
+            await self._zai_page.keyboard.press("Backspace")
+            await asyncio.sleep(0.3)
 
-            # 通过form submit或Enter发送
+            if len(prompt_text) > 200:
+                # 长文本：直接粘贴
+                await self._zai_page.evaluate("(text) => { const ta = document.querySelector('textarea'); ta.focus(); const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set; setter.call(ta, text); ta.dispatchEvent(new Event('input', {bubbles:true})); }", prompt_text)
+                logger.info(f"[Zai] pasted prompt ({len(prompt_text)} chars)")
+                await asyncio.sleep(0.5)
+            else:
+                # 短文本：逐字输入
+                for ch in prompt_text:
+                    await self._zai_page.keyboard.type(ch, delay=50 + int(100 * _random.random()))
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.5)
+
+            # 发送：按 Enter 或点击发送按钮
             send_clicked = await self._zai_page.evaluate("""() => {
-                // 尝试form submit
+                // 尝试按 Enter（如果表单允许）
                 const form = document.querySelector('form');
                 if (form) {
-                    // 创建submit事件
-                    const submitEvent = new Event('submit', {bubbles:true, cancelable:true});
-                    form.dispatchEvent(submitEvent);
-                    return 'form-submit';
+                    const ev = new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles:true});
+                    const textarea = document.querySelector('textarea');
+                    if (textarea) textarea.dispatchEvent(ev);
+                    return 'form-enter';
                 }
-                // 尝试点击发送按钮（可能是SVG按钮）
-                const btns = document.querySelectorAll('button');
-                for (const b of btns) {
-                    const rect = b.getBoundingClientRect();
-                    // 发送按钮通常在textarea右下方，有SVG图标
-                    if (rect.height > 0 && rect.height < 60 && rect.width < 60 && rect.width > 20) {
-                        const svg = b.querySelector('svg');
-                        const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                        if (svg && (label.includes('send') || label.includes('发送'))) {
-                            b.click();
-                            return 'svg-btn';
-                        }
-                    }
+                // 否则点击发送按钮
+                const btns = Array.from(document.querySelectorAll('button'));
+                const sendBtn = btns.find(b => {
+                    const txt = (b.textContent || '').trim();
+                    return txt === '' || txt === '发送' || b.getAttribute('aria-label')?.includes('send') || b.querySelector('[class*="send"]');
+                }) || btns[0];
+                if (sendBtn) {
+                    sendBtn.click();
+                    return 'button-click';
                 }
-                return null;
+                return 'none';
             }""")
-
-            if send_clicked:
-                logger.info(f"[Zai] clicked send ({send_clicked})")
-                # 验证发送是否成功：检查 textarea 是否清空
-                await asyncio.sleep(1)
-                textarea_val = await self._zai_page.evaluate(
-                    "() => (document.querySelector('textarea') || {}).value || ''"
-                )
-                if textarea_val.strip():
-                    logger.warning(f"[Zai] textarea still has content ({len(textarea_val)} chars), send may have failed")
-                    # 按 Enter 重试
-                    await self._zai_page.locator('textarea').first.press('Enter')
-                    logger.info("[Zai] pressed Enter to retry send")
-            else:
-                # 按Enter发送
-                await self._zai_page.locator('textarea').first.press('Enter')
-                logger.info("[Zai] pressed Enter to send")
+            logger.info(f"[Zai] sent message via: {send_clicked}")
+            await asyncio.sleep(0.5)
 
             # 4e. 等待SSE数据通过zaiOnSseChunk桥接到Python队列（最多2分钟）
             logger.info(f"[Zai] waiting for SSE response...")
@@ -6024,96 +6017,95 @@ class BrowserClient:
             # 多次尝试处理弹窗（弹窗可能延迟加载）
             for attempt in range(3):
                 # 1. 自动点击登录按钮（如果页面显示登录提示）
-                await self._zai_page.evaluate(r"""() => {
-                    const loginPatterns = ['登录', '登 录', 'Login', 'Sign in', 'Log in', '登录/注册', 'Sign up'];
-                    const allBtns = document.querySelectorAll('button, a, [role="button"], [class*="login"], [class*="Login"]');
-                    for (const btn of allBtns) {
-                        const txt = (btn.textContent || '').trim();
-                        const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-                        const cls = (btn.className || '').toLowerCase();
-                        if (loginPatterns.some(p => txt.includes(p) || ariaLabel.includes(p.toLowerCase()))) {
-                            // 排除"注册"按钮，优先"登录"
-                            if (txt.includes('注册') && !txt.includes('登录')) continue;
-                            // 排除明显不是登录按钮的元素（如"取消"、"关闭"）
-                            if (txt.includes('取消') || txt.includes('关闭') || txt.includes('Cancel') || txt.includes('Close')) continue;
-                            try {
-                                btn.click();
-                                console.log('[zai-auto-login] clicked login button:', txt);
-                                return true;
-                            } catch(e) {}
-                        }
-                    }
-                    return false;
-                }""")
-
-                await self._zai_page.evaluate(r"""() => {
-                    // 2. 关闭按钮
-                    const closeSelectors = [
-                        'button[aria-label="关闭"]', 'button[aria-label="Close"]',
-                        'button[aria-label="关闭公告"]', '[class*="close"]', '[data-testid*="close"]',
-                        '[class*="modal"] button:first-child', '[class*="dialog"] button:first-child'
-                    ];
-                    for (const sel of closeSelectors) {
-                        document.querySelectorAll(sel).forEach(btn => {
-                            try { if (btn.offsetParent !== null) btn.click(); } catch(e) {}
-                        });
-                    }
-                    
-                    // 3. 确定/同意按钮
-                    const agreePatterns = ['同意', '接受', '确定', '确认', 'Agree', 'Accept', 'OK', 'Confirm', 
-                                          'Got it', '知道了', '我已知晓', '我再想想', '继续', 'Continue'];
-                    document.querySelectorAll('button, [role="button"], a[role="button"]').forEach(btn => {
-                        const txt = (btn.textContent || '').trim();
-                        const cls = (btn.className || '').toLowerCase();
-                        if (agreePatterns.some(p => txt === p || txt.includes(p))) {
-                            // 优先点击主要按钮（primary/confirm等）
-                            if (cls.includes('primary') || cls.includes('confirm') || cls.includes('agree') || 
-                                cls.includes('submit') || cls.includes('bg-') || cls.includes('solid')) {
-                                try { if (btn.offsetParent !== null) btn.click(); } catch(e) {}
+                try:
+                    await asyncio.wait_for(self._zai_page.evaluate(r"""() => {
+                        const loginPatterns = ['登录', '登 录', 'Login', 'Sign in', 'Log in', '登录/注册', 'Sign up'];
+                        const allBtns = document.querySelectorAll('button, a, [role="button"], [class*="login"], [class*="Login"]');
+                        for (const btn of allBtns) {
+                            const txt = (btn.textContent || '').trim();
+                            const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            const cls = (btn.className || '').toLowerCase();
+                            if (loginPatterns.some(p => txt.includes(p) || ariaLabel.includes(p.toLowerCase()))) {
+                                if (txt.includes('注册') && !txt.includes('登录')) continue;
+                                if (txt.includes('取消') || txt.includes('关闭') || txt.includes('Cancel') || txt.includes('Close')) continue;
+                                try { btn.click(); return true; } catch(e) {}
                             }
                         }
-                    });
-                    
-                    // 4. 处理遮罩层
-                    document.querySelectorAll('[class*="overlay"], [class*="mask"], [class*="backdrop"], [class*="modal-overlay"]').forEach(el => {
-                        if (el.style && el.onclick === null && el.offsetParent !== null) {
-                            try { el.click(); } catch(e) {}
+                        return false;
+                    }"""), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.debug(f"[Zai] dismiss popups step1 timeout (attempt {attempt+1})")
+                except Exception as e:
+                    logger.debug(f"[Zai] dismiss popups step1 error: {e}")
+
+                # 2. 关闭按钮、同意按钮、遮罩层、弹窗点击
+                try:
+                    await asyncio.wait_for(self._zai_page.evaluate(r"""() => {
+                        const closeSelectors = [
+                            'button[aria-label="关闭"]', 'button[aria-label="Close"]',
+                            'button[aria-label="关闭公告"]', '[class*="close"]', '[data-testid*="close"]',
+                            '[class*="modal"] button:first-child', '[class*="dialog"] button:first-child'
+                        ];
+                        for (const sel of closeSelectors) {
+                            document.querySelectorAll(sel).forEach(btn => {
+                                try { if (btn.offsetParent !== null) btn.click(); } catch(e) {}
+                            });
                         }
-                    });
-                    
-                    // 5. 处理弹窗容器（点击空白处关闭）
-                    document.querySelectorAll('[class*="modal"], [class*="dialog"], [class*="popup"]').forEach(el => {
-                        if (el.style && el.style.display !== 'none' && el.onclick === null) {
-                            // 检查是否有明显的弹窗内容
-                            const hasContent = el.querySelector('button, input, [class*="content"]');
-                            if (!hasContent) {
+                        const agreePatterns = ['同意', '接受', '确定', '确认', 'Agree', 'Accept', 'OK', 'Confirm', 
+                                              'Got it', '知道了', '我已知晓', '我再想想', '继续', 'Continue'];
+                        document.querySelectorAll('button, [role="button"], a[role="button"]').forEach(btn => {
+                            const txt = (btn.textContent || '').trim();
+                            const cls = (btn.className || '').toLowerCase();
+                            if (agreePatterns.some(p => txt === p || txt.includes(p))) {
+                                if (cls.includes('primary') || cls.includes('confirm') || cls.includes('agree') || 
+                                    cls.includes('submit') || cls.includes('bg-') || cls.includes('solid')) {
+                                    try { if (btn.offsetParent !== null) btn.click(); } catch(e) {}
+                                }
+                            }
+                        });
+                        document.querySelectorAll('[class*="overlay"], [class*="mask"], [class*="backdrop"], [class*="modal-overlay"]').forEach(el => {
+                            if (el.style && el.onclick === null && el.offsetParent !== null) {
                                 try { el.click(); } catch(e) {}
                             }
-                        }
-                    });
-                }""")
-                
-                # 按Escape键关闭可能的模态弹窗
-                await self._zai_page.keyboard.press("Escape")
-                await asyncio.sleep(0.5)
-                
-                # 检查是否还有弹窗（简单检查是否有可见的模态框）
-                has_modal = await self._zai_page.evaluate("""() => {
-                    const modals = document.querySelectorAll('[class*="modal"], [class*="dialog"], [class*="popup"]');
-                    for (const m of modals) {
-                        if (m.style && m.style.display !== 'none' && m.offsetParent !== null && m.style.zIndex > 100) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }""")
-                
-                if not has_modal:
-                    break
-                    
-        except Exception as e:
-            logger.debug(f"[Zai] dismiss popups: {e}")
+                        });
+                        document.querySelectorAll('[class*="modal"], [class*="dialog"], [class*="popup"]').forEach(el => {
+                            if (el.style && el.style.display !== 'none' && el.onclick === null) {
+                                const hasContent = el.querySelector('button, input, [class*="content"]');
+                                if (!hasContent) { try { el.click(); } catch(e) {} }
+                            }
+                        });
+                    }"""), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.debug(f"[Zai] dismiss popups step2 timeout (attempt {attempt+1})")
+                except Exception as e:
+                    logger.debug(f"[Zai] dismiss popups step2 error: {e}")
 
+                # 3. 按 Escape 键
+                try:
+                    await self._zai_page.keyboard.press("Escape")
+                except Exception as e:
+                    logger.debug(f"[Zai] dismiss popups Escape error: {e}")
+                await asyncio.sleep(0.5)
+
+                # 4. 检查是否还有弹窗
+                try:
+                    has_modal = await asyncio.wait_for(self._zai_page.evaluate("""() => {
+                        const modals = document.querySelectorAll('[class*="modal"], [class*="dialog"], [class*="popup"]');
+                        for (const m of modals) {
+                            if (m.style && m.style.display !== 'none' && m.offsetParent !== null && m.style.zIndex > 100) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }"""), timeout=5.0)
+                    if not has_modal:
+                        break
+                except asyncio.TimeoutError:
+                    logger.debug(f"[Zai] dismiss popups has_modal timeout (attempt {attempt+1})")
+                except Exception as e:
+                    logger.debug(f"[Zai] dismiss popups has_modal error: {e}")
+        except Exception as e:
+            logger.debug(f"[Zai] dismiss popups error: {e}")
     async def _dismiss_deepseek_popups(self):
         """处理 DeepSeek 页面上的各种弹窗。"""
         if not self._deepseek_page or self._deepseek_page.is_closed():
