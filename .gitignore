@@ -122,3 +122,8 @@ analyze_components.py
 analyze_routes.py
 find_chunks2.py
 README.old.md
+/my_prompt_bak
+/tmp
+config.json
+prompt_optimizer.py
+json_fixer_flowchart.md

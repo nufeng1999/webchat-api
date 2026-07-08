@@ -4036,19 +4036,30 @@ class BrowserClient:
         """
         if not skip_lock:
             await self._doubao_lock.acquire()
+        result = None
         try:
             # 检查浏览器是否可用
             try:
                 browser_ok = (
                     self._doubao_page is not None
+                    and not self._doubao_page.is_closed()
                     and self._doubao_browser is not None
                     and self._doubao_browser.pages
                 )
             except Exception:
                 browser_ok = False
             if not browser_ok:
-                logger.debug("[Doubao] Browser not connected, falling back to HTTP API")
+                logger.debug("[Doubao] Browser not connected or page closed, falling back to HTTP API")
                 return False, "Browser not connected"
+
+            # 检查当前页面 URL，确认仍在聊天上下文中，避免导航中调用
+            try:
+                current_url = self._doubao_page.url if hasattr(self._doubao_page, 'url') else 'unknown'
+                if not current_url.startswith('https://www.doubao.com/chat'):
+                    logger.warning(f"[Doubao] delete_conversation_via_browser: current page URL is {current_url}, expected /chat")
+                    return False, "Page not in chat context"
+            except Exception as e:
+                logger.warning(f"[Doubao] delete_conversation_via_browser: failed to get page URL: {e}")
 
             device_id = CONFIG.get('device_id', '')
             web_id = CONFIG.get('web_id', '')
@@ -4119,30 +4130,46 @@ class BrowserClient:
             )
             try:
                 result = await asyncio.shield(future)
+                return result.get("success"), ""
             except asyncio.CancelledError:
                 logger.info(f"[Doubao] delete_conversation_via_browser: shielded from cancel, waiting for result")
                 try:
-                    result = future.result() if future.done() else await future
+                    if future.done():
+                        result = future.result()
+                        return result.get("success"), ""
+                    else:
+                        result = await asyncio.wait_for(future, timeout=30.0)
+                        return result.get("success"), ""
                 except Exception as e:
                     logger.warning(f"[Doubao] delete_conversation_via_browser: post-cancel wait failed: {e}")
                     return False, str(e)
             except Exception as e:
-                logger.warning(f"[Doubao] delete_conversation_via_browser: error: {e}")
-                return False, str(e)
-
-            if result.get("success"):
-                logger.info(f"Deleted conversation {conversation_id} via browser page")
-                return True, ""
-
-            err_msg = result.get('error') or json.dumps(result.get('data', {}), ensure_ascii=False)[:300]
-            logger.info(f"Delete conversation {conversation_id} via browser: {err_msg}")
-            return False, "Browser delete returned non-success"
+                err_str = str(e)
+                if "Execution context was destroyed" in err_str or "most likely because of a navigation" in err_str:
+                    logger.warning(f"[Doubao] delete_conversation_via_browser: page navigation invalidated execution context: {e}")
+                    return False, "Page navigation invalidated context"
+                elif "cancelled" in err_str.lower() or "cancel scope" in err_str.lower():
+                    logger.info(f"[Doubao] delete_conversation_via_browser: shielded from cancel, waiting for result")
+                    try:
+                        if future.done():
+                            result = future.result()
+                            return result.get("success"), ""
+                        else:
+                            result = await asyncio.wait_for(future, timeout=30.0)
+                            return result.get("success"), ""
+                    except Exception:
+                        return False, "Post-cancel access failed"
+                else:
+                    logger.warning(f"[Doubao] delete_conversation_via_browser: error: {e}")
+                    return False, str(e)
         except (Exception, asyncio.CancelledError) as e:
             err_str = str(e)
             if "cancelled" in err_str.lower() or "cancel scope" in err_str.lower():
-                logger.info(f"Delete conversation {conversation_id} cancelled during shutdown: {err_str[:100]}")
+                logger.info(f"[Doubao] delete_conversation_via_browser: cancelled during shutdown: {err_str[:100]}")
+            elif "Execution context was destroyed" in err_str or "most likely because of a navigation" in err_str:
+                logger.warning(f"[Doubao] delete_conversation_via_browser: execution context destroyed (likely due to page navigation)")
             else:
-                logger.warning(f"Error deleting conversation {conversation_id} via browser: {e}")
+                logger.warning(f"[Doubao] Error deleting conversation {conversation_id} via browser: {e}")
             return False, str(e)
         finally:
             if not skip_lock:

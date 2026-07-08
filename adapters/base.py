@@ -556,7 +556,7 @@ class BaseAdapter(ABC):
         messages = request_dict.get("messages", [])
         if not messages:
             return "[]"
-        return json.dumps(messages[-3:], ensure_ascii=False)
+        return json.dumps(messages[-1:], ensure_ascii=False)
 
     # ═══════════════════════════════════════════════════════════════════════
     # 公共工具方法：_generate_chat_id
