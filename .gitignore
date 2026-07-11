@@ -9,6 +9,7 @@
 *test*.*
 *.old.py
 *_profile/
+_tmp_*.*
 _explore*.*
 explore*.*
 spark_*.*
@@ -19,10 +20,12 @@ diagnose_*.*
 *.db
 *.sqlite
 *.log
+page-*.*
 .env
 
 accounts.json
 
+kimi_profile_headless/
 logs/
 conversations/
 temp/
@@ -127,3 +130,4 @@ README.old.md
 config.json
 prompt_optimizer.py
 json_fixer_flowchart.md
+_tmp_inspect.py

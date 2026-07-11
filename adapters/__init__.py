@@ -9,7 +9,8 @@ from adapters.zai import ZaiAdapter
 from adapters.mimo import MimoAdapter
 from adapters.minimax import MinimaxAdapter
 from adapters.xinghuo import XinghuoAdapter
-from models import MODEL_CONFIG
+from adapters.kimi import KimiAdapter
+from models import MODEL_CONFIG, KIMI_MODEL_CONFIG
 
 logger = logging.getLogger("webchat-api")
 
@@ -24,6 +25,7 @@ _MODEL_ADAPTER_MAP: dict[str, str] = {
     "mimo-": "mimo",
     "minimax-": "minimax",
     "xinghuo-": "xinghuo",
+    "kimi-": "kimi",
     # Anthropic 兼容模型映射到 doubao
     "claude-3-5-sonnet": "doubao",
     "claude-3-5-haiku": "doubao",
@@ -66,6 +68,9 @@ def _init_adapters():
 
     xinghuo = XinghuoAdapter()
     _ADAPTER_INSTANCES["xinghuo"] = xinghuo
+
+    kimi = KimiAdapter()
+    _ADAPTER_INSTANCES["kimi"] = kimi
 
     for name, adapter in _ADAPTER_INSTANCES.items():
         logger.info(f"Adapter registered: {name} ({len(adapter.get_models())} models)")

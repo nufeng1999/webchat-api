@@ -174,7 +174,7 @@ class BaseAdapter(ABC):
                         pass
 
             # 将意外提升到顶层的键迁移回 arguments
-            extra_keys = [k for k in tc.keys() if k not in ("id", "type", "function")]
+            extra_keys = [k for k in tc.keys() if k not in ("id", "type", "function", "index")]
             if extra_keys:
                 # 初始化 arguments 对象以便插入
                 if "arguments" not in tc["function"] or not isinstance(tc["function"]["arguments"], str):
@@ -1076,6 +1076,7 @@ class BaseAdapter(ABC):
                     "mimo": browser_client.activate_mimo_conversation,
                     "minimax": browser_client.activate_minimax_conversation,
                     "xinghuo": browser_client.activate_xinghuo_conversation,
+                    "kimi": browser_client.activate_kimi_conversation,
                 }
                 activate_fn = activate_map.get(adapter_name)
                 if activate_fn:

@@ -52,6 +52,13 @@ XINGHUO_MODEL_CONFIG = {
     "xinghuo-3.5": {"model_type": "3.5", "desc": "讯飞星火 3.5", "use_deep_think": False, "use_search": False, "supports_file": True, "display_name": "星火 3.5"},
 }
 
+KIMI_MODEL_CONFIG = {
+    "kimi-k2.7-code": {"model_type": "k2.7-code", "desc": "Kimi K2.7 Code (最强 Coding 模型)", "use_deep_think": True, "use_search": True, "supports_file": True, "display_name": "Kimi K2.7 Code"},
+    "kimi-k2.7-code-highspeed": {"model_type": "k2.7-code-highspeed", "desc": "Kimi K2.7 Code Highspeed (高速版)", "use_deep_think": True, "use_search": True, "supports_file": True, "display_name": "Kimi K2.7 Code Highspeed"},
+    "kimi-k2.6": {"model_type": "k2.6", "desc": "Kimi K2.6 (综合能力强，支持多模态)", "use_deep_think": True, "use_search": True, "supports_file": True, "display_name": "Kimi K2.6"},
+    "kimi-k2.5": {"model_type": "k2.5", "desc": "Kimi K2.5 (支持视觉与文本输入)", "use_deep_think": True, "use_search": True, "supports_file": True, "display_name": "Kimi K2.5"},
+}
+
 SYSTEM_PROMPT_MAP = {
     "doubao-coding": "你是一个专业的编程助手，擅长多种编程语言，能够编写、调试、优化代码，并解释技术概念。请用代码块格式输出代码。",
     "doubao-writing": "你是一个专业的写作助手，擅长各类文体写作，包括公文、邮件、文案、小说、论文等。请根据用户需求生成高质量的结构化文本。",

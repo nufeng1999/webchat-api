@@ -396,6 +396,13 @@ class BrowserClient:
         self._xinghuo_lock = asyncio.Lock()
         self._xinghuo_user_data_dir = os.path.join(BASE_DIR, "spark_user_data")
 
+        # Kimi 专属
+        self._kimi_pw = None
+        self._kimi_browser = None
+        self._kimi_page = None
+        self._kimi_lock = asyncio.Lock()
+        self._kimi_user_data_dir = os.path.join(BASE_DIR, "kimi_profile_headless")
+
     def _on_doubao_push(self, stream_id: str, kind: str, value):
         q = self._doubao_queues.get(stream_id)
         if q is None:
@@ -8274,6 +8281,423 @@ class BrowserClient:
                 "file_name": file_info.get("fileName", file_name),
             }
         return {"success": False, "reason": status_result.get("status", "unknown")}
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Kimi (Kimi AI - https://www.kimi.com/zh/chat)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def ensure_kimi_ready(self, headless: bool = True):
+        """确保 Kimi 浏览器已启动且 chat 编辑器就绪。"""
+        # 正确的入口 URL 是 https://www.kimi.com/zh (中文首页)，不是 /zh/chat
+        TARGET_URL = "https://www.kimi.com/zh"
+        if self._kimi_page and not self._kimi_page.is_closed():
+            try:
+                has_editor = await self._kimi_page.evaluate("""() => !!document.querySelector('.chat-input-editor')""")
+                if has_editor:
+                    return
+                await self._kimi_page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+                has_editor = await self._kimi_page.evaluate("""() => !!document.querySelector('.chat-input-editor')""")
+                if has_editor:
+                    return
+            except Exception as e:
+                logger.warning(f"[Kimi] nav failed: {e}")
+
+        from playwright.async_api import async_playwright
+        headless = CONFIG.get('_kimi_headless', headless)
+        logger.info(f"[Kimi] Starting browser... headless={headless}")
+        self._kimi_pw = await async_playwright().start()
+        self._kimi_browser = await self._kimi_pw.chromium.launch_persistent_context(
+            user_data_dir=self._kimi_user_data_dir,
+            headless=headless,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 900},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ignore_default_args=["--enable-automation"],
+        )
+        self._kimi_page = self._kimi_browser.pages[0] if self._kimi_browser.pages else await self._kimi_browser.new_page()
+        await self._kimi_page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+        """)
+        await self._kimi_page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+        for _ in range(30):
+            has_editor = await self._kimi_page.evaluate("""() => !!document.querySelector('.chat-input-editor')""")
+            if has_editor:
+                logger.info("[Kimi] Chat editor ready")
+                await self._kimi_page.evaluate(r"""() => {
+                    const closeBtns = document.querySelectorAll('[class*="close"], [aria-label="关闭"], [aria-label="Close"]');
+                    for (const btn of closeBtns) { try { btn.click(); } catch(e) {} }
+                }""")
+                await asyncio.sleep(1)
+                return
+            await asyncio.sleep(2)
+        if not headless:
+            logger.warning("[Kimi] Editor not found, may need manual login")
+
+    async def _kimi_upload_file_via_ui(self, file_content: str) -> bool:
+        """通过 drag-and-drop 自动上传文件到 Kimi（参考 DeepSeek 实现）。
+        
+        流程:
+        1. 确保已登录（检查 .chat-input-editor 存在）
+        2. 拦截上传 API (apiv2-files/file/upload) 获取 file_id
+        3. 在 .chat-input-editor 上模拟 drag-and-drop（dragenter → dragover → drop → dragend）
+        4. 等待上传 API 响应
+        5. 等待文件卡片状态变为 success（文件解析完成）
+        """
+        if not file_content or not self._kimi_page or self._kimi_page.is_closed():
+            return False
+
+        try:
+            # 1. 确保编辑器可用
+            try:
+                await self._kimi_page.wait_for_selector('.chat-input-editor', timeout=5000)
+            except Exception:
+                logger.error("[Kimi] chat-input-editor not found, likely not logged in")
+                return False
+
+            # 2. 拦截上传 API
+            upload_future: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+
+            async def handle_upload_route(route):
+                try:
+                    resp = await route.fetch()
+                    if resp.status == 200:
+                        try:
+                            data = await resp.json()
+                            if not upload_future.done():
+                                upload_future.set_result(data)
+                                file_id = data.get('file', {}).get('id', '')
+                                logger.info(f"[Kimi] upload API returned: file_id={file_id}")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.debug(f"[Kimi] upload route error: {e}")
+                finally:
+                    try:
+                        await route.fulfill()
+                    except Exception:
+                        pass
+
+            await self._kimi_page.route("**/apiv2-files/file/upload**", handle_upload_route)
+
+            # 3. drag-and-drop
+            drop_ok = await self._kimi_page.evaluate("""(content) => {
+                const editor = document.querySelector('.chat-input-editor');
+                if (!editor) return false;
+                
+                const blob = new Blob([content], { type: 'application/json' });
+                const file = new File([blob], 'request.json', { type: 'application/json', lastModified: Date.now() });
+                
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                
+                editor.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true }));
+                editor.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true }));
+                editor.dispatchEvent(new DragEvent('drop', {
+                    bubbles: true,
+                    cancelable: true,
+                    dataTransfer: dt
+                }));
+                editor.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true }));
+                
+                return true;
+            }""", file_content)
+
+            if not drop_ok:
+                logger.error("[Kimi] drag-and-drop failed")
+                await self._kimi_page.unroute("**/apiv2-files/file/upload**", handle_upload_route)
+                return False
+
+            logger.info("[Kimi] File dropped onto editor")
+
+            # 4. 等待上传响应
+            try:
+                upload_result = await asyncio.wait_for(upload_future, timeout=60)
+                file_id = upload_result.get('file', {}).get('id', '')
+                if not file_id:
+                    logger.warning(f"[Kimi] upload response missing file_id: {upload_result}")
+                    return False
+                logger.info(f"[Kimi] Upload complete, file_id={file_id}")
+            except asyncio.TimeoutError:
+                logger.warning("[Kimi] Upload API timeout")
+                return False
+            finally:
+                try:
+                    await self._kimi_page.unroute("**/apiv2-files/file/upload**", handle_upload_route)
+                except Exception:
+                    pass
+
+            # 5. 等待文件解析完成
+            file_ready = False
+            start = asyncio.get_event_loop().time()
+            while (asyncio.get_event_loop().time() - start) < 60:
+                await asyncio.sleep(2)
+                try:
+                    status = await self._kimi_page.evaluate("""() => {
+                        const cards = document.querySelectorAll('.file-card-container');
+                        if (cards.length === 0) return { found: false };
+                        const lastCard = cards[cards.length - 1];
+                        const className = lastCard.className || '';
+                        const isComplete = className.includes('success') || 
+                                          className.includes('done') ||
+                                          className.includes('complete');
+                        return { found: true, className, isComplete };
+                    }""")
+                    if status and status.get('found') and status.get('isComplete'):
+                        logger.info(f"[Kimi] File analysis complete")
+                        file_ready = True
+                        break
+                except Exception:
+                    pass
+
+            if not file_ready:
+                logger.warning("[Kimi] File analysis completion not detected")
+
+            logger.info("[Kimi] File upload flow completed")
+            return True
+
+        except Exception as e:
+            logger.error(f"[Kimi] UI upload exception: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def _kimi_get_auth_token(self) -> str:
+        if not self._kimi_browser:
+            return ""
+        try:
+            cookies = await self._kimi_browser.cookies()
+            for c in cookies:
+                if c.get("name") == "kimi-auth":
+                    return c.get("value", "")
+        except Exception:
+            pass
+        return ""
+
+    async def activate_kimi_conversation(self, conv_id: str) -> bool:
+        """激活已存在的 Kimi 会话（复用）。"""
+        if not self._kimi_page or self._kimi_page.is_closed():
+            await self.ensure_kimi_ready()
+        try:
+            # 导航到会话 URL
+            await self._kimi_page.goto(f"https://www.kimi.com/chat/{conv_id}", timeout=15000)
+            await asyncio.sleep(2)
+            # 检查是否成功加载到会话
+            editor_ok = await self._kimi_page.evaluate("""() => {
+                const editor = document.querySelector('.chat-input-editor');
+                return !!editor;
+            }""")
+            if editor_ok:
+                logger.info(f"[Kimi] activated conversation: {conv_id}")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"[Kimi] activate conversation error: {e}")
+            return False
+
+    async def _dismiss_kimi_popups(self):
+        """处理 Kimi 页面上的各种弹窗：关闭公告、同意协议、确认提示等。"""
+        if not self._kimi_page or self._kimi_page.is_closed():
+            return
+        try:
+            await self._kimi_page.evaluate(r"""() => {
+                // 1. 关闭按钮
+                const closeBtns = document.querySelectorAll('[class*="close"], [aria-label="关闭"], [aria-label="Close"], button[data-testid*="close"]');
+                for (const btn of closeBtns) { try { btn.click(); } catch(e) {} }
+                // 2. 同意/接受/确定 按钮
+                const agreePatterns = ['同意', '接受', '确定', '确认', ' Agree', 'Accept', 'OK', 'Confirm', 'Got it', '知道了', '我已知晓'];
+                const allBtns = document.querySelectorAll('button, [role="button"], a[role="button"]');
+                for (const btn of allBtns) {
+                    const txt = (btn.textContent || '').trim();
+                    if (agreePatterns.some(p => txt.includes(p))) {
+                        try { btn.click(); } catch(e) {}
+                    }
+                }
+                // 3. 关闭遮罩层弹窗
+                const overlays = document.querySelectorAll('[class*="overlay"], [class*="mask"], [class*="backdrop"], [class*="modal"]');
+                for (const overlay of overlays) {
+                    try { overlay.click(); } catch(e) {}
+                }
+            }""")
+            await self._kimi_page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.debug(f"[Kimi] dismiss popups: {e}")
+
+    async def stream_kimi_chat(self, prompt: str = "", file_content: str = None, **kwargs):
+        """发送消息到 Kimi 并流式返回响应。file_content 通过 UI 上传附件。
+        
+        此方法会:
+        1. 确保 Kimi 编辑器就绪（已在 ensure_kimi_ready 中处理）
+        2. 如果有文件内容，调用 _kimi_upload_file_via_ui 上传
+        3. 输入消息到 .chat-input-editor
+        4. 点击发送按钮或按 Enter
+        5. 轮询 DOM 获取回复内容
+        """
+        await self.ensure_kimi_ready()
+
+        await self._kimi_page.evaluate(r"""() => {
+            const closeBtns = document.querySelectorAll('[class*="close"], [aria-label="关闭"], [aria-label="Close"]');
+            for (const btn of closeBtns) { try { btn.click(); } catch(e) {} }
+        }""")
+        await asyncio.sleep(0.5)
+
+        try:
+            # 上传附件（如果有）
+            if file_content:
+                ok = await self._kimi_upload_file_via_ui(file_content)
+                if not ok:
+                    yield ("error", "[Kimi] UI file upload failed")
+                    return
+
+            # 输入消息
+            editor = await self._kimi_page.query_selector('.chat-input-editor')
+            if editor:
+                await editor.click()
+                await asyncio.sleep(0.2)
+                await self._kimi_page.keyboard.press("Control+A")
+                await asyncio.sleep(0.1)
+                await self._kimi_page.keyboard.press("Backspace")
+                await asyncio.sleep(0.2)
+                await self._kimi_page.keyboard.insert_text(prompt)
+                await asyncio.sleep(0.5)
+            else:
+                yield ("error", "[Kimi] chat-input-editor not found")
+                return
+
+            # 点击发送按钮或按 Enter 发送消息
+            await asyncio.sleep(0.5)
+            send_ok = await self._kimi_page.evaluate("""() => {
+                const btn = document.querySelector('.send-button-container:not(.disabled)') || 
+                           document.querySelector('.send-button:not(.disabled)');
+                if (btn) {
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if not send_ok:
+                await self._kimi_page.keyboard.press("Enter")
+
+            try:
+                await self._kimi_page.wait_for_url("**/chat/**", timeout=10000)
+            except Exception:
+                pass
+
+            # 从 URL 提取 chat_id 并 yield session_id 事件
+            try:
+                chat_id = await self._kimi_page.evaluate("""() => {
+                    const url = window.location.href;
+                    const match = url.match(/\\/chat\\/([a-f0-9-]+)/i);
+                    return match ? match[1] : '';
+                }""")
+                if chat_id:
+                    logger.info(f"[Kimi] session_id extracted from URL: {chat_id}")
+                    yield ("session_id", chat_id)
+                else:
+                    logger.warning("[Kimi] Could not extract chat_id from URL")
+            except Exception as e:
+                logger.warning(f"[Kimi] session_id extraction error: {e}")
+
+            # 读取 AI 回复（等待完整 JSON 响应后一次性 yield）
+            full_response = ""
+            for i in range(120):
+                await asyncio.sleep(1)
+                try:
+                    current_text = await self._kimi_page.evaluate("""() => {
+                        // 策略 1: 直接获取 .chat-content-item-assistant .segment-content
+                        const assistantItems = document.querySelectorAll('.chat-content-item-assistant');
+                        if (assistantItems.length > 0) {
+                            const lastItem = assistantItems[assistantItems.length - 1];
+                            const segmentContent = lastItem.querySelector('.segment-content');
+                            if (segmentContent) {
+                                const text = segmentContent.innerText || segmentContent.textContent || '';
+                                if (text.trim()) return text.trim();
+                            }
+                        }
+
+                        // 策略 2: 查找 .markdown-container 或 .markdown
+                        const markdownEls = document.querySelectorAll('.markdown-container, .markdown');
+                        for (const el of markdownEls) {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            if (text.includes('chatcmpl') && text.length > 100) {
+                                return text;
+                            }
+                        }
+
+                        // 策略 3: 查找包含 chatcmpl 的 paragraph
+                        const paragraphs = document.querySelectorAll('.paragraph');
+                        for (const el of paragraphs) {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            if (text.includes('chatcmpl') && text.length > 100) {
+                                return text;
+                            }
+                        }
+
+                        return '';
+                    }""")
+                except Exception:
+                    current_text = ""
+
+                if current_text and current_text != full_response:
+                    full_response = current_text
+
+                # Check if we have a complete Kimi JSON response
+                if full_response and self._is_complete_kimi_json_response(full_response):
+                    # Yield the full response as a single chunk, then done
+                    yield ("chunk", full_response)
+                    yield ("done", "")
+                    break
+                elif i >= 60 and len(full_response) > 100:
+                    # After 60 seconds, yield what we have
+                    yield ("chunk", full_response)
+                    yield ("done", "")
+                    break
+
+            # If loop ended without yielding done, yield empty done
+            if not full_response:
+                yield ("done", "")
+            else:
+                # If we have content but loop finished without explicit done, yield it once
+                yield ("chunk", full_response)
+                yield ("done", "")
+
+        except Exception as e:
+            logger.error(f"[Kimi] stream_chat error: {e}")
+            yield ("error", str(e))
+
+    def _is_complete_kimi_json_response(self, text: str) -> bool:
+        """Check if accumulated text forms a valid Kimi JSON response."""
+        import json
+        try:
+            data = json.loads(text)
+            return "choices" in data and "content" in data.get("choices", [{}])[0].get("message", {})
+        except (json.JSONDecodeError, KeyError, IndexError):
+            return False
+
+    async def close_kimi(self):
+        """Close Kimi browser context and cleanup resources."""
+        if self._kimi_page and not self._kimi_page.is_closed():
+            try:
+                await self._kimi_page.close()
+                logger.info("[Kimi] page closed")
+            except Exception as e:
+                logger.warning(f"[Kimi] close page error: {e}")
+        if self._kimi_browser:
+            try:
+                if hasattr(self._kimi_browser, 'is_connected') and self._kimi_browser.is_connected():
+                    await self._kimi_browser.close()
+                    logger.info("[Kimi] browser closed")
+                elif hasattr(self._kimi_browser, 'close'):
+                    await self._kimi_browser.close()
+                    logger.info("[Kimi] browser context closed")
+            except Exception as e:
+                logger.warning(f"[Kimi] close browser error: {e}")
+        self._kimi_page = None
+        self._kimi_browser = None
+        self._kimi_pw = None
+        logger.info("[Kimi] resources cleaned up")
 
 
 browser_client = BrowserClient()

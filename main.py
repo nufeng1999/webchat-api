@@ -87,6 +87,7 @@ async def lifespan(app: FastAPI):
         "mimo": browser_client.ensure_mimo_ready,
         "minimax": browser_client.ensure_minimax_ready,
         "xinghuo": browser_client.ensure_xinghuo_ready,
+        "kimi": browser_client.ensure_kimi_ready,
     }
     preload_names = [name for name in _preload_map if CONFIG.get(f"_preload_{name}")]
     if preload_names:
@@ -291,6 +292,13 @@ async def _full_cleanup():
         logger.info("Xinghuo conversations deleted from server")
     except Exception as e:
         logger.warning(f"Failed to delete Xinghuo conversations: {e}")
+
+    try:
+        from browser_client import browser_client
+        await browser_client.delete_all_kimi_conversations()
+        logger.info("Kimi conversations deleted from server")
+    except Exception as e:
+        logger.warning(f"Failed to delete Kimi conversations: {e}")
 
     clear_wsession()
     logger.info("[wsession] cleared all mappings (force clear mode)")
@@ -1074,7 +1082,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="WebChat Free API")
     parser.add_argument("--login", type=str, nargs='?', const='doubao', default=None,
-                        help="Open browser for login and save credentials. Specify 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', or 'minimax' (default: doubao)")
+                        help="Open browser for login and save credentials. Specify 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', 'xinghuo', or 'kimi' (default: doubao)")
     parser.add_argument("--host", default=None,
                         help="Server host (default: from config.json)")
     parser.add_argument("--port", type=int, default=None,
@@ -1093,6 +1101,8 @@ if __name__ == "__main__":
                         help="Show MiniMax Agent browser window only")
     parser.add_argument("--show-xinghuo", action="store_true", default=False,
                         help="Show Xinghuo SparkDesk browser window only")
+    parser.add_argument("--show-kimi", action="store_true", default=False,
+                        help="Show Kimi browser window only")
     parser.add_argument("--keep-conversations", action="store_true", default=False,
                         help="Keep all conversation history after server shutdown (default: delete)")
     parser.add_argument("-q", "--quiet", action="store_true", default=False,
@@ -1103,7 +1113,7 @@ if __name__ == "__main__":
                         choices=["chromium", "chrome", "edge"],
                         help="Browser engine for Playwright: chromium, chrome, edge (default: edge on Windows, chromium on other OS)")
     parser.add_argument("--clear-history", type=str, nargs='?', const='all', default=None,
-                        help="Clear conversation history. Specify platform names (doubao,deepseek,mimo,zai,qianwen,minimax,xinghuo) or 'all' (default: all)")
+                        help="Clear conversation history. Specify platform names (doubao,deepseek,mimo,zai,qianwen,minimax,xinghuo,kimi) or 'all' (default: all)")
     args = parser.parse_args()
 
     # 控制台日志控制
@@ -1116,7 +1126,7 @@ if __name__ == "__main__":
 
     # 各站点独立配置
     # 优先级：--show-xxx 参数 > config.json；若传了任何 --show-xxx，未指定的站点强制 headless
-    _any_show = any([args.show_doubao, args.show_qianwen, args.show_deepseek, args.show_zai, args.show_mimo, args.show_minimax, args.show_xinghuo])
+    _any_show = any([args.show_doubao, args.show_qianwen, args.show_deepseek, args.show_zai, args.show_mimo, args.show_minimax, args.show_xinghuo, args.show_kimi])
     CONFIG['_doubao_headless'] = not args.show_doubao if args.show_doubao else (True if _any_show else CONFIG.get('_doubao_headless', True))
     CONFIG['_qianwen_headless'] = not args.show_qianwen if args.show_qianwen else (True if _any_show else CONFIG.get('_qianwen_headless', True))
     CONFIG['_deepseek_headless'] = not args.show_deepseek if args.show_deepseek else (True if _any_show else CONFIG.get('_deepseek_headless', True))
@@ -1124,6 +1134,7 @@ if __name__ == "__main__":
     CONFIG['_mimo_headless'] = not args.show_mimo if args.show_mimo else (True if _any_show else CONFIG.get('_mimo_headless', True))
     CONFIG['_minimax_headless'] = not args.show_minimax if args.show_minimax else (True if _any_show else CONFIG.get('_minimax_headless', True))
     CONFIG['_xinghuo_headless'] = not args.show_xinghuo if args.show_xinghuo else (True if _any_show else CONFIG.get('_xinghuo_headless', True))
+    CONFIG['_kimi_headless'] = not args.show_kimi if args.show_kimi else (True if _any_show else CONFIG.get('_kimi_headless', True))
     # 浏览器通道映射：Playwright channel 参数
     # 优先使用 config.json 中的 _browser_channel，仅在命令行显式指定时覆盖
     _browser_channel_map = {"chromium": None, "chrome": "chrome", "edge": "msedge"}
@@ -1135,9 +1146,9 @@ if __name__ == "__main__":
 
     if args.login:
         target = args.login.lower()
-        if target not in ("doubao", "qianwen", "deepseek", "zai", "mimo", "minimax", "xinghuo"):
+        if target not in ("doubao", "qianwen", "deepseek", "zai", "mimo", "minimax", "xinghuo", "kimi"):
             if not _console_filter_quiet:
-                print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', or 'xinghuo'", file=sys.stderr)
+                print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', 'xinghuo', or 'kimi'", file=sys.stderr)
             os._exit(1)
         if target == "doubao":
             from login import do_login
@@ -1197,6 +1208,14 @@ if __name__ == "__main__":
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
+        elif target == "kimi":
+            from browser_client import browser_client
+            asyncio.run(browser_client.ensure_kimi_ready(headless=False))
+            if not _console_filter_quiet:
+                print("Kimi login completed")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         else:
             from qianwen_login import do_qianwen_login
             result = asyncio.run(do_qianwen_login(show_browser=True))
@@ -1221,7 +1240,7 @@ if __name__ == "__main__":
         client = BrowserClient()
         platforms = [p.strip().lower() for p in args.clear_history.split(',') if p.strip()]
         if 'all' in platforms:
-            platforms = ['doubao', 'deepseek', 'mimo', 'zai', 'qianwen', 'minimax', 'xinghuo']
+            platforms = ['doubao', 'deepseek', 'mimo', 'zai', 'qianwen', 'minimax', 'xinghuo', 'kimi']
 
         async def _clear_all():
             for p in platforms:
@@ -1267,6 +1286,12 @@ if __name__ == "__main__":
                         await client.delete_all_xinghuo_conversations()
                     except Exception as e:
                         logger.warning(f"[Clear] xinghuo: {e}")
+                elif p == 'kimi':
+                    try:
+                        await client.ensure_kimi_ready(headless=True)
+                        await client.delete_all_kimi_conversations()
+                    except Exception as e:
+                        logger.warning(f"[Clear] kimi: {e}")
                 else:
                     logger.warning(f"[Clear] unknown platform: {p}")
             await client.close()
