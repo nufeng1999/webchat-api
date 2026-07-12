@@ -1215,8 +1215,8 @@ if __name__ == "__main__":
             sys.stderr.flush()
             os._exit(0)
         elif target == "kimi":
-            from browser_client import browser_client
-            asyncio.run(browser_client.ensure_kimi_ready(headless=False))
+            from kimi_login import login_and_save
+            asyncio.run(login_and_save())
             if not _console_filter_quiet:
                 print("Kimi login completed")
             sys.stdout.flush()
