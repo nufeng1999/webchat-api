@@ -6,7 +6,7 @@
 
 - **OpenAI 兼容** — 完全兼容 `/v1/chat/completions`，支持流式/非流式、Tool Calls、Function Calling
 - **Anthropic 兼容** — 完全兼容 `/v1/messages`，Claude Code 原生对接
-- **7 大平台统一接入** — 豆包、千问、DeepSeek、z.ai、MiMo、MiniMax、讯飞星火
+- **8 大平台统一接入** — 豆包、千问、DeepSeek、z.ai、MiMo、MiniMax、讯飞星火、Kimi
 - **Vision 图片识别** — 支持 OpenAI Vision 格式，自动上传图片
 - **图片生成** — 兼容 OpenAI `/v1/images/generations`
 - **AI 音乐生成** — 歌词 + 音频自动生成，Web 端播放
@@ -51,6 +51,9 @@ python main.py --login minimax
 
 # 登录讯飞星火
 python main.py --login xinghuo
+
+# 登录 Kimi
+python main.py --login kimi
 ```
 
 ### 3. 启动服务
@@ -160,6 +163,15 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 | `xinghuo-4.0-ultra` | 星火 4.0 Ultra 旗舰 |
 | `xinghuo-4.0` | 星火 4.0 |
 | `xinghuo-3.5` | 星火 3.5 |
+
+### Kimi
+
+| 模型 ID | 说明 |
+|---------|------|
+| `kimi-k2.7-code` | Kimi K2.7 Code（最强 Coding 模型） |
+| `kimi-k2.7-code-highspeed` | Kimi K2.7 Code Highspeed（高速版） |
+| `kimi-k2.6` | Kimi K2.6（综合能力强，支持多模态） |
+| `kimi-k2.5` | Kimi K2.5（支持视觉与文本输入） |
 
 ### Anthropic Claude 模型映射
 
@@ -290,6 +302,7 @@ for chunk in stream:
 | `--show-mimo` | 显示 MiMo 浏览器窗口 |
 | `--show-minimax` | 显示 MiniMax 浏览器窗口 |
 | `--show-xinghuo` | 显示讯飞星火浏览器窗口 |
+| `--show-kimi` | 显示 Kimi 浏览器窗口 |
 | `--keep-conversations` | 保留对话历史（默认关闭时删除） |
 | `--browser` | 浏览器引擎（chromium/chrome/edge） |
 | `--clear-history [platforms]` | 清除对话历史 |
@@ -312,6 +325,7 @@ for chunk in stream:
     "_mimo_headless": true,
     "_minimax_headless": true,
     "_xinghuo_headless": true,
+    "_kimi_headless": true,
     "_keep_conversations": false,
     "conversation_retention_days": 7,
     "request_limiter_max_concurrent": {

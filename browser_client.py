@@ -8566,6 +8566,12 @@ class BrowserClient:
                 yield ("error", "[Kimi] chat-input-editor not found")
                 return
 
+            # 发送前记录已有的 assistant 回复数量，用于后续只读取新增回复
+            prev_assistant_count = await self._kimi_page.evaluate("""() => {
+                return document.querySelectorAll('.chat-content-item-assistant').length;
+            }""")
+            logger.debug(f"[Kimi] prev_assistant_count before send: {prev_assistant_count}")
+
             # 点击发送按钮或按 Enter 发送消息
             await asyncio.sleep(0.5)
             send_ok = await self._kimi_page.evaluate("""() => {
@@ -8602,46 +8608,49 @@ class BrowserClient:
 
             # 读取 AI 回复（等待完整 JSON 响应后一次性 yield）
             full_response = ""
+            last_processed_content = ""  # 记录已处理过的内容长度，用于增量提取
             for i in range(120):
                 await asyncio.sleep(1)
                 try:
-                    current_text = await self._kimi_page.evaluate("""() => {
-                        // 策略 1: 直接获取 .chat-content-item-assistant .segment-content
-                        const assistantItems = document.querySelectorAll('.chat-content-item-assistant');
-                        if (assistantItems.length > 0) {
-                            const lastItem = assistantItems[assistantItems.length - 1];
-                            const segmentContent = lastItem.querySelector('.segment-content');
-                            if (segmentContent) {
-                                const text = segmentContent.innerText || segmentContent.textContent || '';
-                                if (text.trim()) return text.trim();
-                            }
-                        }
-
-                        // 策略 2: 查找 .markdown-container 或 .markdown
-                        const markdownEls = document.querySelectorAll('.markdown-container, .markdown');
-                        for (const el of markdownEls) {
-                            const text = (el.innerText || el.textContent || '').trim();
-                            if (text.includes('chatcmpl') && text.length > 100) {
-                                return text;
-                            }
-                        }
-
-                        // 策略 3: 查找包含 chatcmpl 的 paragraph
-                        const paragraphs = document.querySelectorAll('.paragraph');
-                        for (const el of paragraphs) {
-                            const text = (el.innerText || el.textContent || '').trim();
-                            if (text.includes('chatcmpl') && text.length > 100) {
-                                return text;
-                            }
-                        }
-
-                        return '';
+                    # 获取当前所有 assistant 项的数量
+                    current_count = await self._kimi_page.evaluate("""() => {
+                        return document.querySelectorAll('.chat-content-item-assistant').length;
                     }""")
+                    
+                    # 只从新增的 assistant 项中读取内容
+                    new_count = current_count - prev_assistant_count
+                    if new_count <= 0:
+                        # 还没新增 assistant 项，尝试从已有的最后一项读取（仍在生成中）
+                        current_text = await self._kimi_page.evaluate("""() => {
+                            const items = document.querySelectorAll('.chat-content-item-assistant');
+                            if (items.length === 0) return '';
+                            const lastItem = items[items.length - 1];
+                            const seg = lastItem.querySelector('.segment-content');
+                            if (!seg) return '';
+                            return (seg.innerText || seg.textContent || '').trim();
+                        }""")
+                        current_text = current_text if current_text else ''
+                    else:
+                        # 有新增项，读取最新的那一条
+                        current_text = await self._kimi_page.evaluate(f"""() => {{
+                            const items = document.querySelectorAll('.chat-content-item-assistant');
+                            if (items.length === 0) return '';
+                            const newItem = items[items.length - 1];
+                            const seg = newItem.querySelector('.segment-content');
+                            if (!seg) return '';
+                            return (seg.innerText || seg.textContent || '').trim();
+                        }}""")
+                        # 增量提取：只取新增内容
+                        if current_text and last_processed_content and current_text.startswith(last_processed_content):
+                            current_text = current_text[len(last_processed_content):]
+                        if current_text:
+                            last_processed_content = (last_processed_content or '') + current_text
+                            logger.debug(f"[Kimi] incremental chunk ({len(current_text)} chars)")
+                    
+                    if current_text and current_text != full_response:
+                        full_response += current_text
                 except Exception:
-                    current_text = ""
-
-                if current_text and current_text != full_response:
-                    full_response = current_text
+                    pass
 
                 # Check if we have a complete Kimi JSON response
                 if full_response and self._is_complete_kimi_json_response(full_response):

@@ -335,20 +335,20 @@ async def _selective_cleanup(retention_days: int):
         remove_mapping_by_conv_id(conv_id)
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: Request, body: ChatCompletionRequest):
     logger.debug(f"------------------[new chat_completions]------------------")
-    adapter = get_adapter(request.model)
-
+    adapter = get_adapter(body.model)
+    logger.debug(f"x-session-id：{request.headers.get('x-session-id')}")
     # wsession 处理
-    wsession = resolve_wsession(request.messages)
-    mapped_conv_id = get_conversation_id(request.model, wsession)
+    wsession = resolve_wsession(body.messages)
+    mapped_conv_id = get_conversation_id(body.model, wsession)
     if mapped_conv_id:
-        request.conversation_id = mapped_conv_id
-        logger.info(f"[wsession] {request.model}:{wsession} 发现映射: {mapped_conv_id} (复用)")
+        body.conversation_id = mapped_conv_id
+        logger.info(f"[wsession] {body.model}:{wsession} 发现映射: {mapped_conv_id} (复用)")
     else:
-        logger.info(f"[wsession] {request.model}:{wsession} 无映射 → 创建新对话")
+        logger.info(f"[wsession] {body.model}:{wsession} 无映射 → 创建新对话")
 
-    acquired, error_msg = await request_limiter.acquire(request.model)
+    acquired, error_msg = await request_limiter.acquire(body.model)
     if not acquired:
         logger.debug(f"[chat_completions] not acquired ")
         return JSONResponse(
@@ -357,12 +357,12 @@ async def chat_completions(request: ChatCompletionRequest):
         )
 
     try:
-        if request.stream:
-            logger.debug(f"[Request] stream {request.model}")
+        if body.stream:
+            logger.debug(f"[Request] stream {body.model}")
             async def stream_with_cleanup():
-                async for chunk in adapter.stream_chat(request):
+                async for chunk in adapter.stream_chat(body):
                     yield chunk
-                await _update_wsession_mapping(adapter, wsession, request.model)
+                await _update_wsession_mapping(adapter, wsession, body.model)
             return StreamingResponse(
                 stream_with_cleanup(),
                 media_type="text/event-stream",
@@ -373,18 +373,18 @@ async def chat_completions(request: ChatCompletionRequest):
                 }
             )
         else:
-            logger.debug(f"[Request] non_stream {request.model}")
-            result = await adapter.non_stream_chat(request)
-            await _update_wsession_mapping(adapter, wsession, request.model)
+            logger.debug(f"[Request] non_stream {body.model}")
+            result = await adapter.non_stream_chat(body)
+            await _update_wsession_mapping(adapter, wsession, body.model)
             return JSONResponse(content=result)
     finally:
-        request_limiter.release(request.model)
+        request_limiter.release(body.model)
 
 @app.post("/v1/messages")
-async def anthropic_messages(request: AnthropicMessageRequest):
-    if request.stream:
+async def anthropic_messages(request: Request, body: AnthropicMessageRequest):
+    if body.stream:
         return StreamingResponse(
-            stream_anthropic_messages(request),
+            stream_anthropic_messages(body),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -393,7 +393,7 @@ async def anthropic_messages(request: AnthropicMessageRequest):
             }
         )
     else:
-        result = await non_stream_anthropic_messages(request)
+        result = await non_stream_anthropic_messages(body)
         return JSONResponse(content=result)
 
 @app.get("/v1/models")
