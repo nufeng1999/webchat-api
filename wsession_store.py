@@ -6,6 +6,7 @@ wsession 共享映射表 — (model, wsession) → web 对话实例 ID
 import re
 import threading
 import time
+import uuid
 import sqlite3
 from typing import Optional
 
@@ -65,8 +66,29 @@ def extract_wsession(messages) -> Optional[str]:
 
 
 def resolve_wsession(messages) -> str:
-    """提取 wsession，如果没有则返回 DEFAULT_WSESSION。"""
-    return extract_wsession(messages) or DEFAULT_WSESSION
+    """提取 wsession，如果没有则用 system content 生成 UUID5 作为 wsession。"""
+    wsession = extract_wsession(messages)
+    if wsession:
+        return wsession
+    
+    # 未找到 wsession，获取第一条 system 消息的 content
+    for m in messages:
+        if getattr(m, 'role', None) == 'system':
+            content = getattr(m, 'content', '') or ''
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        content = item.get("text", "")
+                        break
+            
+            if content:
+                # 如果 content 长度大于 2048，只取最后 2048 个字符
+                if len(content) > 2048:
+                    content = content[-2048:]
+                return str(uuid.uuid5(uuid.NAMESPACE_DNS, content))
+    
+    # 如果没有 system content，回退到 DEFAULT_WSESSION
+    return DEFAULT_WSESSION
 
 
 def get_conversation_id(model: str, wsession: str) -> Optional[str]:

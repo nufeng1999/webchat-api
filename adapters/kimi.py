@@ -125,9 +125,11 @@ class KimiAdapter(BaseAdapter):
             request_dict['task'] = get_webchat_task(self.get_adapter_name())
         request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
         msgs = request_dict.get('messages', [])
-        if len(msgs) > 5:
-            msgs = msgs[-5:]
-        request_dict['messages'] = msgs
+        if len(msgs) > 25:
+            new_msgs = msgs[:15] + msgs[-10:]
+        else:
+            new_msgs = msgs
+        request_dict['messages'] = new_msgs
         return json.dumps(request_dict, ensure_ascii=False, indent=None, separators=(',', ':'))
 
     def _build_retry_prompt(self, prompt_text: str, is_tool_return: bool, parse_error_history: list) -> str:
