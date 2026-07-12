@@ -52,10 +52,16 @@ async def lifespan(app: FastAPI):
     def _silent_playwright_errors(loop, context):
         exc = context.get('exception')
         msg = context.get('message', '')
+        exc_str = str(exc) if exc else ''
         # 抑制 Playwright 连接关闭相关的异步警告
-        if exc and 'Connection closed while reading from the driver' in str(exc):
+        if exc and 'Connection closed while reading from the driver' in exc_str:
             return
         if 'Future exception was never retrieved' in msg and 'Connection closed while reading from the driver' in msg:
+            return
+        # 抑制 Playwright 关闭时产生的 transport/window I/O 错误
+        if isinstance(exc, ValueError) and 'I/O operation on closed pipe' in exc_str:
+            return
+        if 'Task was destroyed but it is pending' in msg:
             return
         if _original_handler:
             _original_handler(loop, context)

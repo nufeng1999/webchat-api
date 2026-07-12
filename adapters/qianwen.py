@@ -125,6 +125,24 @@ class QianwenAdapter(BaseAdapter):
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             else:
                 prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
+
+            try:
+                file_name = "request.json"
+                if last_role == 'tool':
+                    file_name = "toolreturn.json"
+                    request_dict['task'] = get_ret_format_prompt(self.get_adapter_name())
+                    request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
+                request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
+                logs_dir = os.path.join(BASE_DIR, "logs")
+                os.makedirs(logs_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tool_path = os.path.join(logs_dir, f"toolreturn_{ts}.{file_name.rsplit('.', 1)[-1] if '.' in file_name else 'json'}")
+                with open(tool_path, 'w', encoding='utf-8') as f:
+                    f.write(request_json)
+                logger.info(f"[Qianwen] saved {Colors.BOLD_RED}{file_name}{Colors.RESET} to {tool_path}")
+            except Exception as e:
+                logger.warning(f"[Qianwen] save {file_name} failed: {e}")
+
             self._pending_messages = [{
                 "mime_type": "text/plain",
                 "content": prompt_text,

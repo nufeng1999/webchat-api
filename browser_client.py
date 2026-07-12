@@ -401,7 +401,7 @@ class BrowserClient:
         self._kimi_browser = None
         self._kimi_page = None
         self._kimi_lock = asyncio.Lock()
-        self._kimi_user_data_dir = os.path.join(BASE_DIR, "kimi_profile_headless")
+        self._kimi_user_data_dir = os.path.join(BASE_DIR, "kimi_profile")
 
     def _on_doubao_push(self, stream_id: str, kind: str, value):
         q = self._doubao_queues.get(stream_id)
@@ -8551,10 +8551,23 @@ class BrowserClient:
                     yield ("error", "[Kimi] UI file upload failed")
                     return
 
-            # 输入消息
+            # 移除遮罩层：Kimi 上传文件后，侧边栏的 mask 可能挡住编辑器/发送按钮
+            await self._kimi_page.evaluate("""() => {
+                document.querySelectorAll('[class*="mask"], [class*="overlay"], [class*="backdrop"], [class*="sidebar-slot"]').forEach(el => {
+                    try {
+                        if (el.style) el.style.display = 'none';
+                    } catch(e) {}
+                });
+            }""")
+            await asyncio.sleep(0.2)
+
+            # 输入消息（用 evaluate 聚焦+输入，绕过 Playwright 指针拦截检查）
             editor = await self._kimi_page.query_selector('.chat-input-editor')
             if editor:
-                await editor.click()
+                await self._kimi_page.evaluate("""() => {
+                    const ed = document.querySelector('.chat-input-editor');
+                    if (ed) { ed.focus(); ed.click(); }
+                }""")
                 await asyncio.sleep(0.2)
                 await self._kimi_page.keyboard.press("Control+A")
                 await asyncio.sleep(0.1)

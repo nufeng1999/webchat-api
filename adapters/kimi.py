@@ -86,6 +86,20 @@ class KimiAdapter(BaseAdapter):
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             else:
                 prompt_text = get_exectask_prompt(self.get_adapter_name()) + "\n " + self._get_last_message_as_json(request_dict)
+
+            try:
+                logs_dir = os.path.join(BASE_DIR, "logs")
+                os.makedirs(logs_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_content = self._prepare_inline_file_content(request, is_tool_return)
+                fname = "toolreturn.json" if is_tool_return else "request.json"
+                saved_path = os.path.join(logs_dir, f"{fname.rsplit('.', 1)[0]}_{ts}.json")
+                with open(saved_path, 'w', encoding='utf-8') as f:
+                    f.write(file_content)
+                logger.info(f"[Kimi] saved {Colors.BOLD_RED}{fname}{Colors.RESET} to {saved_path}")
+            except Exception as e:
+                logger.warning(f"[Kimi] save {fname} failed: {e}")
+
             return prompt_text, None
 
         last_msg = request.messages[-1] if request.messages else None
