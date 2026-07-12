@@ -8606,71 +8606,53 @@ class BrowserClient:
             except Exception as e:
                 logger.warning(f"[Kimi] session_id extraction error: {e}")
 
-            # 读取 AI 回复（等待完整 JSON 响应后一次性 yield）
-            full_response = ""
-            last_processed_content = ""  # 记录已处理过的内容长度，用于增量提取
-            for i in range(120):
+            # 读取 AI 回复
+            full_response_from_dom = ""  # 跟踪 DOM 中最新的完整助理消息文本
+            last_yielded_full_content = "" # 跟踪已作为块返回的完整内容
+
+            for i in range(120):  # 轮询 120 秒
                 await asyncio.sleep(1)
                 try:
-                    # 获取当前所有 assistant 项的数量
-                    current_count = await self._kimi_page.evaluate("""() => {
-                        return document.querySelectorAll('.chat-content-item-assistant').length;
+                    # 获取当前最后一个 assistant 消息的完整文本
+                    current_assistant_text = await self._kimi_page.evaluate("""() => {
+                        const assistantItems = document.querySelectorAll('.chat-content-item-assistant');
+                        if (assistantItems.length === 0) return '';
+                        const lastItem = assistantItems[assistantItems.length - 1];
+                        const segmentContent = lastItem.querySelector('.segment-content');
+                        if (segmentContent) {
+                            return (segmentContent.innerText || segmentContent.textContent || '').trim();
+                        }
+                        return '';
                     }""")
-                    
-                    # 只从新增的 assistant 项中读取内容
-                    new_count = current_count - prev_assistant_count
-                    if new_count <= 0:
-                        # 还没新增 assistant 项，尝试从已有的最后一项读取（仍在生成中）
-                        current_text = await self._kimi_page.evaluate("""() => {
-                            const items = document.querySelectorAll('.chat-content-item-assistant');
-                            if (items.length === 0) return '';
-                            const lastItem = items[items.length - 1];
-                            const seg = lastItem.querySelector('.segment-content');
-                            if (!seg) return '';
-                            return (seg.innerText || seg.textContent || '').trim();
-                        }""")
-                        current_text = current_text if current_text else ''
-                    else:
-                        # 有新增项，读取最新的那一条
-                        current_text = await self._kimi_page.evaluate(f"""() => {{
-                            const items = document.querySelectorAll('.chat-content-item-assistant');
-                            if (items.length === 0) return '';
-                            const newItem = items[items.length - 1];
-                            const seg = newItem.querySelector('.segment-content');
-                            if (!seg) return '';
-                            return (seg.innerText || seg.textContent || '').trim();
-                        }}""")
-                        # 增量提取：只取新增内容
-                        if current_text and last_processed_content and current_text.startswith(last_processed_content):
-                            current_text = current_text[len(last_processed_content):]
-                        if current_text:
-                            last_processed_content = (last_processed_content or '') + current_text
-                            logger.debug(f"[Kimi] incremental chunk ({len(current_text)} chars)")
-                    
-                    if current_text and current_text != full_response:
-                        full_response += current_text
-                except Exception:
-                    pass
 
-                # Check if we have a complete Kimi JSON response
-                if full_response and self._is_complete_kimi_json_response(full_response):
-                    # Yield the full response as a single chunk, then done
-                    yield ("chunk", full_response)
+                    if current_assistant_text and current_assistant_text != last_yielded_full_content:
+                        # 仅返回新增的部分
+                        new_content_to_yield = current_assistant_text[len(last_yielded_full_content):]
+                        if new_content_to_yield:
+                            yield ("chunk", new_content_to_yield)
+                            logger.debug(f"[Kimi] yielding new chunk: {new_content_to_yield[:100]}...")
+                            last_yielded_full_content = current_assistant_text
+                    
+                    full_response_from_dom = current_assistant_text # 更新 DOM 中观察到的最新完整响应
+
+                except Exception as e:
+                    logger.warning(f"[Kimi] Error during polling for response: {e}")
+
+                # 使用 DOM 中观察到的完整内容检查是否完成
+                if full_response_from_dom and self._is_complete_kimi_json_response(full_response_from_dom):
                     yield ("done", "")
+                    logger.debug("[Kimi] Full Kimi JSON response detected, ending stream.")
                     break
-                elif i >= 60 and len(full_response) > 100:
-                    # After 60 seconds, yield what we have
-                    yield ("chunk", full_response)
+                elif i >= 60 and full_response_from_dom and full_response_from_dom == last_yielded_full_content:
+                    # 60秒后，如果内容没有变化，则认为是完成或卡住
+                    logger.debug(f"[Kimi] Timeout or stuck detected (60s), ending stream.")
                     yield ("done", "")
                     break
 
-            # If loop ended without yielding done, yield empty done
-            if not full_response:
+            # 如果循环结束时没有明确的 done 信号
+            if not full_response_from_dom or full_response_from_dom == last_yielded_full_content:
                 yield ("done", "")
-            else:
-                # If we have content but loop finished without explicit done, yield it once
-                yield ("chunk", full_response)
-                yield ("done", "")
+                logger.debug("[Kimi] Stream ended without new content or explicit done.")
 
         except Exception as e:
             logger.error(f"[Kimi] stream_chat error: {e}")
