@@ -1,6 +1,6 @@
 # WebChat Free API
 
-将豆包、千问、DeepSeek、z.ai（智谱）、MiMo（小米）、MiniMax、讯飞星火 7 大 AI 平台的对话能力包装为标准 OpenAI / Anthropic 兼容 API，供 Claude Code、OpenCode 等 AI Agent 软件直接调用。
+将豆包、千问、DeepSeek、z.ai（智谱）、MiMo（小米）、MiniMax、讯飞星火、Kimi 8 大 AI 平台的对话能力包装为标准 OpenAI / Anthropic 兼容 API，供 Claude Code、OpenCode 等 AI Agent 软件直接调用。
 
 ## 功能特性
 
@@ -335,7 +335,8 @@ for chunk in stream:
         "zai": 1,
         "mimo": 1,
         "minimax": 1,
-        "xinghuo": 1
+        "xinghuo": 1,
+        "kimi": 1
     }
 }
 ```
@@ -372,7 +373,8 @@ webchat-api/
 │   ├── zai.py               # z.ai 适配器
 │   ├── mimo.py              # MiMo 适配器
 │   ├── minimax.py           # MiniMax 适配器
-│   └── xinghuo.py           # 讯飞星火适配器
+│   ├── xinghuo.py           # 讯飞星火适配器
+│   └── kimi.py              # Kimi 适配器
 ├── music.py                 # 音乐生成
 ├── podcast.py               # 播客生成
 ├── volcengine_tts.py        # 火山引擎 TTS
