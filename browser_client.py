@@ -8638,45 +8638,82 @@ class BrowserClient:
                         return '';
                     }""")
 
-                    if current_assistant_text and current_assistant_text != last_yielded_full_content:
-                        # 仅返回新增的部分
-                        new_content_to_yield = current_assistant_text[len(last_yielded_full_content):]
-                        if new_content_to_yield:
-                            yield ("chunk", new_content_to_yield)
-                            logger.debug(f"[Kimi] yielding new chunk: {new_content_to_yield[:100]}...")
-                            last_yielded_full_content = current_assistant_text
-                    
-                    full_response_from_dom = current_assistant_text # 更新 DOM 中观察到的最新完整响应
+                    # 累积完整文本用于最终提取
+                    if current_assistant_text:
+                        full_response_from_dom = current_assistant_text
+
+                    # 检测完成：JSON 完整或超时
+                    is_done = False
+                    if full_response_from_dom and self._is_complete_kimi_json_response(full_response_from_dom):
+                        is_done = True
+                        logger.debug("[Kimi] Full Kimi JSON response detected, ending stream.")
+                    elif i >= 60 and full_response_from_dom:
+                        is_done = True
+                        logger.debug(f"[Kimi] Timeout or stuck detected (60s), ending stream.")
+
+                    if is_done:
+                        # 将完整文本传给 done 事件，供适配器一次性提取 JSON
+                        yield ("done", full_response_from_dom)
+                        break
 
                 except Exception as e:
                     logger.warning(f"[Kimi] Error during polling for response: {e}")
 
-                # 使用 DOM 中观察到的完整内容检查是否完成
-                if full_response_from_dom and self._is_complete_kimi_json_response(full_response_from_dom):
-                    yield ("done", "")
-                    logger.debug("[Kimi] Full Kimi JSON response detected, ending stream.")
-                    break
-                elif i >= 60 and full_response_from_dom and full_response_from_dom == last_yielded_full_content:
-                    # 60秒后，如果内容没有变化，则认为是完成或卡住
-                    logger.debug(f"[Kimi] Timeout or stuck detected (60s), ending stream.")
-                    yield ("done", "")
-                    break
-
             # 如果循环结束时没有明确的 done 信号
-            if not full_response_from_dom or full_response_from_dom == last_yielded_full_content:
+            if not full_response_from_dom:
                 yield ("done", "")
-                logger.debug("[Kimi] Stream ended without new content or explicit done.")
+                logger.debug("[Kimi] Stream ended without new content.")
 
         except Exception as e:
             logger.error(f"[Kimi] stream_chat error: {e}")
             yield ("error", str(e))
 
     def _is_complete_kimi_json_response(self, text: str) -> bool:
-        """Check if accumulated text forms a valid Kimi JSON response."""
+        """Check if accumulated text forms a valid Kimi JSON response.
+        使用 strict=False 允许字符串中包含字面换行符等控制字符。"""
         import json
         try:
-            data = json.loads(text)
-            return "choices" in data and "content" in data.get("choices", [{}])[0].get("message", {})
+            # 提取第一个完整的 JSON 结构（忽略前导非 JSON 文本）
+            start = -1
+            for i, ch in enumerate(text):
+                if ch == '{' or ch == '[':
+                    start = i
+                    break
+            if start == -1:
+                return False
+            # 找到匹配的闭合
+            stack = []
+            in_string = False
+            escape = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == '\\':
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                    elif ch == '{' or ch == '[':
+                        stack.append(ch)
+                    elif ch == '}':
+                        if stack and stack[-1] == '{':
+                            stack.pop()
+                        else:
+                            break
+                    elif ch == ']':
+                        if stack and stack[-1] == '[':
+                            stack.pop()
+                        else:
+                            break
+                if not stack:
+                    json_text = text[start:i+1]
+                    data = json.loads(json_text, strict=False)
+                    return "choices" in data and "content" in data.get("choices", [{}])[0].get("message", {})
+            return False
         except (json.JSONDecodeError, KeyError, IndexError):
             return False
 

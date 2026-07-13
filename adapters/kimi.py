@@ -1,6 +1,5 @@
 """Kimi Adapter for webchat-api"""
 import json
-import re
 import uuid
 import time
 import asyncio
@@ -174,79 +173,75 @@ class KimiAdapter(BaseAdapter):
 
     async def _call_stream(self, **kwargs):
         from browser_client import browser_client
+
+        full_response = None
         async for kind, value in browser_client.stream_kimi_chat(**kwargs):
-            if kind == "chunk":
-                text = value.strip()
-                match = re.search(r'\{.*\}', text, re.DOTALL)
-                
-                if match:
-                    json_str = match.group(0)
-                    try:
-                        data = json.loads(json_str)
-                        
-                        # 已是完整的OpenAI格式：直接透传
-                        if "choices" in data and data.get("object") == "chat.completion.chunk":
-                            yield "chunk", json_str
-                            continue
-                        
-                        # 需要包装的情况
-                        if data.get("object") == "chat.requests":
-                            # Kimi 完整响应格式：将 message 直接映射到 delta
-                            req_list = data.get("chat.requests", [])
-                            if req_list:
-                                req = req_list[0]
-                                message = req.get("message", {})
-                                finish_reason = req.get("finish_reason", "stop")
-                                sse_chunk = {
-                                    "id": data.get("id", ""),
-                                    "object": "chat.completion.chunk",
-                                    "created": data.get("created", 0),
-                                    "model": data.get("model", ""),
-                                    "choices": [{
-                                        "index": req.get("index", 0),
-                                        "delta": message,
-                                        "finish_reason": finish_reason
-                                    }]
-                                }
-                                yield "chunk", json.dumps(sse_chunk, ensure_ascii=False)
-                                continue
-
-                        content = None
-                        tool_calls = None
-                        finish_reason = "stop"
-                        
-                        if "content" in data:
-                            # 简单内容响应
-                            content = data.get("content")
-                        elif "tool_calls" in data:
-                            # tool_calls 响应
-                            tool_calls = data.get("tool_calls")
-                            finish_reason = "tool_calls"
-                        else:
-                            # 未知格式，透传
-                            yield kind, value
-                            continue
-                        
-                        # 构建标准 OpenAI SSE chunk
-                        sse_chunk = {
-                            "id": data.get("id", ""),
-                            "object": "chat.completion.chunk",
-                            "created": data.get("created", 0),
-                            "model": data.get("model", ""),
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": content, "tool_calls": tool_calls},
-                                "finish_reason": finish_reason
-                            }]
-                        }
-                        yield "chunk", json.dumps(sse_chunk, ensure_ascii=False)
-                        continue
-                    except json.JSONDecodeError:
-                        pass
-
+            if kind == "session_id":
                 yield kind, value
-            else:
+            elif kind == "error":
                 yield kind, value
+                return
+            elif kind == "done":
+                full_response = value
+                break
+
+        if not full_response:
+            return
+
+        cleaned = self._strip_json_prefix(full_response)
+
+        try:
+            data = json.loads(cleaned, strict=False)
+        except json.JSONDecodeError:
+            if cleaned:
+                yield "chunk", cleaned
+            return
+
+        if "choices" in data and data.get("object") == "chat.completion":
+            choice = data["choices"][0]
+            message = choice.get("message", {})
+            content = message.get("content")
+            tool_calls = message.get("tool_calls")
+            finish_reason = choice.get("finish_reason", "stop")
+
+            chunk = {
+                "id": data.get("id", ""),
+                "object": "chat.completion.chunk",
+                "created": data.get("created", 0),
+                "model": data.get("model", ""),
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason
+                }]
+            }
+            if content:
+                chunk["choices"][0]["delta"]["content"] = content
+            if tool_calls:
+                chunk["choices"][0]["delta"]["tool_calls"] = tool_calls
+                if finish_reason == "stop":
+                    chunk["choices"][0]["finish_reason"] = "tool_calls"
+            yield "chunk", json.dumps(chunk, ensure_ascii=False)
+        elif data.get("object") == "chat.requests":
+            req_list = data.get("chat.requests", [])
+            if req_list:
+                req = req_list[0]
+                message = req.get("message", {})
+                finish_reason = req.get("finish_reason", "stop")
+                chunk = {
+                    "id": data.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "created": data.get("created", 0),
+                    "model": data.get("model", ""),
+                    "choices": [{
+                        "index": req.get("index", 0),
+                        "delta": message,
+                        "finish_reason": finish_reason
+                    }]
+                }
+                yield "chunk", json.dumps(chunk, ensure_ascii=False)
+        elif cleaned:
+            yield "chunk", cleaned
 
     async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
         self._last_session_id = ""

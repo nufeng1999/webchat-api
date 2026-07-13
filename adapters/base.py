@@ -688,20 +688,60 @@ class BaseAdapter(ABC):
 
         return full_text, suppress_text, buffered_chunks, False, None, _think_buf
 
+    def _extract_first_json(self, text: str) -> str:
+        """从文本中提取第一个完整的 JSON 对象/数组（支持跨行）。如未闭合则返回从首个 { 或 [ 到末尾的子串。"""
+        # 找到第一个 { 或 [
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == '{' or ch == '[':
+                start = i
+                break
+        if start == -1:
+            return ""
+        # 使用栈和字符串状态追踪来寻找匹配的闭合
+        stack = []
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                # 在字符串内部忽略结构字符（包括字面换行等控制字符）
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{' or ch == '[':
+                    stack.append(ch)
+                elif ch == '}':
+                    if stack and stack[-1] == '{':
+                        stack.pop()
+                    else:
+                        break  # 不匹配，终止
+                elif ch == ']':
+                    if stack and stack[-1] == '[':
+                        stack.pop()
+                    else:
+                        break  # 不匹配，终止
+            if not stack:
+                # 找到闭合的顶层结构
+                return text[start:i+1]
+        # 未闭合，返回从 start 到末尾（用于流式增量）
+        return text[start:]
+
     def _strip_json_prefix(self, text: str) -> str:
+        """剥离 JSON 前的任意非 JSON 字符，并尝试返回仅含第一个完整 JSON 对象/数组的字符串。"""
         text = (text or "").replace('\x00', '')
         if not text:
             return ""
         stripped = text.lstrip()
         if not stripped:
             return ""
-        if stripped.startswith('{') or stripped.startswith('[') or stripped.startswith("```"):
-            return stripped
-        if stripped.startswith("思考过程") or stripped.startswith("reasoning") or stripped.startswith("json"):
-            match = re.search(r'\{[\s\S]*|\[[\s\S]*', stripped)
-            if match:
-                return match.group(0).strip()
-        return text
+        return self._extract_first_json(stripped)
 
     def _strip_think_tags_with_buf(self, text: str) -> tuple[str, str]:
         """
