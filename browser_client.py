@@ -8622,6 +8622,8 @@ class BrowserClient:
             # 读取 AI 回复
             full_response_from_dom = ""  # 跟踪 DOM 中最新的完整助理消息文本
             last_yielded_full_content = "" # 跟踪已作为块返回的完整内容
+            stable_count = 0  # 连续稳定（内容无变化）的秒数
+            MAX_STABLE_SECONDS = 10  # 连续 10 秒无变化视为完成
 
             for i in range(120):  # 轮询 120 秒
                 await asyncio.sleep(1)
@@ -8638,21 +8640,27 @@ class BrowserClient:
                         return '';
                     }""")
 
-                    # 累积完整文本用于最终提取
+                    # 检测内容是否已稳定（AI 完成生成）
                     if current_assistant_text:
+                        if current_assistant_text == full_response_from_dom:
+                            stable_count += 1
+                        else:
+                            stable_count = 0  # 内容有变化，重置稳定计数
                         full_response_from_dom = current_assistant_text
 
-                    # 检测完成：JSON 完整或超时
+                    # 检测完成条件
                     is_done = False
                     if full_response_from_dom and self._is_complete_kimi_json_response(full_response_from_dom):
                         is_done = True
                         logger.debug("[Kimi] Full Kimi JSON response detected, ending stream.")
-                    elif i >= 60 and full_response_from_dom:
+                    elif stable_count >= MAX_STABLE_SECONDS and full_response_from_dom:
                         is_done = True
-                        logger.debug(f"[Kimi] Timeout or stuck detected (60s), ending stream.")
+                        logger.debug(f"[Kimi] Content stable for {MAX_STABLE_SECONDS}s, ending stream.")
+                    elif i >= 110 and full_response_from_dom:
+                        is_done = True
+                        logger.debug(f"[Kimi] Max timeout (120s), ending stream with current content.")
 
                     if is_done:
-                        # 将完整文本传给 done 事件，供适配器一次性提取 JSON
                         yield ("done", full_response_from_dom)
                         break
 
@@ -8669,53 +8677,16 @@ class BrowserClient:
             yield ("error", str(e))
 
     def _is_complete_kimi_json_response(self, text: str) -> bool:
-        """Check if accumulated text forms a valid Kimi JSON response.
-        使用 strict=False 允许字符串中包含字面换行符等控制字符。"""
-        import json
-        try:
-            # 提取第一个完整的 JSON 结构（忽略前导非 JSON 文本）
-            start = -1
-            for i, ch in enumerate(text):
-                if ch == '{' or ch == '[':
-                    start = i
-                    break
-            if start == -1:
-                return False
-            # 找到匹配的闭合
-            stack = []
-            in_string = False
-            escape = False
-            for i in range(start, len(text)):
-                ch = text[i]
-                if in_string:
-                    if escape:
-                        escape = False
-                    elif ch == '\\':
-                        escape = True
-                    elif ch == '"':
-                        in_string = False
-                else:
-                    if ch == '"':
-                        in_string = True
-                    elif ch == '{' or ch == '[':
-                        stack.append(ch)
-                    elif ch == '}':
-                        if stack and stack[-1] == '{':
-                            stack.pop()
-                        else:
-                            break
-                    elif ch == ']':
-                        if stack and stack[-1] == '[':
-                            stack.pop()
-                        else:
-                            break
-                if not stack:
-                    json_text = text[start:i+1]
-                    data = json.loads(json_text, strict=False)
-                    return "choices" in data and "content" in data.get("choices", [{}])[0].get("message", {})
-            return False
-        except (json.JSONDecodeError, KeyError, IndexError):
-            return False
+        """Check if accumulated text contains a Kimi JSON payload that has started.
+        Returns True as soon as we detect the start of a Kimi response JSON object."""
+        # Kimi's full response always contains a marker like "object":"chat.completion"
+        # or at least "object":"chat" somewhere within the JSON payload.
+        # This allows us to break early without waiting for the JSON to be fully closed.
+        if '"object":"chat.completion"' in text:
+            return True
+        if '"object":"chat"' in text:  # fallback for truncated messages
+            return True
+        return False
 
     async def close_kimi(self):
         """Close Kimi browser context and cleanup resources."""
