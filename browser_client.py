@@ -15,6 +15,31 @@ from config import CONFIG, USER_AGENT, BASE_DIR
 
 logger = logging.getLogger("webchat-browser")
 
+
+def _parse_grpc_web_json_stream(raw_bytes: bytes) -> list[dict]:
+    """Parse gRPC-Web JSON stream frames: [flags:1][length:4][payload]."""
+    chunks = []
+    offset = 0
+    total = len(raw_bytes)
+    while offset + 5 <= total:
+        flags = raw_bytes[offset]
+        length = int.from_bytes(raw_bytes[offset + 1:offset + 5], "big")
+        offset += 5
+        if length < 0 or offset + length > total:
+            break
+        payload = raw_bytes[offset:offset + length]
+        offset += length
+        if flags & 0x80:
+            continue
+        try:
+            text = payload.decode("utf-8", errors="replace")
+            if text:
+                chunks.append(json.loads(text))
+        except Exception as e:
+            logger.debug(f"[gRPC-Web] parse frame failed: {e}")
+    return chunks
+
+
 def _bring_window_to_front():
     """用 Win32 API 查找 Edge 窗口并强制置顶显示。仅 Windows 有效。"""
     if not sys.platform.startswith("win"):
@@ -8561,6 +8586,51 @@ class BrowserClient:
             }""")
             await asyncio.sleep(0.2)
 
+            # 注册 route 拦截（应在文件上传之后、发送之前）
+            q = asyncio.Queue()
+            captured_chat_id = ""
+
+            async def handle_kimi_chat_route(route):
+                nonlocal captured_chat_id
+                logger.info(f"[Kimi] ChatService/Chat intercepted: {route.request.method} {route.request.url}")
+                try:
+                    resp = await route.fetch(timeout=600000)
+                    body = await resp.body()
+                    logger.info(f"[Kimi] ChatService/Chat body length: {len(body)} bytes")
+                    chunks = _parse_grpc_web_json_stream(body)
+                    logger.info(f"[Kimi] Parsed {len(chunks)} JSON frames from stream")
+                    for chunk in chunks:
+                        chat = chunk.get("chat")
+                        if isinstance(chat, dict) and chat.get("id"):
+                            captured_chat_id = chat.get("id") or captured_chat_id
+                            logger.info(f"[Kimi] Got session_id from response: {captured_chat_id}")
+                            q.put_nowait(("session_id", captured_chat_id))
+                        block = chunk.get("block")
+                        if isinstance(block, dict):
+                            text_obj = block.get("text")
+                            if isinstance(text_obj, dict):
+                                content = text_obj.get("content")
+                                if content:
+                                    q.put_nowait(("chunk", content))
+                        if "done" in chunk:
+                            q.put_nowait(("done", ""))
+                    q.put_nowait(("done", ""))
+                    await route.fulfill(response=resp)
+                except Exception as e:
+                    logger.warning(f"[Kimi] ChatService/Chat route error: {e}")
+                    q.put_nowait(("error", str(e)))
+                    q.put_nowait(("done", ""))
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
+
+            try:
+                await self._kimi_page.unroute("**/apiv2/kimi.gateway.chat.v1.ChatService/Chat**")
+            except Exception:
+                pass
+            await self._kimi_page.route("**/apiv2/kimi.gateway.chat.v1.ChatService/Chat**", handle_kimi_chat_route)
+
             # 输入消息（用 evaluate 聚焦+输入，绕过 Playwright 指针拦截检查）
             editor = await self._kimi_page.query_selector('.chat-input-editor')
             if editor:
@@ -8604,7 +8674,7 @@ class BrowserClient:
             except Exception:
                 pass
 
-            # 从 URL 提取 chat_id 并 yield session_id 事件
+            # 从 URL 提取 chat_id 并 yield session_id 事件（route handler 也会提取）
             try:
                 chat_id = await self._kimi_page.evaluate("""() => {
                     const url = window.location.href;
@@ -8619,74 +8689,84 @@ class BrowserClient:
             except Exception as e:
                 logger.warning(f"[Kimi] session_id extraction error: {e}")
 
-            # 读取 AI 回复
-            full_response_from_dom = ""  # 跟踪 DOM 中最新的完整助理消息文本
-            last_yielded_full_content = "" # 跟踪已作为块返回的完整内容
-            stable_count = 0  # 连续稳定（内容无变化）的秒数
-            MAX_STABLE_SECONDS = 10  # 连续 10 秒无变化视为完成
-
-            for i in range(120):  # 轮询 120 秒
-                await asyncio.sleep(1)
-                try:
-                    # 获取当前最后一个 assistant 消息的完整文本
-                    current_assistant_text = await self._kimi_page.evaluate("""() => {
-                        const assistantItems = document.querySelectorAll('.chat-content-item-assistant');
-                        if (assistantItems.length === 0) return '';
-                        const lastItem = assistantItems[assistantItems.length - 1];
-                        const segmentContent = lastItem.querySelector('.segment-content');
-                        if (segmentContent) {
-                            return (segmentContent.innerText || segmentContent.textContent || '').trim();
-                        }
-                        return '';
-                    }""")
-
-                    # 检测内容是否已稳定（AI 完成生成）
-                    if current_assistant_text:
-                        if current_assistant_text == full_response_from_dom:
-                            stable_count += 1
-                        else:
-                            stable_count = 0  # 内容有变化，重置稳定计数
-                        full_response_from_dom = current_assistant_text
-
-                    # 检测完成条件
-                    is_done = False
-                    if full_response_from_dom and self._is_complete_kimi_json_response(full_response_from_dom):
-                        is_done = True
-                        logger.debug("[Kimi] Full Kimi JSON response detected, ending stream.")
-                    elif stable_count >= MAX_STABLE_SECONDS and full_response_from_dom:
-                        is_done = True
-                        logger.debug(f"[Kimi] Content stable for {MAX_STABLE_SECONDS}s, ending stream.")
-                    elif i >= 110 and full_response_from_dom:
-                        is_done = True
-                        logger.debug(f"[Kimi] Max timeout (120s), ending stream with current content.")
-
-                    if is_done:
-                        yield ("done", full_response_from_dom)
+            # 通过网络拦截读取 AI 回复（替代 DOM 轮询）
+            full_response = ""
+            session_id_yielded = bool(chat_id)
+            try:
+                while True:
+                    kind, value = await asyncio.wait_for(q.get(), timeout=600)
+                    if kind == "session_id":
+                        if not session_id_yielded and value:
+                            logger.info(f"[Kimi] session_id from API: {value}")
+                            yield ("session_id", value)
+                            session_id_yielded = True
+                    elif kind == "chunk":
+                        full_response += value
+                    elif kind == "error":
+                        logger.warning(f"[Kimi] API stream error: {value}")
+                        yield ("error", value)
+                    elif kind == "done":
                         break
+            except asyncio.TimeoutError:
+                logger.warning(f"[Kimi] timeout waiting for API response (600s)")
 
-                except Exception as e:
-                    logger.warning(f"[Kimi] Error during polling for response: {e}")
-
-            # 如果循环结束时没有明确的 done 信号
-            if not full_response_from_dom:
-                yield ("done", "")
-                logger.debug("[Kimi] Stream ended without new content.")
+            yield ("done", full_response)
+            logger.info(f"[Kimi] stream done, total response: {len(full_response)} chars")
 
         except Exception as e:
             logger.error(f"[Kimi] stream_chat error: {e}")
             yield ("error", str(e))
+        finally:
+            try:
+                await self._kimi_page.unroute("**/apiv2/kimi.gateway.chat.v1.ChatService/Chat**")
+            except Exception:
+                pass
 
     def _is_complete_kimi_json_response(self, text: str) -> bool:
-        """Check if accumulated text contains a Kimi JSON payload that has started.
-        Returns True as soon as we detect the start of a Kimi response JSON object."""
-        # Kimi's full response always contains a marker like "object":"chat.completion"
-        # or at least "object":"chat" somewhere within the JSON payload.
-        # This allows us to break early without waiting for the JSON to be fully closed.
-        if '"object":"chat.completion"' in text:
-            return True
-        if '"object":"chat"' in text:  # fallback for truncated messages
-            return True
-        return False
+        """Check if accumulated text contains a completely closed Kimi JSON response.
+        Uses structural brace-counting (string-aware) instead of json.loads.
+        Returns True only when the JSON object/array is fully closed."""
+        # Find the first { or [ that starts the JSON payload
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == '{' or ch == '[':
+                start = i
+                break
+        if start == -1:
+            return False
+
+        # Count braces with string awareness to find matching close
+        stack = []
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{' or ch == '[':
+                    stack.append(ch)
+                elif ch == '}':
+                    if stack and stack[-1] == '{':
+                        stack.pop()
+                    else:
+                        return False  # mismatched close
+                elif ch == ']':
+                    if stack and stack[-1] == '[':
+                        stack.pop()
+                    else:
+                        return False  # mismatched close
+            if not stack:
+                # JSON is fully closed
+                return True
+        return False  # never closed within the text
 
     async def close_kimi(self):
         """Close Kimi browser context and cleanup resources."""

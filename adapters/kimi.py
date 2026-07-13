@@ -174,7 +174,7 @@ class KimiAdapter(BaseAdapter):
     async def _call_stream(self, **kwargs):
         from browser_client import browser_client
 
-        full_response = None
+        full_response = ""
         async for kind, value in browser_client.stream_kimi_chat(**kwargs):
             if kind == "session_id":
                 yield kind, value
@@ -190,58 +190,58 @@ class KimiAdapter(BaseAdapter):
 
         cleaned = self._strip_json_prefix(full_response)
 
-        try:
-            data = json.loads(cleaned, strict=False)
-        except json.JSONDecodeError:
-            if cleaned:
-                yield "chunk", cleaned
-            return
+        def _fix_literal_newlines_in_json(json_str):
+            result = []
+            in_string = False
+            escape = False
+            for ch in json_str:
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == '\\':
+                        escape = True
+                        result.append(ch)
+                    elif ch == '"':
+                        in_string = False
+                        result.append(ch)
+                    elif ch == '\n':
+                        result.append('\\n')
+                    elif ch == '\r':
+                        result.append('\\r')
+                    elif ch == '\t':
+                        result.append('\\t')
+                    else:
+                        result.append(ch)
+                else:
+                    if ch == '"':
+                        in_string = True
+                    result.append(ch)
+            return ''.join(result)
 
-        if "choices" in data and data.get("object") == "chat.completion":
-            choice = data["choices"][0]
-            message = choice.get("message", {})
-            content = message.get("content")
-            tool_calls = message.get("tool_calls")
-            finish_reason = choice.get("finish_reason", "stop")
+        def _try_normalize_json(text):
+            if not text or text[:1] not in ('{', '['):
+                return text
+            try:
+                json.loads(text, strict=False)
+                return text
+            except json.JSONDecodeError:
+                fixed = _fix_literal_newlines_in_json(text)
+                try:
+                    json.loads(fixed, strict=False)
+                    return fixed
+                except json.JSONDecodeError:
+                    try:
+                        from json_fixer import JsonFixer
+                        repaired = JsonFixer().fix(fixed)
+                        return json.dumps(repaired, ensure_ascii=False)
+                    except Exception:
+                        return fixed
 
-            chunk = {
-                "id": data.get("id", ""),
-                "object": "chat.completion.chunk",
-                "created": data.get("created", 0),
-                "model": data.get("model", ""),
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish_reason
-                }]
-            }
-            if content:
-                chunk["choices"][0]["delta"]["content"] = content
-            if tool_calls:
-                chunk["choices"][0]["delta"]["tool_calls"] = tool_calls
-                if finish_reason == "stop":
-                    chunk["choices"][0]["finish_reason"] = "tool_calls"
-            yield "chunk", json.dumps(chunk, ensure_ascii=False)
-        elif data.get("object") == "chat.requests":
-            req_list = data.get("chat.requests", [])
-            if req_list:
-                req = req_list[0]
-                message = req.get("message", {})
-                finish_reason = req.get("finish_reason", "stop")
-                chunk = {
-                    "id": data.get("id", ""),
-                    "object": "chat.completion.chunk",
-                    "created": data.get("created", 0),
-                    "model": data.get("model", ""),
-                    "choices": [{
-                        "index": req.get("index", 0),
-                        "delta": message,
-                        "finish_reason": finish_reason
-                    }]
-                }
-                yield "chunk", json.dumps(chunk, ensure_ascii=False)
-        elif cleaned:
-            yield "chunk", cleaned
+        normalized = _try_normalize_json(cleaned)
+
+        if normalized:
+            yield "chunk", normalized
+        yield "done", ""
 
     async def stream_chat(self, request: ChatCompletionRequest) -> AsyncGenerator[bytes, None]:
         self._last_session_id = ""
