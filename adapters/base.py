@@ -644,10 +644,12 @@ class BaseAdapter(ABC):
             value = value.replace('\x00', '')
             if not value:
                 return full_text, suppress_text, buffered_chunks, False, None, _think_buf
-            # 过滤非 JSON 前缀（如 "思考过程", "reasoning", "json" 等）
-            cleaned_chunk = self._strip_json_prefix(value)
-            full_text += cleaned_chunk
+
             if not suppress_text:
+                # 过滤非 JSON 前缀（如 "思考过程", "reasoning", "json" 等）
+                cleaned_chunk = self._strip_json_prefix(value)
+                full_text += cleaned_chunk
+
                 ft = full_text.lstrip()
                 if ft[:1] == "{" or ft[:3] == "```":
                     suppress_text = True
@@ -668,23 +670,26 @@ class BaseAdapter(ABC):
                         # 计算在原始 full_text 中的实际位置
                         actual_pos = len(full_text) - len(ft) + pos
                         full_text = full_text[actual_pos:]
-            if not suppress_text:
-                # 合并 _think_buf + cleaned_chunk 做跨 chunk think 标签过滤
-                combined = _think_buf + cleaned_chunk
-                cleaned, _think_buf = self._strip_think_tags_with_buf(combined)
-                if is_agent and buffered_chunks is not None:
-                    if cleaned:
-                        buffered_chunks.append(self._format_chunk(cleaned, model, chat_id))
-                else:
-                    if cleaned:
-                        return full_text, suppress_text, buffered_chunks, True, self._format_chunk(cleaned, model, chat_id), _think_buf
-                    elif _think_buf:
-                        # 缓冲区有内容但不输出，等待闭合
-                        return full_text, suppress_text, buffered_chunks, False, None, _think_buf
+
+                if not suppress_text:
+                    # 合并 _think_buf + cleaned_chunk 做跨 chunk think 标签过滤
+                    combined = _think_buf + cleaned_chunk
+                    cleaned, _think_buf = self._strip_think_tags_with_buf(combined)
+                    if is_agent and buffered_chunks is not None:
+                        if cleaned:
+                            buffered_chunks.append(self._format_chunk(cleaned, model, chat_id))
                     else:
-                        # 清空缓冲区（可能是空 chunk）
-                        return full_text, suppress_text, buffered_chunks, False, None, ""
-            # 如果 suppress_text 已启用，此 chunk 不产生输出，直接累积到 full_text 后继续
+                        if cleaned:
+                            return full_text, suppress_text, buffered_chunks, True, self._format_chunk(cleaned, model, chat_id), _think_buf
+                        elif _think_buf:
+                            # 缓冲区有内容但不输出，等待闭合
+                            return full_text, suppress_text, buffered_chunks, False, None, _think_buf
+                        else:
+                            # 清空缓冲区（可能是空 chunk）
+                            return full_text, suppress_text, buffered_chunks, False, None, ""
+            else:
+                # suppress_text 启用后，后续 chunk 必须原样累积，避免纯文本增量被 JSON 前缀清洗丢弃
+                full_text += value
 
         return full_text, suppress_text, buffered_chunks, False, None, _think_buf
 

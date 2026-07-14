@@ -8791,6 +8791,356 @@ class BrowserClient:
         self._kimi_pw = None
         logger.info("[Kimi] resources cleaned up")
 
+    async def delete_all_kimi_conversations(self):
+        """通过 UI 自动化删除 Kimi 所有会话。"""
+        import asyncio
+        import json
+        
+        if not self._kimi_page or self._kimi_page.is_closed():
+            await self.ensure_kimi_ready()
+
+        logger.info("[Kimi] Starting conversation deletion via UI...")
+        deleted_count = 0
+
+        for attempt in range(20):
+            await self._kimi_page.goto("https://www.kimi.com/zh/chat", wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
+
+            # 获取所有会话链接
+            sessions = await self._kimi_page.evaluate("""() => {
+                const links = document.querySelectorAll('a[href*="/chat/"]');
+                return Array.from(links).map(link => ({
+                    href: link.getAttribute('href'),
+                    text: (link.textContent || '').trim().substring(0, 50),
+                    className: (link.className || '').substring(0, 80),
+                }));
+            }""")
+
+            # 过滤掉 /chat/history 等非会话链接
+            chat_links = [s for s in sessions if '/chat/' in s['href'] and 'history' not in s['href']]
+            logger.info(f"[Kimi] Found {len(chat_links)} conversations to process")
+
+            if not chat_links:
+                logger.info(f"[Kimi] No more conversations to delete. Deleted {deleted_count} total.")
+                break
+
+            first_link = chat_links[0]
+            logger.info(f"[Kimi] Found first conversation: {first_link['text']} ({first_link['href']})")
+
+            # 尝试通过 hover 触发操作按钮
+            hover_result = await self._kimi_page.evaluate("""(href) => {
+                const link = document.querySelector('a[href=\\"' + href + '\\"]');
+                if (!link) return { found: false, status: 'not_found' };
+                
+                // 检查链接是否可见且可交互
+                const rect = link.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) {
+                    return { found: false, status: 'not_visible' };
+                }
+
+                // 模拟鼠标悬停
+                link.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                await asyncio.sleep(0.1);
+
+                // 查找操作按钮
+                const parent = link.closest('[class*=\"item\"], [class*=\"entry\"], li');
+                if (!parent) parent = link.parentElement;
+                
+                const buttons = parent ? parent.querySelectorAll('button, [role=\"button\"], [class*=\"action\"], [class*=\"icon\"], [class*=\"more\"], [class*=\"delete\"], [class*=\"trash\"], [class*=\"remove\"]') : [];
+                const buttonsResult = [];
+                for (const btn of buttons) {
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        results.push({
+                            tag: btn.tagName,
+                            className: (btn.className || '').substring(0, 80),
+                            text: (btn.textContent || '').trim().substring(0, 30),
+                            ariaLabel: btn.getAttribute('aria-label') || '',
+                            x: rect.x, y: rect.y, w: rect.width, h: rect.height,
+                        });
+                    }
+                }
+                return {
+                    found: true,
+                    status: 'buttons_found',
+                    buttons: results,
+                };
+            }""", first_link['href'])
+
+            if isinstance(dom_result, dict) and dom_result.get('found'):
+                status = dom_result.get('status')
+                logger.info(f"[Kimi] Hover result: {status}, buttons: {len(dom_result.get('buttons', []))}")
+                if status == 'buttons_found' and dom_result.get('buttons'):
+                    # 点击第一个可见按钮
+                    logger.info("[Kimi] Found delete buttons, attempting click...")
+                    await self._click_deletion_button(dom_result['buttons'][0])
+                    deleted_count += 1
+                    await asyncio.sleep(0.5)  # 等待后台处理
+                elif status == 'not_visible':
+                    logger.warning(f"[Kimi] Session not visible, trying fallback...")
+                    await self._handle_invisible_session(first_link['href'])
+            else:
+                logger.warning(f"[Kimi] Could not find deletion controls: {dom_result}")
+
+        logger.info(f"[Kimi] Deletion complete. Total deleted: {deleted_count}")
+        return deleted_count
+
+    async def _click_deletion_button(self, button_info):
+        """通过 Playwright 点击删除按钮，并处理可能的确认对话框。"""
+        # 尝试点击该按钮
+        click_result = await self._kimi_page.evaluate("""(button) => {
+            const rect = button.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                button.click();
+                return { clicked: true, text: (button.textContent || '').trim().substring(0, 30) };
+            }
+            return { clicked: false };
+        }""", button_info)
+
+        if click_result.get('clicked'):
+            logger.info(f"[Kimi] Clicked button: {button_info.text[:30]}")
+        else:
+            logger.warning("[Kimi] Failed to click button")
+
+        # 等待并检查是否出现确认对话框
+        await asyncio.sleep(1)
+
+        # 检查是否有确认对话框出现
+        confirm_result = await self._kimi_page.evaluate("""() => {
+            const dialogs = document.querySelectorAll('[class*=\"dialog\"], [class*=\"modal\"], [role=\"dialog\"], [class*=\"overlay\"], [class*=\"backdrop\"]');
+            for (const d of dialogs) {
+                const rect = d.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    const txt = (d.textContent || '').toLowerCase();
+                    if (txt.includes('delete') || txt.includes('确认') || txt.includes('确认删除')) {
+                        return { found: true, className: d.className.substring(0, 80) };
+                    }
+                }
+            }
+            return { found: false };
+        }""")
+        if confirm_result.get('found'):
+            logger.info("[Kimi] Found confirm dialog, attempting to close/decline...")
+            await self._kimi_page.evaluate("""() => {
+                const dialogs = document.querySelectorAll('[class*=\"dialog\"], [class*=\"modal\"], [role=\"dialog\"]');
+                for (const d of dialogs) {
+                    d.close();
+                }
+            }""")
+        else:
+            logger.info("[Kimi] No confirm dialog found, continuing...")
+
+    async def _handle_invisible_session(self, href):
+        """处理无法直接点击的会话（使用右键菜单或其他隐藏方式）。"""
+        logger.info("[Kimi] Handling invisible session via right-click...")
+        try:
+            # 右键点击该链接
+            await self._kimi_page.evaluate("""(href) => {
+                const link = document.querySelector('a[href=\\"' + href + '\\"]');
+                if (link) {
+                    link.click({ button: 'right' });
+                    return true;
+                }
+                return false;
+            }""", href)
+
+            # 等待上下文菜单出现
+            await asyncio.sleep(1)
+
+            # 查找并点击删除选项
+            delete_clicked = await self._kimi_page.evaluate("""() => {
+                const menus = document.querySelectorAll('[class*=\"menu\"], [role=\"menu\"], [role=\"dialog\"]');
+                for (const menu of menus) {
+                    const rect = menu.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        const items = menu.querySelectorAll('[role=\"menuitem\"], button, li');
+                        for (const item of items) {
+                            const txt = (item.textContent || '').toLowerCase();
+                            if (txt.includes('delete') || txt.includes('remove') || txt.includes('删除')) {
+                                item.click();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }""")
+            if delete_clicked:
+                logger.info("[Kimi] Deleted via context menu")
+            else:
+                logger.warning("[Kimi] Could not delete via context menu - may need manual intervention")
+        except Exception as e:
+            logger.warning(f"[Kimi] Error in invisible session handling: {e}")
+
+    async def delete_all_kimi_conversations(self):
+        """通过 UI 自动化删除 Kimi 所有会话。"""
+        import asyncio
+
+        if not self._kimi_page or self._kimi_page.is_closed():
+            await self.ensure_kimi_ready()
+
+        logger.info("[Kimi] Starting UI-based conversation deletion...")
+        deleted_count = 0
+        page = self._kimi_page
+
+        for attempt in range(30):
+            try:
+                await page.goto("https://www.kimi.com/zh/chat", wait_until="domcontentloaded", timeout=15000)
+            except:
+                await page.goto("https://www.kimi.com/")
+            await asyncio.sleep(3)
+
+            # 移除 mask 和展开侧边栏
+            await page.evaluate("""() => {
+                document.querySelectorAll('.mask, [class*="mask"], [class*="overlay"], [class*="backdrop"], [class*="sidebar-slot"]').forEach(el => {
+                    el.style.display = 'none';
+                    el.style.pointerEvents = 'none';
+                });
+                document.querySelectorAll('.is-collapsed').forEach(el => el.classList.remove('is-collapsed'));
+            }""")
+            await asyncio.sleep(1)
+
+            # 找到第一个会话链接，hover 它触发“更多”按钮
+            chat_info = await page.evaluate("""() => {
+                const link = document.querySelector('a[href*="/chat/"]:not([href*="history"])');
+                if (!link) return null;
+                const rect = link.getBoundingClientRect();
+                return {
+                    href: link.getAttribute('href'),
+                    text: (link.textContent || '').trim().substring(0, 40),
+                    x: Math.round(rect.x + rect.width / 2),
+                    y: Math.round(rect.y + rect.height / 2),
+                };
+            }""")
+
+            if not chat_info:
+                logger.info("[Kimi] No chat links remaining. Deletion complete.")
+                break
+
+            logger.info(f"[Kimi] Hovering chat item at ({chat_info['x']}, {chat_info['y']})")
+
+            # 鼠标移动 + 点击会话项（触发鼠标进入事件）
+            await page.mouse.move(chat_info['x'], chat_info['y'])
+            await asyncio.sleep(0.5)
+
+            # 用 JS dispatch mouseenter 事件
+            await page.evaluate("""(href) => {
+                const link = document.querySelector(`a[href="${href}"]`);
+                if (link) {
+                    link.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                    link.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                }
+            }""", chat_info['href'])
+            await asyncio.sleep(1)
+
+            # 现在查找出现的“更多”按钮
+            more_btn = await page.evaluate("""() => {
+                const btn = document.querySelector('.next-sidebar-history-item__more');
+                if (!btn) return null;
+                const rect = btn.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+                }
+                return null;
+            }""")
+
+            if not more_btn:
+                logger.warning("[Kimi] 'More' button not visible. Trying JS click directly...")
+                await page.evaluate("""(href) => {
+                    const link = document.querySelector('a[href*="/chat/"]:not([href*="history"])');
+                    if (link) {
+                        // 查找父容器内的所有按钮
+                        let p = link;
+                        for (let i = 0; i < 4; i++) {
+                            if (p && p.parentElement) p = p.parentElement;
+                        }
+                        if (p) {
+                            const btns = p.querySelectorAll('button, [class*="more"], [class*="action"]');
+                            if (btns.length > 0) btns[btns.length - 1].click();
+                        }
+                    }
+                }""", chat_info['href'])
+                await asyncio.sleep(2)
+            else:
+                logger.info(f"[Kimi] Clicking 'more' button at ({more_btn['x']}, {more_btn['y']})")
+                await page.mouse.click(more_btn['x'], more_btn['y'])
+                await asyncio.sleep(1)
+
+            # 检查弹出的菜单
+            menu_items = await page.evaluate("""() => {
+                const menus = document.querySelectorAll('[class*="menu"], [role="menu"], [class*="popup"], [class*="dropdown"], [class*="popover"], [class*="dialog"]');
+                const result = [];
+                for (const menu of menus) {
+                    const rect = menu.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        const items = menu.querySelectorAll('[role="menuitem"], button, li, a');
+                        for (const it of items) {
+                            const txt = (it.textContent || '').trim();
+                            if (txt) result.push({ text: txt, className: (typeof it.className === 'string' ? it.className : '').substring(0, 50) });
+                        }
+                    }
+                }
+                return result;
+            }""")
+            logger.info(f"[Kimi] Menu items count: {len(menu_items)}")
+
+            delete_clicked = False
+            for item in menu_items:
+                tl = item['text'].lower()
+                if any(k in tl for k in ['delete', 'remove', 'trash', '删除', '清空']):
+                    logger.info(f"[Kimi] Found delete menu item: {item['text']}")
+                    await page.evaluate("""(txt) => {
+                        const menus = document.querySelectorAll('[class*="menu"], [role="menu"], [class*="popup"], [class*="dropdown"]');
+                        for (const menu of menus) {
+                            const items = menu.querySelectorAll('[role="menuitem"], button, li, a');
+                            for (const it of items) {
+                                if ((it.textContent || '').trim() === txt) {
+                                    it.click();
+                                    return;
+                                }
+                            }
+                        }
+                    }""", item['text'])
+                    delete_clicked = True
+                    break
+
+            if not delete_clicked:
+                logger.warning("[Kimi] No delete option. Trying keyboard shortcut or alternative...")
+                await page.keyboard.press("Escape")
+                continue
+
+            await asyncio.sleep(2)
+
+            # 确认对话框
+            try:
+                confirm_clicked = await page.evaluate("""() => {
+                    const dia = document.querySelectorAll('[class*="dialog"], [class*="modal"], [role="dialog"]');
+                    for (const d of dia) {
+                        const r = d.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            const btns = d.querySelectorAll('button, [role="button"]');
+                            for (const b of btns) {
+                                const t = (b.textContent || '').trim().toLowerCase();
+                                if (t.includes('删除') || t.includes('确定') || t.includes('确认') || t.includes('yes') || t.includes('delete')) {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                }""")
+                if confirm_clicked:
+                    logger.info("[Kimi] Confirmed via dialog button")
+                await asyncio.sleep(2)
+            except:
+                pass
+
+            deleted_count += 1
+            logger.info(f"[Kimi] Deleted {deleted_count} conversation(s)")
+
+        logger.info(f"[Kimi] Deletion complete. Total deleted: {deleted_count}")
+        return deleted_count
 
 browser_client = BrowserClient()
 
