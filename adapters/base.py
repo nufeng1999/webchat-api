@@ -720,14 +720,10 @@ class BaseAdapter(ABC):
                 elif ch == '}':
                     if stack and stack[-1] == '{':
                         stack.pop()
-                    else:
-                        break  # 不匹配，终止
                 elif ch == ']':
                     if stack and stack[-1] == '[':
                         stack.pop()
-                    else:
-                        break  # 不匹配，终止
-            if not stack:
+            if not stack and (ch == '}' or ch == ']'):
                 # 找到闭合的顶层结构
                 return text[start:i+1]
         # 未闭合，返回从 start 到末尾（用于流式增量）
