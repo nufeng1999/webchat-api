@@ -348,14 +348,9 @@ class BaseAdapter(ABC):
                     json_lines.append(line)
             text = "\n".join(json_lines).strip()
 
-        match = None
-        for pattern in (r'\{[\s\S]*\}', r'\[[\s\S]*\]'):
-            m = re.search(pattern, text)
-            if m:
-                match = m.group(0).strip()
-                break
+        match = self._extract_first_json(text)
         if match:
-            return match
+            return match.strip()
         return text
 
     def _parse_response(self, full_text: str) -> tuple:
@@ -397,6 +392,23 @@ class BaseAdapter(ABC):
             return None, None, None, is_openai_chunk, is_tool_calls
 
         if not isinstance(parsed, dict):
+            # 处理顶层为列表的情况（如 OpenAI choices 数组单独出现）
+            if isinstance(parsed, list) and parsed:
+                first_choice = parsed[0]
+                if isinstance(first_choice, dict):
+                    is_openai_chunk = True
+                    delta_or_message = first_choice.get("delta") or first_choice.get("message", {})
+                    if isinstance(delta_or_message, dict):
+                        content = delta_or_message.get("content") or None
+                        if content == "":
+                            content = None
+                        tool_calls = delta_or_message.get("tool_calls") or first_choice.get("tool_calls")
+                        if not tool_calls:
+                            tool_calls = None
+                        else:
+                            tool_calls = self._sanitize_tool_calls(tool_calls)
+                        finish_reason = first_choice.get("finish_reason")
+                        return content, tool_calls, finish_reason, is_openai_chunk, is_tool_calls
             return None, None, None, is_openai_chunk, is_tool_calls
 
         # OpenAI chunk 格式: {choices: [{delta/message, ...}]}
@@ -693,17 +705,9 @@ class BaseAdapter(ABC):
 
         return full_text, suppress_text, buffered_chunks, False, None, _think_buf
 
-    def _extract_first_json(self, text: str) -> str:
-        """从文本中提取第一个完整的 JSON 对象/数组（支持跨行）。如未闭合则返回从首个 { 或 [ 到末尾的子串。"""
-        # 找到第一个 { 或 [
-        start = -1
-        for i, ch in enumerate(text):
-            if ch == '{' or ch == '[':
-                start = i
-                break
-        if start == -1:
-            return ""
-        # 使用栈和字符串状态追踪来寻找匹配的闭合
+    def _scan_balanced_json(self, text: str, start: int) -> tuple[str, bool]:
+        """从 start 位置（必须是 { 或 [）向后扫描，返回 (子串, 是否闭合)。
+        闭合时子串为完整平衡结构；未闭合时子串为 start 到末尾。"""
         stack = []
         in_string = False
         escape = False
@@ -716,7 +720,6 @@ class BaseAdapter(ABC):
                     escape = True
                 elif ch == '"':
                     in_string = False
-                # 在字符串内部忽略结构字符（包括字面换行等控制字符）
             else:
                 if ch == '"':
                     in_string = True
@@ -729,10 +732,46 @@ class BaseAdapter(ABC):
                     if stack and stack[-1] == '[':
                         stack.pop()
             if not stack and (ch == '}' or ch == ']'):
-                # 找到闭合的顶层结构
-                return text[start:i+1]
-        # 未闭合，返回从 start 到末尾（用于流式增量）
-        return text[start:]
+                return text[start:i + 1], True
+        return text[start:], False
+
+    def _extract_first_json(self, text: str) -> str:
+        """从文本中提取第一个完整且可解析的 JSON 对象/数组（支持跨行）。
+
+        遍历所有候选起点（每个 { 或 [），优先返回第一个能被成功解析的平衡片段；
+        若都无法解析，则回退到第一个候选起点的平衡片段（或到末尾的子串，用于流式增量）。
+        这样可以跳过像 '{"' 这样的坏前缀（流首帧残缺时常见）。"""
+        candidates = [i for i, ch in enumerate(text) if ch == '{' or ch == '[']
+        if not candidates:
+            return ""
+
+        first_balanced = None
+        first_unclosed = None
+        for start in candidates:
+            candidate, closed = self._scan_balanced_json(text, start)
+            if not closed:
+                if first_unclosed is None:
+                    first_unclosed = candidate
+                continue
+            if first_balanced is None:
+                first_balanced = candidate
+            # 尝试解析：先标准 json，再走 JsonFixer 兜底
+            try:
+                json.loads(candidate)
+                return candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
+            try:
+                JsonFixer().fix(candidate)
+                return candidate
+            except (ValueError, TypeError):
+                continue
+
+        if first_balanced is not None:
+            return first_balanced
+        if first_unclosed is not None:
+            return first_unclosed
+        return text[candidates[0]:]
 
     def _strip_json_prefix(self, text: str) -> str:
         """剥离 JSON 前的任意非 JSON 字符，并尝试返回仅含第一个完整 JSON 对象/数组的字符串。"""
