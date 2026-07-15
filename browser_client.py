@@ -2260,13 +2260,24 @@ class BrowserClient:
                     if still_has_text and send_enabled:
                         logger.warning(f"[Doubao] Input still has text (attempt {_verify_attempt+1}/{max_send_retries}), send button is enabled. Retrying via Playwright click.")
                         try:
-                            # Use Playwright's click method which is more robust
                             await self._doubao_page.click('#flow-end-msg-send, button[data-testid*="send"], button[class*="send"]', timeout=5000)
                             logger.info("[Doubao] Playwright click on send button successful.")
                         except Exception as click_e:
                             logger.warning(f"[Doubao] Playwright click on send button failed: {click_e}. Falling back to Enter key for retry.")
                             await self._doubao_page.keyboard.press("Enter")
-                        # If this was the last attempt and still_has_text is true, the error below will be logged.
+                        await asyncio.sleep(1)
+                        recheck = await self._doubao_page.evaluate("""() => {
+                            const ta = document.querySelector('textarea');
+                            return (ta && ta.value && ta.value.trim().length > 0) ||
+                                   (() => {
+                                       const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                                       return ce && ce.innerText && ce.innerText.trim().length > 0;
+                                   })();
+                        }""")
+                        if not recheck:
+                            logger.info("[Doubao] Input cleared after retry click, message sent successfully.")
+                            break
+                        continue
                     elif still_has_text and not send_enabled:
                         logger.warning(f"[Doubao] Input still has text, but send button is disabled (attempt {_verify_attempt+1}/{max_send_retries}). Will recheck.")
                 else: # This 'else' block executes if the loop completes without a 'break' (i.e., all attempts failed)
