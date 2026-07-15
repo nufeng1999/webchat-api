@@ -4532,7 +4532,6 @@ class BrowserClient:
                 const el = document.querySelector('[contenteditable]') || document.querySelector('textarea');
                 if (el) { el.focus(); el.click(); }
             }""")
-            return file_name
 
     async def fetch_qianwen_models(self) -> list[dict]:
         """从千问页面模型选择弹窗中获取可用模型列表。"""
