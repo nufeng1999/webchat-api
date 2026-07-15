@@ -118,9 +118,17 @@ class QianwenAdapter(BaseAdapter):
         if reuse_conversation:
             logger.info(f"[Qianwen] skipping file upload for reused conversation")
             request_dict = request.model_dump()
+            # last_msg = request.messages[-1] if request.messages else None
+            # last_role = getattr(last_msg, 'role', '') if last_msg else ''
+
             last_msg = request.messages[-1] if request.messages else None
-            last_role = getattr(last_msg, 'role', '') if last_msg else ''
-            if last_role == 'tool':
+            is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+            if not is_tool_return and isinstance(getattr(last_msg, 'content', None), list):
+                if len(request.messages) >= 2:
+                    last_msg = request.messages[-2] if request.messages else None
+                    is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+
+            if is_tool_return:
                 logger.debug(f"------------[is_tool_return]-------------")
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
             else:
@@ -128,7 +136,7 @@ class QianwenAdapter(BaseAdapter):
 
             try:
                 file_name = "request.json"
-                if last_role == 'tool':
+                if is_tool_return:
                     file_name = "toolreturn.json"
                     request_dict['task'] = get_ret_format_prompt(self.get_adapter_name())
                     request_dict['sample_response_format'] = CONFIG.get('sample_response_format', '')
@@ -151,10 +159,17 @@ class QianwenAdapter(BaseAdapter):
             }]
             return prompt_text, None
 
+        # last_msg = request.messages[-1] if request.messages else None
+        # last_role = getattr(last_msg, 'role', '') if last_msg else ''
         last_msg = request.messages[-1] if request.messages else None
-        last_role = getattr(last_msg, 'role', '') if last_msg else ''
+        is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+        if not is_tool_return and isinstance(getattr(last_msg, 'content', None), list):
+                if len(request.messages) >= 2:
+                    last_msg = request.messages[-2] if request.messages else None
+                    is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+
         file_name = "request.json"
-        if last_role == 'tool':
+        if is_tool_return:
             file_name = "toolreturn.json"
             request_dict = request.model_dump()
             request_dict['task'] = get_ret_format_prompt(self.get_adapter_name())

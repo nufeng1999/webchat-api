@@ -73,6 +73,10 @@ class DeepseekAdapter(BaseAdapter):
             request_dict = request.model_dump()
             last_msg = request.messages[-1] if request.messages else None
             is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+            if not is_tool_return and isinstance(getattr(last_msg, 'content', None), list):
+                if len(request.messages) >= 2:
+                    last_msg = request.messages[-2] if request.messages else None
+                    is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
             if is_tool_return:
                 logger.debug(f"------------[is_tool_return]-------------")
                 prompt_text = get_ret_format_prompt(self.get_adapter_name()) + "\n " + self._get_last_three_messages_as_json(request_dict)
@@ -96,6 +100,10 @@ class DeepseekAdapter(BaseAdapter):
 
         last_msg = request.messages[-1] if request.messages else None
         is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
+        if not is_tool_return and isinstance(getattr(last_msg, 'content', None), list):
+                if len(request.messages) >= 2:
+                    last_msg = request.messages[-2] if request.messages else None
+                    is_tool_return = getattr(last_msg, 'role', None) == 'tool' if last_msg else False
         file_content = self._prepare_inline_file_content(request, is_tool_return)
         request_dict = request.model_dump()
         if is_tool_return:

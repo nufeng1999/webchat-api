@@ -556,19 +556,32 @@ class BaseAdapter(ABC):
 
     @staticmethod
     def _get_last_message_as_json(request_dict: dict) -> str:
-        """从 request JSON dict 的 messages 中提取最后一条消息，返回 JSON 字符串。"""
+        """从 request JSON dict 的 messages 中提取最后一条消息，返回 JSON 字符串。
+        如果最后一条消息的 content 是列表，则返回倒数第二条消息。
+        """
         messages = request_dict.get("messages", [])
         if not messages:
             return "{}"
-        return json.dumps(messages[-1], ensure_ascii=False)
+        last = messages[-1]
+        if isinstance(last.get("content"), list):
+            if len(messages) >= 2:
+                return json.dumps(messages[-2], ensure_ascii=False)
+            return "{}"
+        return json.dumps(last, ensure_ascii=False)
 
     @staticmethod
     def _get_last_three_messages_as_json(request_dict: dict) -> str:
         """从 request JSON dict 的 messages 中提取最后三条消息，返回 JSON 字符串。"""
         messages = request_dict.get("messages", [])
         if not messages:
-            return "[]"
-        return json.dumps(messages[-1:], ensure_ascii=False)
+            return "{}"
+        last = messages[-1]
+        if isinstance(last.get("content"), list):
+            if len(messages) >= 2:
+                return json.dumps(messages[-2], ensure_ascii=False)
+            return "{}"
+        return json.dumps(last, ensure_ascii=False)
+
 
     # ═══════════════════════════════════════════════════════════════════════
     # 公共工具方法：_generate_chat_id
