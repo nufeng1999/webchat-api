@@ -16,6 +16,7 @@ spark_*.*
 analyze*.*
 dump_*.*
 diagnose_*.*
+discover_*.*
 *backup*.*
 *.db
 *.sqlite
@@ -132,3 +133,4 @@ prompt_optimizer.py
 json_fixer_flowchart.md
 _tmp_inspect.py
 discover_kimi_api.py
+discover_kimi_chat_list.py
