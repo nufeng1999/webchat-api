@@ -40,7 +40,7 @@
   "_preload_xinghuo": false,
   "_preload_kimi": false,
   "sample_response_format": "{\n\"id\":\"f2c1e2b6-88da-48d0-a662-7722ab726354\",\n\"created\":1781275513,\n\"model\":\"<model>\",\n\"object\":\"chat.completion\",\n\"choices\":[\n{\n\"index\":0,\n\"message\":{\n\"role\":\"assistant\",\n\"content\":\"{\\\"<content>\\\"}\",\n\"tool_calls\":[\n{\n\"index\":0,\n\"id\":\"call_00_HKZLPI83gIOMFZ7Oq5Ct9726\",\n\"type\":\"function\",\n\"function\":{\n\"name\":\"<tool>\",\n\"arguments\":\"{\\\"<arguments>\\\"}\"\n}\n}\n],\n\"reasoning_content\":\"<reasoning_content>\"\n},\n\"finish_reason\":\"tool_calls\"\n}\n],\n\"usage\":{\n\"prompt_tokens\":<prompt_tokens>,\n\"completion_tokens\":<completion_tokens>,\n\"total_tokens\":<total_tokens>,\n\"completion_tokens_details\":{\n\"reasoning_tokens\":<reasoning_tokens>,\n\"accepted_prediction_tokens\":<accepted_prediction_tokens>,\n\"rejected_prediction_tokens\":<rejected_prediction_tokens>,\n\"audio_tokens\":<audio_tokens>\n},\n\"prompt_tokens_details\":{\n\"cached_tokens\":<cached_tokens>,\n\"audio_tokens\":<audio_tokens>\n}\n}\n}",
-  "_browser_channel": "chromium",
+  "_browser_channel": "msedge",
   "_rate_limit_wait_seconds": 240,
   "_rate_limit_retry_seconds": 60,
   "img_url": "http://192.168.0.200:8765/images"
