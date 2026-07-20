@@ -465,6 +465,7 @@ class DoubaoMixin:
         import asyncio as _asyncio
 
         if not page or page.is_closed():
+            logger.info(f"[Doubao] page.is_closed() for {uid}")
             return None
 
         base_hash = uid.split(":", 1)[1]
@@ -472,7 +473,7 @@ class DoubaoMixin:
 
         async def _capture(route):
             req_url = route.request.url
-            if 'rc_gen_image' in req_url and 'image_dld' in req_url:
+            if 'rc_gen_image' in req_url and 'dld' in req_url:
                 captured_urls.append(req_url)
                 logger.info(f"[Doubao] captured full-size request for {uid}: {req_url[:150]}")
                 await route.abort()
@@ -521,13 +522,15 @@ class DoubaoMixin:
                 # Fallback: press Escape to close context menu, try a different approach
                 await page.keyboard.press('Escape')
                 await _asyncio.sleep(0.3)
+                logger.warning(f"Fallback: press Escape to close context menu, try a different approach")
                 return None
 
             # Step 3: Wait for the intercepted full-size URL
             for _ in range(20):
                 if captured_urls:
                     return captured_urls[0]
-                await _asyncio.sleep(0.5)
+                await _asyncio.sleep(1)
+            logger.warning(f"Wait for the intercepted full-size URL None")
             return None
         except Exception as e:
             logger.warning(f"[Doubao] capture full-size url failed for {uid}: {e}")
