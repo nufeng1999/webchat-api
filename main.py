@@ -24,6 +24,7 @@ from openai_api import stream_chat_completion, non_stream_chat_completion, gener
 from anthropic_api import stream_anthropic_messages, non_stream_anthropic_messages
 from podcast import start_podcast_generation, get_podcast_status, get_podcast_audio, get_podcast_script, list_podcasts, AUDIO_DIR
 from music import start_music_generation, get_music_status, get_music_audio, get_music_lyric, list_music, get_music_styles
+from video import start_video_generation, get_video_status, list_videos
 from exporter import fetch_user_info, fetch_conversation_list, export_conversation_full
 from storage import init_db, save_conversation, list_conversations as db_list_conversations, get_conversation as db_get_conversation, save_message, get_messages as db_get_messages, delete_conversation as db_delete_conversation, search_conversations
 from adapters import init_all as adapters_init_all, close_all as adapters_close_all, get_adapter, get_image_adapter, get_models as get_adapter_models
@@ -712,7 +713,9 @@ async def health():
             "tutor_mode": True,
             "data_analyst_mode": True,
             "anthropic_api": True,
-            "podcast": True
+            "podcast": True,
+            "music": True,
+            "video": True
         }
     }
     if SIGN_METHOD == 'b2' and signer:
@@ -879,6 +882,41 @@ async def music_list():
 @app.get("/v1/music/styles")
 async def music_styles():
     result = await get_music_styles()
+    return JSONResponse(content=result)
+
+@app.post("/v1/video/generations")
+async def video_generate(request: Request):
+    """创建视频生成任务"""
+    body = await request.json()
+    prompt = body.get("prompt", "")
+    model = body.get("model", "jimeng")
+    duration = body.get("duration", 5)
+    width = body.get("width", 1280)
+    height = body.get("height", 720)
+    fps = body.get("fps", 30)
+    seed = body.get("seed")
+    n = body.get("n", 1)
+    image = body.get("image")
+    response_format = body.get("response_format")
+    user = body.get("user")
+    metadata = body.get("metadata", {})
+
+    if not prompt:
+        raise HTTPException(status_code=400, detail="'prompt' is required")
+
+    result = await start_video_generation(
+        prompt, model=model, duration=duration, width=width, height=height,
+        fps=fps, seed=seed, n=n, image=image, response_format=response_format,
+        user=user, metadata=metadata
+    )
+    return JSONResponse(content=result)
+
+@app.get("/v1/video/generations/{task_id}")
+async def video_status(task_id: str):
+    """获取视频生成任务状态"""
+    result = await get_video_status(task_id)
+    if "error" in result and result.get("error") == "Task not found":
+        raise HTTPException(status_code=404, detail="Task not found")
     return JSONResponse(content=result)
 
 @app.get("/v1/user/info")

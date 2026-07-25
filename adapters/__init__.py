@@ -3,6 +3,7 @@ from typing import Optional
 
 from adapters.base import BaseAdapter
 from adapters.doubao import DoubaoAdapter
+from adapters.doubao_video import DoubaoVideoAdapter
 from adapters.qianwen import QianwenAdapter
 from adapters.deepseek import DeepseekAdapter
 from adapters.zai import ZaiAdapter
@@ -10,6 +11,7 @@ from adapters.mimo import MimoAdapter
 from adapters.minimax import MinimaxAdapter
 from adapters.xinghuo import XinghuoAdapter
 from adapters.kimi import KimiAdapter
+from adapters.jimeng import JimengAdapter
 from models import MODEL_CONFIG, KIMI_MODEL_CONFIG
 
 logger = logging.getLogger("webchat-api")
@@ -18,6 +20,8 @@ _ADAPTER_INSTANCES: dict[str, BaseAdapter] = {}
 
 _MODEL_ADAPTER_MAP: dict[str, str] = {
     "doubao-": "doubao",
+    "doubao-video": "doubao_video",
+    "doubao-video-": "doubao_video",
     "qianwen-": "qianwen",
     "deepseek-": "deepseek",
     "deepseek": "deepseek",
@@ -26,6 +30,8 @@ _MODEL_ADAPTER_MAP: dict[str, str] = {
     "minimax-": "minimax",
     "xinghuo-": "xinghuo",
     "kimi-": "kimi",
+    "jimeng-": "jimeng",
+    "jimeng": "jimeng",
     # Anthropic 兼容模型映射到 doubao
     "claude-3-5-sonnet": "doubao",
     "claude-3-5-haiku": "doubao",
@@ -51,6 +57,9 @@ def _init_adapters():
     doubao = DoubaoAdapter()
     _ADAPTER_INSTANCES["doubao"] = doubao
 
+    doubao_video = DoubaoVideoAdapter()
+    _ADAPTER_INSTANCES["doubao_video"] = doubao_video
+
     qianwen = QianwenAdapter()
     _ADAPTER_INSTANCES["qianwen"] = qianwen
 
@@ -71,6 +80,9 @@ def _init_adapters():
 
     kimi = KimiAdapter()
     _ADAPTER_INSTANCES["kimi"] = kimi
+
+    jimeng = JimengAdapter()
+    _ADAPTER_INSTANCES["jimeng"] = jimeng
 
     for name, adapter in _ADAPTER_INSTANCES.items():
         logger.info(f"Adapter registered: {name} ({len(adapter.get_models())} models)")

@@ -7,9 +7,10 @@ from ._mimo import MimoMixin
 from ._minimax import MiniMaxMixin
 from ._xinghuo import XinghuoMixin
 from ._kimi import KimiMixin
+from ._jimeng import JimengMixin
 
 
-class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixin, MiniMaxMixin, XinghuoMixin, KimiMixin):
+class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixin, MiniMaxMixin, XinghuoMixin, KimiMixin, JimengMixin):
     def __init__(self):
         # Doubao 专属
         self._doubao_pw = None
@@ -20,6 +21,13 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._doubao_user_data_dir = DOUBAO_USER_DATA_DIR
         self._visible_browser_started_at = None
         self._profile_params = {}
+
+        # Jimeng 专属
+        self._jimeng_pw = None
+        self._jimeng_browser = None
+        self._jimeng_page = None
+        self._jimeng_lock = asyncio.Lock()
+        self._jimeng_user_data_dir = os.path.join(BASE_DIR, "jimeng_profile")
 
         # Qianwen 专属
         self._qianwen_pw = None
@@ -75,7 +83,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
     async def close(self):
         """关闭所有浏览器。"""
         # 先关闭页面，再关闭浏览器上下文，最后停止 Playwright，避免 driver 已断开后仍访问 page。
-        for attr in ['_doubao_page', '_qianwen_page', '_deepseek_page', '_zai_page', '_mimo_page', '_minimax_page', '_xinghuo_page']:
+        for attr in ['_doubao_page', '_qianwen_page', '_deepseek_page', '_zai_page', '_mimo_page', '_minimax_page', '_xinghuo_page', '_jimeng_page']:
             page = getattr(self, attr, None)
             if page:
                 try:
@@ -85,7 +93,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
                     logger.debug(f"Error closing page {attr}: {e}")
                 setattr(self, attr, None)
 
-        for attr in ['_doubao_browser', '_qianwen_browser', '_deepseek_browser', '_zai_browser', '_mimo_browser', '_minimax_browser', '_xinghuo_browser']:
+        for attr in ['_doubao_browser', '_qianwen_browser', '_deepseek_browser', '_zai_browser', '_mimo_browser', '_minimax_browser', '_xinghuo_browser', '_jimeng_browser']:
             browser = getattr(self, attr, None)
             if browser:
                 try:
@@ -94,7 +102,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
                     logger.debug(f"Error closing browser {attr}: {e}")
                 setattr(self, attr, None)
 
-        for attr in ['_pw', '_doubao_pw', '_qianwen_pw', '_deepseek_pw', '_zai_pw', '_mimo_pw', '_minimax_pw', '_xinghuo_pw']:
+        for attr in ['_pw', '_doubao_pw', '_qianwen_pw', '_deepseek_pw', '_zai_pw', '_mimo_pw', '_minimax_pw', '_xinghuo_pw', '_jimeng_pw']:
             pw = getattr(self, attr, None)
             if pw:
                 try:

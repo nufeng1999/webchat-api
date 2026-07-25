@@ -128,3 +128,21 @@ class ImageGenerationRequest(BaseModel):
     metadata: Optional[dict] = None
 
     model_config = ConfigDict(extra='allow')
+
+
+class VideoGenerationRequest(BaseModel):
+    """视频生成请求模型。"""
+    model: Optional[str] = None
+    prompt: Optional[str] = None
+    image: Optional[str] = None
+    duration: Optional[int] = Field(default=None, ge=1, le=60)
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fps: Optional[int] = None
+    seed: Optional[int] = None
+    n: int = Field(default=1, ge=1, le=4)
+    response_format: Optional[str] = None
+    user: Optional[str] = None
+    metadata: Optional[dict] = None
+
+    model_config = ConfigDict(extra='allow')

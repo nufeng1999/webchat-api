@@ -159,15 +159,68 @@ class DoubaoMixin:
                 const get = (k) => {
                     try { return localStorage.getItem(k) || ''; } catch (e) { return ''; }
                 };
-                return {
-                    device_id: get('device_id') || (window.deviceId || ''),
-                    web_id: get('web_id') || (window.webId || ''),
-                    tea_uuid: get('tea_uuid') || (window.teaUuid || ''),
-                    fp: get('fp') || (window.fp || '')
-                };
+
+                // 1. 尝试顶层键
+                let device_id = get('device_id') || (window.deviceId || '');
+                let web_id = get('web_id') || (window.webId || '');
+                let tea_uuid = get('tea_uuid') || (window.teaUuid || '');
+                let fp = get('fp') || (window.fp || '');
+
+                // 2. 从 samantha_web_web_id JSON 提取 web_id
+                if (!web_id) {
+                    try {
+                        const sw = JSON.parse(get('samantha_web_web_id') || '{}');
+                        if (sw.web_id) web_id = sw.web_id;
+                    } catch(e) {}
+                }
+
+                // 3. 从 __tea_cache_tokens_* JSON 提取 web_id / user_unique_id
+                if (!web_id) {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        if (k && k.startsWith('__tea_cache_tokens_')) {
+                            try {
+                                const v = JSON.parse(get(k) || '{}');
+                                if (v.web_id) { web_id = v.web_id; break; }
+                            } catch(e) {}
+                        }
+                    }
+                }
+
+                // 4. 从 SLARDARmfa_web (base64 JSON) 提取 device_id
+                if (!device_id) {
+                    try {
+                        const raw = get('SLARDARmfa_web');
+                        if (raw) {
+                            const decoded = JSON.parse(decodeURIComponent(escape(atob(raw))));
+                            if (decoded.deviceId) device_id = decoded.deviceId;
+                        }
+                    } catch(e) {}
+                }
+
+                // 5. 从 tt_scid 或 ttcid 作为 device_id fallback
+                if (!device_id) {
+                    device_id = get('tt_scid') || get('ttcid') || '';
+                }
+
+                // 6. tea_uuid fallback: 用 __tea_cache_tokens_* 中的 user_unique_id
+                if (!tea_uuid) {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        if (k && k.startsWith('__tea_cache_tokens_')) {
+                            try {
+                                const v = JSON.parse(get(k) || '{}');
+                                if (v.user_unique_id) { tea_uuid = v.user_unique_id; break; }
+                            } catch(e) {}
+                        }
+                    }
+                }
+
+                return { device_id, web_id, tea_uuid, fp };
             }""")
             if params.get('device_id') and params.get('web_id') and params.get('tea_uuid'):
                 self._profile_params.update(params)
+                logger.info(f"[Doubao] profile params refreshed: device_id={params['device_id'][:16]}..., web_id={params['web_id']}, tea_uuid={params['tea_uuid'][:16]}...")
             else:
                 logger.warning(f"[Doubao] Incomplete profile params: {params}")
         except Exception as e:
@@ -2197,4 +2250,493 @@ class DoubaoMixin:
                 "progress": 100,
                 "src": ""
             }
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 视频生成支持 (Doubao video generation)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def call_doubao_video_generate_api(self, body: dict) -> dict:
+        """通过路由拦截调用 Doubao 视频生成 /chat/completion API。
+        模仿 stream_doubao_chat_via_type 的模式：
+        1. 导航到 /chat/ 页面
+        2. 注册 route handler 拦截 /chat/completion
+        3. 通过 DOM 输入简单消息 + 回车触发请求
+        4. Route handler 修改 body 注入视频生成参数
+        5. 从 SSE 响应中提取 conversation_id
+        """
+        await self.ensure_doubao_ready(headless=True)
+        page = self._doubao_page
+        if not page:
+            raise RuntimeError("Doubao page not available")
+
+        logger.info("[DoubaoVideo] Starting video generation via route interception...")
+
+        trace_id = uuid.uuid4().hex
+        span_id = uuid.uuid4().hex
+        stream_id = uuid.uuid4().hex
+
+        # 专用队列，避免与 stream_completion 冲突
+        queue: asyncio.Queue = asyncio.Queue()
+        self._doubao_queues[stream_id] = queue
+
+        # 清除旧的 route handler
+        try:
+            await page.unroute("**/chat/completion**")
+        except Exception:
+            pass
+
+        conversation_id = None
+        request_intercepted = asyncio.Event()
+
+        # 定义 route handler - 仿照 stream_doubao_chat_via_type
+        async def handle_route(route):
+            nonlocal conversation_id
+            logger.info(f"[DoubaoVideo] Intercepted request: {route.request.method} {route.request.url[:100]}")
+
+            if 'doubao.com/chat/completion' not in route.request.url:
+                logger.info("[DoubaoVideo] Not target URL, continuing normally")
+                await route.continue_()
+                return
+
+            logger.info("[DoubaoVideo] Target URL intercepted, modifying body for video generation")
+            request_intercepted.set()
+
+            try:
+                orig_body = route.request.post_data
+                if not orig_body:
+                    logger.warning("[DoubaoVideo] No request body, continuing original request")
+                    await route.continue_()
+                    return
+
+                body_dict = json.loads(orig_body)
+                logger.info(f"[DoubaoVideo] Original request body keys: {list(body_dict.keys())}")
+
+                # 注入视频生成所需的 chat_ability 和 video_params
+                # body 已经包含了完整的 video 生成参数（从 video.py 传入）
+                if 'chat_ability' in body:
+                    body_dict['chat_ability'] = body['chat_ability']
+                    logger.info("[DoubaoVideo] Injected chat_ability from provided body")
+
+                # 合并 ext 中的 input_skill 等字段
+                if 'ext' in body:
+                    body_dict['ext'] = {**body_dict.get('ext', {}), **body['ext']}
+
+                # 确保 option 中的场景设置正确
+                if 'option' in body_dict:
+                    body_dict['option']['send_message_scene'] = 'video'
+
+                modified_body = json.dumps(body_dict, ensure_ascii=False)
+                new_headers = dict(route.request.headers)
+                flow_trace = {"trace_id": trace_id, "span_id": span_id}
+                new_headers["x-flow-trace"] = json.dumps(flow_trace)
+                new_headers["accept"] = "text/event-stream"
+                logger.info("[DoubaoVideo] Modified body with trace headers, proceeding with route.fetch()...")
+
+                # 使用 route.fetch 代替 route.continue_ 以获取响应并解析 SSE
+                resp = await route.fetch(headers=new_headers, post_data=modified_body, timeout=180000)
+                logger.info(f"[DoubaoVideo] route.fetch completed, status={resp.status}")
+            except Exception as fetch_e:
+                logger.error(f"[DoubaoVideo] route.fetch failed: {fetch_e}")
+                queue.put_nowait(("error", f"Fetch error: {fetch_e}"))
+                queue.put_nowait(("done", ""))
+                try:
+                    await route.abort()
+                except Exception:
+                    pass
+                return
+
+            try:
+                raw_bytes = await resp.body()
+                raw_text = raw_bytes.decode("utf-8", errors="replace")
+                logger.info(f"[DoubaoVideo] Response: {len(raw_text)} bytes")
+            except Exception as body_e:
+                logger.warning(f"[DoubaoVideo] Failed to read response body: {body_e}")
+                queue.put_nowait(("error", f"Body read error: {body_e}"))
+                queue.put_nowait(("done", ""))
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+                return
+
+            # 解析 SSE 流
+            for block in raw_text.split("\n\n"):
+                block = block.strip()
+                if not block:
+                    continue
+
+                event_type = ""
+                data_str = ""
+                for line in block.split("\n"):
+                    if line.startswith("event:"):
+                        event_type = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_str = line[5:].strip()
+
+                if not data_str:
+                    continue
+
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if event_type == "SSE_ACK":
+                    cid = data.get("ack_client_meta", {}).get("conversation_id", "")
+                    if cid:
+                        conversation_id = cid
+                        logger.info(f"[DoubaoVideo] Got conversation_id: {cid}")
+                        queue.put_nowait(("conversation_id", cid))
+                    continue
+
+                if event_type == "STREAM_ERROR":
+                    err = json.dumps(data, ensure_ascii=False)
+                    queue.put_nowait(("error", err))
+                    queue.put_nowait(("done", ""))
+                    try:
+                        await route.fulfill(response=resp)
+                    except Exception:
+                        pass
+                    return
+
+                # 我们也可以转发其他事件，但这里只关心 conversation_id
+                if event_type == "STREAM_CHUNK":
+                    queue.put_nowait(("chunk", data))
+                    continue
+
+            queue.put_nowait(("done", ""))
+            try:
+                await route.fulfill(response=resp)
+            except Exception as e:
+                if "already handled" not in str(e).lower():
+                    logger.warning(f"[DoubaoVideo] route.fulfill error: {e}")
+
+        # 注册 route handler
+        await page.route("**/chat/completion**", handle_route)
+
+        try:
+            # 导航到干净的聊天页面
+            logger.info("[DoubaoVideo] Navigating to /chat/...")
+            await page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(2)
+
+            # 等待页面稳定
+            await asyncio.sleep(3)
+
+            # 尝试进入一个全新的对话状态：点击"新建对话"按钮（如果存在）
+            try:
+                await page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    for (const b of btns) {
+                        const txt = (b.textContent || '').trim();
+                        if (txt === '新建对话' || txt === '新对话' || txt.includes('新建') || txt.includes('新对话')) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.warning(f"[DoubaoVideo] Click '新建对话' failed: {e}")
+
+            # 等待输入框出现
+            for _ in range(60):
+                has_input = await page.evaluate("""() => !!document.querySelector('textarea') || !!document.querySelector('[contenteditable=true][role=textbox]')""")
+                if has_input:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                raise RuntimeError("Chat input not found after navigation")
+
+            # 切换到"视频生成"模式（使用 Playwright 原生点击 data-skill-id）
+            try:
+                skill_locator = page.locator('[data-skill-id="skill_bar_button_17"]')
+                if await skill_locator.count() > 0:
+                    await skill_locator.click(force=True, timeout=5000)
+                    logger.info("[DoubaoVideo] clicked '视频生成' via Playwright native click")
+                    await asyncio.sleep(3)
+                else:
+                    logger.warning("[DoubaoVideo] video skill button not found by data-skill-id, proceeding in default mode")
+            except Exception as e:
+                logger.warning(f"[DoubaoVideo] Failed to click '视频生成' skill button: {e}")
+
+            # 提取 body 中的第一个 text_block 作为触发消息
+            trigger_text = "生成视频"
+            if body.get('messages') and len(body['messages']) > 0:
+                msg = body['messages'][0]
+                if msg.get('content_block'):
+                    for block in msg['content_block']:
+                        if block.get('content', {}).get('text_block', {}).get('text'):
+                            trigger_text = block['content']['text_block']['text']
+                            break
+
+            logger.info(f"[DoubaoVideo] Preparing to send trigger: {trigger_text[:50]}")
+
+            # Focus and click input
+            ok = await page.evaluate("""() => {
+                const ta = document.querySelector('textarea');
+                if (ta) {
+                    ta.focus();
+                    ta.click();
+                    return true;
+                }
+                const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                if (ce) {
+                    ce.focus();
+                    ce.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if not ok:
+                raise RuntimeError("Failed to focus input")
+
+            # 聚焦输入框
+            await page.evaluate("""() => {
+                const ta = document.querySelector('textarea');
+                if (ta) {
+                    ta.focus();
+                    ta.click();
+                    return;
+                }
+                const ce = document.querySelector('[contenteditable=true][role=textbox]');
+                if (ce) {
+                    ce.focus();
+                    ce.click();
+                }
+            }""")
+            await asyncio.sleep(0.3)
+
+            # 清空输入框
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.3)
+
+            # 使用 insert_text 输入文本（比 nativeSetter + dispatchEvent 更可靠）
+            await page.keyboard.insert_text(trigger_text)
+            logger.info(f"[DoubaoVideo] Text inserted via insert_text: {trigger_text[:50]}")
+            await asyncio.sleep(0.5)
+
+            logger.info("[DoubaoVideo] Text inserted via insert_text, sending...")
+            
+            # ========== 简化版：不再等 SSE，只确认发送成功 ==========
+            # 1) 尝试点击发送按钮
+            clicked = await page.evaluate("""() => {
+                const btn = document.getElementById('flow-end-msg-send') ||
+                           document.querySelector('button[data-testid*="send"]') ||
+                           document.querySelector('button[class*="send"]');
+                if (btn && !btn.disabled && btn.offsetParent !== null) {
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if clicked:
+                logger.info("[DoubaoVideo] Clicked send button")
+            else:
+                logger.info("[DoubaoVideo] Send button not ready, pressing Enter")
+                await page.keyboard.press("Enter")
+
+            # 2) 等待输入框清空 + 检查页面出现"正在为您生成视频"
+            max_wait = 45
+            start = time.time()
+            task_success = False
+            while time.time() - start < max_wait:
+                # 检查输入框
+                cleared = await page.evaluate("""() => {
+                    const ta = document.querySelector('textarea');
+                    const ce = document.querySelector('[contenteditable=true][role=textbox]') || document.querySelector('[contenteditable="true"]');
+                    const taHas = ta && ta.value && ta.value.trim().length > 0;
+                    const ceHas = ce && (ce.innerText || ce.textContent || '').trim().length > 0;
+                    return !(taHas || ceHas);
+                }""")
+                if cleared:
+                    # 检查页面是否出现"正在为您生成视频"或其变体
+                    resp = await page.evaluate("""() => {
+                        const txt = document.body.innerText || '';
+                        if (txt.includes('正在为您生成视频')) return true;
+                        if (/\b(视频)\b/u.test(txt) && /\b(生成中)\b/u.test(txt)) return true;
+                        return false;
+                    }""")
+                    if resp:
+                        logger.info("[DoubaoVideo] Task creation confirmed: input cleared and '正在为您生成视频' detected")
+                        task_success = True
+                        break
+                await asyncio.sleep(1)
+
+            if not task_success:
+                logger.warning("[DoubaoVideo] Task creation detection failed, but continuing anyway")
+                # 即使超时，仍假设交付成功，让后续状态检测兜底
+
+            # 3) 不管前面如何，都等待 SSE 队列完成（获取 conversation_id）
+            try:
+                while True:
+                    kind, value = await asyncio.wait_for(queue.get(), timeout=120)
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        logger.error(f"[DoubaoVideo] SSE error: {value[:200]}")
+                        continue
+                    if kind == "conversation_id":
+                        conversation_id = value
+            except asyncio.TimeoutError:
+                logger.warning("[DoubaoVideo] SSE response timeout")
+
+        finally:
+            try:
+                await page.unroute("**/chat/completion**")
+            except Exception:
+                pass
+            self._doubao_queues.pop(stream_id, None)
+
+        if not conversation_id:
+            conversation_id = f"doubao_video_{int(time.time() * 1000)}"
+            logger.warning(f"[DoubaoVideo] No conversation_id from SSE, using fallback: {conversation_id}")
+
+        task_id = conversation_id
+        logger.info(f"[DoubaoVideo] task_id={task_id}, conversation_id={conversation_id}")
+
+        # 导航到对话页面，以便后续状态轮询可以检测到视频元素
+        if conversation_id and not conversation_id.startswith("doubao_video_"):
+            try:
+                await page.goto(f"https://www.doubao.com/chat/{conversation_id}", wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+                logger.info(f"[DoubaoVideo] Navigated to conversation page: {conversation_id}")
+            except Exception as nav_e:
+                logger.warning(f"[DoubaoVideo] Navigation to conversation page failed: {nav_e}")
+
+        return {
+            "ret": "0",
+            "errmsg": "success",
+            "data": {
+                "task": {
+                    "task_id": task_id,
+                    "conversation_id": conversation_id
+                }
+            }
+        }
+
+    async def call_doubao_video_status_api(self, task_ids: list[str]) -> dict:
+        """查询 Doubao 视频生成任务状态。
+
+         对每个 task_id，导航到对应对话页面，检查视频是否已生成。
+         返回 status: 20=in_progress, 40=completed, 50=failed
+         """
+        await self.ensure_doubao_ready(headless=True)
+        page = self._doubao_page
+        if not page:
+            return {"ret": "-1", "errmsg": "Page not available", "data": {}}
+
+        data = {}
+
+        for task_id in task_ids:
+            try:
+                logger.info(f"[DoubaoVideoStatus] Navigating to https://www.doubao.com/chat/{task_id}")
+                await page.goto(f"https://www.doubao.com/chat/{task_id}", wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(5)  # 等待页面和视频加载
+
+                # 等待 video 元素出现
+                try:
+                    await page.wait_for_selector('video', timeout=15000)
+                except Exception:
+                    pass
+
+                # 若 video 元素存在但 src 为空，尝试点击播放器触发视频加载
+                try:
+                    has_src = await page.evaluate("""() => {
+                        const v = document.querySelector('video');
+                        return !!(v && v.src && v.src.includes('http'));
+                    }""")
+                    if not has_src:
+                        # 尝试点击 xgplayer 容器
+                        await page.evaluate("""() => {
+                            const player = document.querySelector('[class*="xgplayer"], [class*="video-player"]');
+                            if (player) player.click();
+                        }""")
+                        await asyncio.sleep(3)
+                except Exception:
+                    pass
+
+                status_info = await page.evaluate("""() => {
+                    const findVideoUrl = () => {
+                        // 1. 直接 video 标签
+                        const videos = document.querySelectorAll('video');
+                        for (const v of videos) {
+                            const src = v.src || v.currentSrc || '';
+                            if (src && !src.startsWith('blob:') && src.includes('http')) {
+                                return { status: 40, url: src };
+                            }
+                        }
+                        // 2. xgplayer 容器
+                        const players = document.querySelectorAll('[class*="xgplayer"], [class*="video-player"]');
+                        for (const p of players) {
+                            const v = p.querySelector('video');
+                            if (v) {
+                                const src = v.src || v.currentSrc || '';
+                                if (src && src.includes('http')) {
+                                    return { status: 40, url: src };
+                                }
+                            }
+                        }
+                        // 3. source 元素
+                        const sources = document.querySelectorAll('video source');
+                        for (const s of sources) {
+                            const src = s.src || '';
+                            if (src && src.includes('http')) {
+                                return { status: 40, url: src };
+                            }
+                        }
+                        // 4. 下载链接
+                        const dls = document.querySelectorAll('a[href*="mp4"], a[href*="video"], a[download]');
+                        for (const a of dls) {
+                            const href = a.href || '';
+                            if (href.includes('http') && (href.includes('.mp4') || href.includes('video'))) {
+                                return { status: 40, url: href };
+                            }
+                        }
+                        // 5. 内容审核 / 违规错误（纯文本消息）
+                        const bodyText = document.body.innerText || '';
+                        const moderationPatterns = [
+                            '疑似包含侵权', '违规内容', '无法返回该内容', '换个主题',
+                            '生成额度未扣除', '涉及敏感', '内容审核', '不符合规范',
+                            '生成失败', '违反相关规定', '无法生成'
+                        ];
+                        for (const pat of moderationPatterns) {
+                            if (bodyText.includes(pat)) {
+                                return { status: 50, url: null, errmsg: pat };
+                            }
+                        }
+                        // 6. 错误标识（CSS class）
+                        const errEls = document.querySelectorAll('[class*="error"], [class*="fail"], [class*="Error"]');
+                        if (errEls.length > 0) {
+                            return { status: 50, url: null, errmsg: 'error element detected' };
+                        }
+                        return { status: 20, url: null };
+                    };
+                    return findVideoUrl();
+                }""")
+
+                st = status_info.get("status", 20)
+                video_url = status_info.get("url")
+                err_msg = status_info.get("errmsg")
+                data[task_id] = {"status": st, "video_url": video_url, "errmsg": err_msg}
+
+                if st == 40:
+                    logger.info(f"[DoubaoVideoStatus] ✅ Found video: task_id={task_id}, url={video_url}")
+                elif st == 20:
+                    # 打印 body 片段帮助调试
+                    try:
+                        snippet = await page.evaluate("() => document.body.innerHTML.slice(0, 1000)")
+                        logger.info(f"[DoubaoVideoStatus] ⏳ Still generating: task_id={task_id}, body snippet: {snippet[:300]}...")
+                    except Exception:
+                        logger.info(f"[DoubaoVideoStatus] ⏳ Still generating: task_id={task_id}")
+                else:
+                    logger.info(f"[DoubaoVideoStatus] ❌ Error: task_id={task_id}, reason: {err_msg}")
+
+            except Exception as e:
+                logger.warning(f"[DoubaoVideoStatus] Error for {task_id}: {e}")
+                data[task_id] = {"status": 20, "video_url": None}
+
+        return {"ret": "0", "errmsg": "success", "data": data}
 
