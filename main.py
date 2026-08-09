@@ -1126,7 +1126,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="WebChat Free API")
     parser.add_argument("--login", type=str, nargs='?', const='doubao', default=None,
-                        help="Open browser for login and save credentials. Specify 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', 'xinghuo', or 'kimi' (default: doubao)")
+                        help="Open browser for login and save credentials. Specify 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', 'xinghuo', 'kimi', or 'meta' (default: doubao)")
     parser.add_argument("--host", default=None,
                         help="Server host (default: from config.json)")
     parser.add_argument("--port", type=int, default=None,
@@ -1147,6 +1147,8 @@ if __name__ == "__main__":
                         help="Show Xinghuo SparkDesk browser window only")
     parser.add_argument("--show-kimi", action="store_true", default=False,
                         help="Show Kimi browser window only")
+    parser.add_argument("--show-meta", action="store_true", default=False,
+                        help="Show Meta.ai browser window only (Urban VPN + meta.ai)")
     parser.add_argument("--keep-conversations", action="store_true", default=False,
                         help="Keep all conversation history after server shutdown (default: delete)")
     parser.add_argument("-q", "--quiet", action="store_true", default=False,
@@ -1157,7 +1159,7 @@ if __name__ == "__main__":
                         choices=["chromium", "chrome", "edge"],
                         help="Browser engine for Playwright: chromium, chrome, edge (default: edge on Windows, chromium on other OS)")
     parser.add_argument("--clear-history", type=str, nargs='?', const='all', default=None,
-                        help="Clear conversation history. Specify platform names (doubao,deepseek,mimo,zai,qianwen,minimax,xinghuo,kimi) or 'all' (default: all)")
+                        help="Clear conversation history. Specify platform names (doubao,deepseek,mimo,zai,qianwen,minimax,xinghuo,kimi,meta) or 'all' (default: all)")
     args = parser.parse_args()
 
     # 控制台日志控制
@@ -1170,7 +1172,7 @@ if __name__ == "__main__":
 
     # 各站点独立配置
     # 优先级：--show-xxx 参数 > config.json；若传了任何 --show-xxx，未指定的站点强制 headless
-    _any_show = any([args.show_doubao, args.show_qianwen, args.show_deepseek, args.show_zai, args.show_mimo, args.show_minimax, args.show_xinghuo, args.show_kimi])
+    _any_show = any([args.show_doubao, args.show_qianwen, args.show_deepseek, args.show_zai, args.show_mimo, args.show_minimax, args.show_xinghuo, args.show_kimi, args.show_meta])
     CONFIG['_doubao_headless'] = not args.show_doubao if args.show_doubao else (True if _any_show else CONFIG.get('_doubao_headless', True))
     CONFIG['_qianwen_headless'] = not args.show_qianwen if args.show_qianwen else (True if _any_show else CONFIG.get('_qianwen_headless', True))
     CONFIG['_deepseek_headless'] = not args.show_deepseek if args.show_deepseek else (True if _any_show else CONFIG.get('_deepseek_headless', True))
@@ -1179,6 +1181,7 @@ if __name__ == "__main__":
     CONFIG['_minimax_headless'] = not args.show_minimax if args.show_minimax else (True if _any_show else CONFIG.get('_minimax_headless', True))
     CONFIG['_xinghuo_headless'] = not args.show_xinghuo if args.show_xinghuo else (True if _any_show else CONFIG.get('_xinghuo_headless', True))
     CONFIG['_kimi_headless'] = not args.show_kimi if args.show_kimi else (True if _any_show else CONFIG.get('_kimi_headless', True))
+    CONFIG['_meta_headless'] = not args.show_meta if args.show_meta else (True if _any_show else CONFIG.get('_meta_headless', True))
     # 浏览器通道映射：Playwright channel 参数
     # 优先使用 config.json 中的 _browser_channel，仅在命令行显式指定时覆盖
     _browser_channel_map = {"chromium": None, "chrome": "chrome", "edge": "msedge"}
@@ -1190,9 +1193,9 @@ if __name__ == "__main__":
 
     if args.login:
         target = args.login.lower()
-        if target not in ("doubao", "qianwen", "deepseek", "zai", "mimo", "minimax", "xinghuo", "kimi"):
+        if target not in ("doubao", "qianwen", "deepseek", "zai", "mimo", "minimax", "xinghuo", "kimi", "meta"):
             if not _console_filter_quiet:
-                print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', 'xinghuo', or 'kimi'", file=sys.stderr)
+                print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', 'xinghuo', 'kimi', or 'meta'", file=sys.stderr)
             os._exit(1)
         if target == "doubao":
             from login import do_login
@@ -1260,6 +1263,23 @@ if __name__ == "__main__":
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
+        elif target == "meta":
+            from meta_login import login_and_save
+            result = asyncio.run(login_and_save(show_browser=True))
+            if result.get("success"):
+                if not _console_filter_quiet:
+                    print("=" * 50)
+                    print("Meta.ai 登录成功！登录状态已保存到 meta_profile 目录。")
+                    print("=" * 50)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
+            else:
+                if not _console_filter_quiet:
+                    print(f"Login failed: {result.get('message', 'unknown error')}", file=sys.stderr)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
         else:
             from qianwen_login import do_qianwen_login
             result = asyncio.run(do_qianwen_login(show_browser=True))
@@ -1284,7 +1304,7 @@ if __name__ == "__main__":
         client = BrowserClient()
         platforms = [p.strip().lower() for p in args.clear_history.split(',') if p.strip()]
         if 'all' in platforms:
-            platforms = ['doubao', 'deepseek', 'mimo', 'zai', 'qianwen', 'minimax', 'xinghuo', 'kimi']
+            platforms = ['doubao', 'deepseek', 'mimo', 'zai', 'qianwen', 'minimax', 'xinghuo', 'kimi', 'meta']
 
         async def _clear_all():
             for p in platforms:
@@ -1336,6 +1356,13 @@ if __name__ == "__main__":
                         await client.delete_all_kimi_conversations()
                     except Exception as e:
                         logger.warning(f"[Clear] kimi: {e}")
+                elif p == 'meta':
+                    try:
+                        await client.ensure_meta_ready(headless=True, ensure_vpn=True)
+                        res = await client.delete_all_meta_conversations(headless=True)
+                        logger.info(f"[Clear] meta: deleted {res.get('deleted', 0)} conversations, {res.get('rows_remaining', 0)} remaining")
+                    except Exception as e:
+                        logger.warning(f"[Clear] meta: {e}")
                 else:
                     logger.warning(f"[Clear] unknown platform: {p}")
             await client.close()

@@ -14,6 +14,7 @@ MODEL_CONFIG = {
     "doubao-tutor": {"bot_id": "7338286299411103781", "use_deep_think": True, "use_auto_cot": False, "desc": "解题答疑"},
     "doubao-data-analyst": {"bot_id": "7338286299411103781", "use_deep_think": False, "use_auto_cot": True, "desc": "数据分析师（生成分析代码）"},
     "doubao-image": {"bot_id": "7338286299411103781", "use_deep_think": False, "use_auto_cot": False, "desc": "图片生成（文生图）", "is_image_model": True},
+    "meta-image": {"bot_id": "", "use_deep_think": False, "use_auto_cot": False, "desc": "Meta 图片生成（文生图）", "is_image_model": True},
     "doubao-podcast": {"bot_id": "7338286299411103781", "use_deep_think": False, "use_auto_cot": False, "desc": "AI播客生成", "is_podcast_model": True},
     "doubao-music": {"bot_id": "7338286299411103781", "use_deep_think": False, "use_auto_cot": False, "desc": "AI音乐生成", "is_music_model": True},
 }
@@ -66,6 +67,7 @@ SYSTEM_PROMPT_MAP = {
     "doubao-tutor": "你是一个专业的解题答疑老师，擅长数学、物理、化学等学科。请逐步分析问题，给出详细的解题过程和答案，标注关键步骤和易错点。",
     "doubao-data-analyst": "你是一个专业的数据分析师，擅长数据分析、可视化和Python编程。请根据用户描述的数据生成分析代码，使用pandas、matplotlib等库，确保代码可运行且有注释。注意：代码是生成供用户自行执行，不要试图直接运行代码。",
     "doubao-image": "你是一个专业的AI图片生成助手。当用户描述想要的图片时，请直接使用你的图片生成能力创建图片。不需要过多文字说明，直接生成图片即可。",
+    "meta-image": "你是一个专业的AI图片生成助手。当用户描述想要的图片时，请直接使用你的图片生成能力创建图片。不需要过多文字说明，直接生成图片即可。",
 }
 
 ANTHROPIC_MODEL_MAP = {

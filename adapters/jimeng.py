@@ -76,6 +76,23 @@ class JimengAdapter(BaseAdapter):
         ).encode()
         yield format_openai_done()
 
+    async def _call_stream(self, **kwargs):
+        """即梦适配器不需要流式聊天调用。"""
+        return
+        yield  # Make it a generator
+
+    async def _prepare_messages(self, request, browser_client, is_agent: bool, reuse_conversation: bool = False):
+        """即梦适配器不需要消息准备。"""
+        return "", None
+
+    async def _delete_conversation(self):
+        """即梦适配器不需要对话删除。"""
+        pass
+
+    async def _get_lock(self):
+        """返回用于并发控制的锁。"""
+        return self._lock
+
     async def generate_video(
         self,
         prompt: str,

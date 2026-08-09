@@ -12,6 +12,7 @@ from adapters.minimax import MinimaxAdapter
 from adapters.xinghuo import XinghuoAdapter
 from adapters.kimi import KimiAdapter
 from adapters.jimeng import JimengAdapter
+from adapters.meta import MetaAdapter
 from models import MODEL_CONFIG, KIMI_MODEL_CONFIG
 
 logger = logging.getLogger("webchat-api")
@@ -44,6 +45,8 @@ _DEFAULT_ADAPTER = "doubao"
 _IMAGE_ADAPTER_MAP: dict[str, str] = {
     "doubao-image": "doubao",
     "doubao-": "doubao",
+    "meta-image": "meta",
+    "meta-": "meta",
 }
 
 _DEFAULT_IMAGE_ADAPTER = "doubao"
@@ -83,6 +86,9 @@ def _init_adapters():
 
     jimeng = JimengAdapter()
     _ADAPTER_INSTANCES["jimeng"] = jimeng
+
+    meta = MetaAdapter()
+    _ADAPTER_INSTANCES["meta"] = meta
 
     for name, adapter in _ADAPTER_INSTANCES.items():
         logger.info(f"Adapter registered: {name} ({len(adapter.get_models())} models)")

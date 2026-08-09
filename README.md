@@ -1,6 +1,6 @@
 # WebChat Free API
 
-将豆包、千问、DeepSeek、z.ai（智谱）、MiMo（小米）、MiniMax、讯飞星火、Kimi 8 大 AI 平台的对话能力包装为标准 OpenAI / Anthropic 兼容 API，供 Claude Code、OpenCode 等 AI Agent 软件直接调用。
+将豆包、千问、DeepSeek、z.ai（智谱）、MiMo（小米）、MiniMax、讯飞星火、Kimi 8 大 AI 平台的对话能力包装为标准 OpenAI / Anthropic 兼容 API，供 Claude Code、OpenCode 等 AI Agent 软件直接调用。另有 Meta.ai 图片生成（需 Urban VPN 代理访问）。
 
 ## 功能特性
 
@@ -8,7 +8,7 @@
 - **Anthropic 兼容** — 完全兼容 `/v1/messages`，Claude Code 原生对接
 - **8 大平台统一接入** — 豆包、千问、DeepSeek、z.ai、MiMo、MiniMax、讯飞星火、Kimi
 - **Vision 图片识别** — 支持 OpenAI Vision 格式，自动上传图片
-- **图片生成** — 兼容 OpenAI `/v1/images/generations`
+- **图片生成** — 兼容 OpenAI `/v1/images/generations`（`doubao-image`、`meta-image`）
 - **AI 音乐生成** — 歌词 + 音频自动生成，Web 端播放
 - **AI 播客生成** — 脚本 + 火山引擎 TTS 音频，前置/后置音乐
 - **Agent 模式** — Tool Calls、System Prompt、多轮工具调用
@@ -54,6 +54,9 @@ python main.py --login xinghuo
 
 # 登录 Kimi
 python main.py --login kimi
+
+# 登录 Meta.ai（需先配置 meta_profile，内置 Urban VPN 扩展）
+python main.py --login meta
 ```
 
 ### 3. 启动服务
@@ -104,6 +107,14 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 | `doubao-image` | 图片生成（文生图） |
 | `doubao-podcast` | AI 播客生成 |
 | `doubao-music` | AI 音乐生成 |
+
+### Meta.ai（图片生成）
+
+| 模型 ID | 说明 |
+|---------|------|
+| `meta-image` | Meta.ai 文生图（浏览器驱动，需 Urban VPN 访问） |
+
+> Meta.ai 国内不可直连，通过 `meta_profile` 内置的 Urban VPN 扩展访问。每次浏览器启动会先连接 VPN，连接成功后才打开 meta.ai。
 
 ### DeepSeek
 
@@ -303,9 +314,10 @@ for chunk in stream:
 | `--show-minimax` | 显示 MiniMax 浏览器窗口 |
 | `--show-xinghuo` | 显示讯飞星火浏览器窗口 |
 | `--show-kimi` | 显示 Kimi 浏览器窗口 |
+| `--show-meta` | 显示 Meta.ai 浏览器窗口（Urban VPN + meta.ai） |
 | `--keep-conversations` | 保留对话历史（默认关闭时删除） |
 | `--browser` | 浏览器引擎（chromium/chrome/edge） |
-| `--clear-history [platforms]` | 清除对话历史 |
+| `--clear-history [platforms]` | 清除对话历史（doubao,deepseek,mimo,zai,qianwen,minimax,xinghuo,kimi,meta） |
 | `-q/--quiet` | 抑制控制台日志 |
 | `--log-level` | 日志级别 |
 
@@ -326,6 +338,7 @@ for chunk in stream:
     "_minimax_headless": true,
     "_xinghuo_headless": true,
     "_kimi_headless": true,
+    "_meta_headless": false,
     "_keep_conversations": false,
     "conversation_retention_days": 7,
     "request_limiter_max_concurrent": {
@@ -363,7 +376,10 @@ webchat-api/
 ├── sse.py                   # SSE 解析 + 格式化
 ├── openai_api.py            # OpenAI 兼容逻辑
 ├── anthropic_api.py         # Anthropic 兼容逻辑
-├── browser_client.py        # Playwright 浏览器自动化客户端
+├── browser_client/          # Playwright 浏览器自动化客户端（各平台 mixin）
+│   ├── __init__.py          # BrowserClient 基类 + 状态管理
+│   ├── _meta.py             # Meta.ai 浏览器客户端（Urban VPN + 会话删除）
+│   └── ...                  # 各平台浏览器客户端
 ├── adapters/                # 适配器层
 │   ├── __init__.py          # 适配器注册 + 模型路由
 │   ├── base.py              # 基类（模板方法 + JSON过滤/修补）
@@ -374,7 +390,10 @@ webchat-api/
 │   ├── mimo.py              # MiMo 适配器
 │   ├── minimax.py           # MiniMax 适配器
 │   ├── xinghuo.py           # 讯飞星火适配器
-│   └── kimi.py              # Kimi 适配器
+│   ├── kimi.py              # Kimi 适配器
+│   ├── meta.py              # Meta.ai 图片生成适配器（meta-image）
+│   └── jimeng.py            # 即梦适配器
+├── meta_login.py            # Meta.ai 登录（VPN 连接后打开 meta.ai）
 ├── music.py                 # 音乐生成
 ├── podcast.py               # 播客生成
 ├── volcengine_tts.py        # 火山引擎 TTS
