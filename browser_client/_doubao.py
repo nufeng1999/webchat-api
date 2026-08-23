@@ -2136,7 +2136,7 @@ class DoubaoMixin:
         
         cookie = get_doubao_cookie()
         if not cookie:
-            raise RuntimeError("Cannot read cookie from doubao_profile")
+            raise RuntimeError("Cannot read cookie from profiles/doubao_profile")
 
         device_id = CONFIG.get('device_id', '')
         tea_uuid = CONFIG.get('tea_uuid', '')

@@ -19,8 +19,8 @@ class ZaiMixin:
 
     def _reset_zai_profile_crash():
         """启动浏览器前重置 profile 的崩溃标记，防止 Chromium 认为上次异常退出。"""
-        local_state_path = os.path.join(BASE_DIR, "zai_profile", "Local State")
-        prefs_path = os.path.join(BASE_DIR, "zai_profile", "Default", "Preferences")
+        local_state_path = os.path.join(BASE_DIR, "profiles", "zai_profile", "Local State")
+        prefs_path = os.path.join(BASE_DIR, "profiles", "zai_profile", "Default", "Preferences")
         try:
             if os.path.exists(local_state_path):
                 with open(local_state_path, "r", encoding="utf-8") as f:
@@ -89,7 +89,7 @@ class ZaiMixin:
         if headless:
             _args.append("--headless=new")
         self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
-            user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
+            user_data_dir=os.path.join(BASE_DIR, "profiles", "zai_profile"),
             headless=headless,
             channel=_browser_channel(),
             args=_args,
@@ -287,7 +287,7 @@ class ZaiMixin:
         logger.info(f"[Zai] Launching non-headless browser for recovery...")
         self._zai_pw = await async_playwright().start()
         self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
-            user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
+            user_data_dir=os.path.join(BASE_DIR, "profiles", "zai_profile"),
             headless=False,  # 强制非 headless
             channel=_browser_channel(),
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
@@ -350,7 +350,7 @@ class ZaiMixin:
         _args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
         _args.append("--headless=new")  # 确保是 headless
         self._zai_browser = await self._zai_pw.chromium.launch_persistent_context(
-            user_data_dir=os.path.join(BASE_DIR, "zai_profile"),
+            user_data_dir=os.path.join(BASE_DIR, "profiles", "zai_profile"),
             headless=True,  # 强制 headless
             channel=_browser_channel(),
             args=_args,

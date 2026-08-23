@@ -70,7 +70,7 @@ def _bring_window_to_front():
         logger.debug(f"[Zai] Win32 bring to front failed: {e}")
 
 STORAGE_STATE_PATH = os.path.join(BASE_DIR, "storage_state.json")
-DOUBAO_USER_DATA_DIR = os.path.join(BASE_DIR, "doubao_profile")
+DOUBAO_USER_DATA_DIR = os.path.join(BASE_DIR, "profiles", "doubao_profile")
 
 
 def _read_cookie_from_profile_db() -> str:

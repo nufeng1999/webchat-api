@@ -2,7 +2,7 @@
 from ._shared import *
 
 META_URL = "https://www.meta.ai/"
-META_PROFILE_DIR = os.path.join(BASE_DIR, "meta_profile")
+META_PROFILE_DIR = os.path.join(BASE_DIR, "profiles", "meta_profile")
 META_EXT_ID = "nimlmejbmnecnaghgmbahmbaddhjbecg"
 META_EXT_POPUP_URL = f"chrome-extension://{META_EXT_ID}/popup/index.html"
 

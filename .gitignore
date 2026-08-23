@@ -1,4 +1,4 @@
-    __pycache__/
+__pycache__/
 *.pyc
 *.pyo
 *.png
@@ -6,10 +6,8 @@
 *.txt
 *.webp
 *.ps1
-*login*.*
 *test*.*
 *.old.py
-*_profile/
 _tmp_*.*
 _explore*.*
 explore*.*
@@ -27,6 +25,7 @@ page-*.*
 
 accounts.json
 
+*_profile/
 kimi_profile/
 logs/
 conversations/
@@ -36,13 +35,25 @@ screenshots/
 spark_user_data/
 spark_user_data2/
 
+/~
 .venv/
 venv/
 
+exports/
+media/
+/.refact
+my_prompt/
+deepseek_profile/
+doubao_profile/
+qianwen_profile/
+zai_profile/
+mimo_profile/
+/my_prompt/backup
+/my_prompt_bak
+/tmp
+
 .DS_Store
 Thumbs.db
-
-
 test_*.py
 check_*.py
 capture_*.py
@@ -51,14 +62,10 @@ extract_cookie*.py
 generate_*.py
 screenshot_*.png
 *.mp3
-media/
 new_cookie.txt
 sse_response.txt
 music_result.json
 captured_music.json
-exports/
-/.refact
-/~
 test.py
 test.json
 storage_state.json
@@ -107,15 +114,8 @@ exectask_prompt.md
 request_task.md
 ret_format_task.md
 config.py
-my_prompt/
-/my_prompt/backup
 deepseek_storage_state.json
 deepseek_api_results.json
-deepseek_profile/
-doubao_profile/
-qianwen_profile/
-zai_profile/
-mimo_profile/
 probe_mimo*.py
 mimo_*.png
 mimo_*.html
@@ -127,8 +127,6 @@ analyze_components.py
 analyze_routes.py
 find_chunks2.py
 README.old.md
-/my_prompt_bak
-/tmp
 config.json
 prompt_optimizer.py
 json_fixer_flowchart.md

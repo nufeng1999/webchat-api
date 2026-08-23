@@ -332,7 +332,7 @@ class CookiePool:
             except RuntimeError:
                 pass
 
-            from login import do_login
+            from login.doubao_login import do_login
             result = asyncio.run(do_login(show_browser=True))
             if result.get("success"):
                 reload_config()
@@ -557,3 +557,4 @@ def load_conversation_state(chat_id: str) -> dict:
         with open(state_file, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {}
+

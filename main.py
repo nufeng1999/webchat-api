@@ -1198,13 +1198,13 @@ if __name__ == "__main__":
                 print(f"Unknown login target: {target}. Use 'doubao', 'qianwen', 'deepseek', 'zai', 'mimo', 'minimax', 'xinghuo', 'kimi', or 'meta'", file=sys.stderr)
             os._exit(1)
         if target == "doubao":
-            from login import do_login
+            from login.doubao_login import do_login
             result = asyncio.run(do_login(show_browser=True))
             if result.get("success"):
                 if not _console_filter_quiet:
                     print("=" * 50)
-                    print("豆包登录成功！登录状态已保存到 doubao_profile 目录。")
-                    print("如需重新登录，删除 doubao_profile 目录后运行 python main.py --login doubao")
+                    print("豆包登录成功！登录状态已保存到 profiles/doubao_profile 目录。")
+                    print("如需重新登录，删除 profiles/doubao_profile 目录后运行 python main.py --login doubao")
                     print("=" * 50)
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -1216,7 +1216,7 @@ if __name__ == "__main__":
                 sys.stderr.flush()
                 os._exit(1)
         elif target == "deepseek":
-            from deepseek_login import login_and_save
+            from login.deepseek_login import login_and_save
             asyncio.run(login_and_save())
             if not _console_filter_quiet:
                 print("DeepSeek login completed")
@@ -1224,7 +1224,7 @@ if __name__ == "__main__":
             sys.stderr.flush()
             os._exit(0)
         elif target == "zai":
-            from zai_login import login_and_save
+            from login.zai_login import login_and_save
             asyncio.run(login_and_save())
             if not _console_filter_quiet:
                 print("Zai login completed")
@@ -1232,7 +1232,7 @@ if __name__ == "__main__":
             sys.stderr.flush()
             os._exit(0)
         elif target == "mimo":
-            from mimo_login import login_and_save
+            from login.mimo_login import login_and_save
             asyncio.run(login_and_save())
             if not _console_filter_quiet:
                 print("MiMo login completed")
@@ -1240,7 +1240,7 @@ if __name__ == "__main__":
             sys.stderr.flush()
             os._exit(0)
         elif target == "minimax":
-            from minimax_login import login_and_save
+            from login.minimax_login import login_and_save
             asyncio.run(login_and_save())
             if not _console_filter_quiet:
                 print("MiniMax Agent login completed")
@@ -1248,7 +1248,7 @@ if __name__ == "__main__":
             sys.stderr.flush()
             os._exit(0)
         elif target == "xinghuo":
-            from xinghuo_login import login_and_save
+            from login.xinghuo_login import login_and_save
             asyncio.run(login_and_save())
             if not _console_filter_quiet:
                 print("讯飞星火 login completed")
@@ -1256,7 +1256,7 @@ if __name__ == "__main__":
             sys.stderr.flush()
             os._exit(0)
         elif target == "kimi":
-            from kimi_login import login_and_save
+            from login.kimi_login import login_and_save
             asyncio.run(login_and_save())
             if not _console_filter_quiet:
                 print("Kimi login completed")
@@ -1264,12 +1264,12 @@ if __name__ == "__main__":
             sys.stderr.flush()
             os._exit(0)
         elif target == "meta":
-            from meta_login import login_and_save
+            from login.meta_login import login_and_save
             result = asyncio.run(login_and_save(show_browser=True))
             if result.get("success"):
                 if not _console_filter_quiet:
                     print("=" * 50)
-                    print("Meta.ai 登录成功！登录状态已保存到 meta_profile 目录。")
+                    print("Meta.ai 登录成功！登录状态已保存到 profiles/meta_profile 目录。")
                     print("=" * 50)
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -1281,12 +1281,12 @@ if __name__ == "__main__":
                 sys.stderr.flush()
                 os._exit(1)
         else:
-            from qianwen_login import do_qianwen_login
+            from login.qianwen_login import do_qianwen_login
             result = asyncio.run(do_qianwen_login(show_browser=True))
             if result.get("success"):
                 if not _console_filter_quiet:
                     print("=" * 50)
-                    print("千问登录成功！登录状态已保存到 qianwen_profile 目录。")
+                    print("千问登录成功！登录状态已保存到 profiles/qianwen_profile 目录。")
                     print("如需重新登录，删除 qianwen_profile 目录后运行 python main.py --login qianwen")
                     print("=" * 50)
                 sys.stdout.flush()
@@ -1426,3 +1426,4 @@ if __name__ == "__main__":
         uvicorn.run(app, host=host, port=port, log_config=uvicorn_log_config)
     else:
         uvicorn.run(app, host=host, port=port)
+

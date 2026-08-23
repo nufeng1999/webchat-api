@@ -8,7 +8,7 @@ from config import CONFIG, CONFIG_PATH, BASE_DIR, USER_AGENT
 
 logger = logging.getLogger("doubao-login")
 
-USER_DATA_DIR = os.path.join(BASE_DIR, "doubao_profile")
+USER_DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "profiles", "doubao_profile")
 
 
 async def do_login(show_browser: bool = True) -> dict:

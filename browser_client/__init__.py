@@ -28,7 +28,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._jimeng_browser = None
         self._jimeng_page = None
         self._jimeng_lock = asyncio.Lock()
-        self._jimeng_user_data_dir = os.path.join(BASE_DIR, "jimeng_profile")
+        self._jimeng_user_data_dir = os.path.join(BASE_DIR, "profiles", "jimeng_profile")
 
         # Qianwen 专属
         self._qianwen_pw = None
@@ -36,7 +36,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._qianwen_page = None
         self._qianwen_lock = asyncio.Lock()
         self._qianwen_queues = {}
-        self._qianwen_user_data_dir = os.path.join(BASE_DIR, "qianwen_profile")
+        self._qianwen_user_data_dir = os.path.join(BASE_DIR, "profiles", "qianwen_profile")
 
         # DeepSeek 专属
         self._deepseek_pw = None
@@ -44,7 +44,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._deepseek_page = None
         self._deepseek_lock = asyncio.Lock()
         self._deepseek_queues = {}
-        self._deepseek_user_data_dir = os.path.join(BASE_DIR, "deepseek_profile")
+        self._deepseek_user_data_dir = os.path.join(BASE_DIR, "profiles", "deepseek_profile")
 
         # Zai 专属
         self._zai_pw = None
@@ -52,7 +52,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._zai_page = None
         self._zai_lock = asyncio.Lock()
         self._zai_queues = {}
-        self._zai_user_data_dir = os.path.join(BASE_DIR, "zai_profile")
+        self._zai_user_data_dir = os.path.join(BASE_DIR, "profiles", "zai_profile")
 
         # Mimo 专属
         self._mimo_pw = None
@@ -60,13 +60,13 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._mimo_page = None
         self._mimo_lock = asyncio.Lock()
         self._mimo_queues = {}
-        self._mimo_user_data_dir = os.path.join(BASE_DIR, "mimo_profile")
+        self._mimo_user_data_dir = os.path.join(BASE_DIR, "profiles", "mimo_profile")
 
         self._minimax_pw = None
         self._minimax_browser = None
         self._minimax_page = None
         self._minimax_lock = asyncio.Lock()
-        self._minimax_user_data_dir = os.path.join(BASE_DIR, "minimax_profile")
+        self._minimax_user_data_dir = os.path.join(BASE_DIR, "profiles", "minimax_profile")
 
         self._xinghuo_pw = None
         self._xinghuo_browser = None
@@ -79,14 +79,14 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._kimi_browser = None
         self._kimi_page = None
         self._kimi_lock = asyncio.Lock()
-        self._kimi_user_data_dir = os.path.join(BASE_DIR, "kimi_profile")
+        self._kimi_user_data_dir = os.path.join(BASE_DIR, "profiles", "kimi_profile")
 
         # Meta.ai 专属
         self._meta_pw = None
         self._meta_browser = None
         self._meta_page = None
         self._meta_lock = asyncio.Lock()
-        self._meta_user_data_dir = os.path.join(BASE_DIR, "meta_profile")
+        self._meta_user_data_dir = os.path.join(BASE_DIR, "profiles", "meta_profile")
 
     async def close(self):
         """关闭所有浏览器。"""

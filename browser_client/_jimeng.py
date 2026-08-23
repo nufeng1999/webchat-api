@@ -3,7 +3,7 @@ from ._shared import *
 
 JIMENG_URL = "https://jimeng.jianying.com"
 JIMENG_GENERATE_URL = f"{JIMENG_URL}/ai-tool/generate?enter_from=ai_feature&from_page=explore&ai_feature_name=video"
-JIMENG_USER_DATA_DIR = os.path.join(BASE_DIR, "jimeng_profile")
+JIMENG_USER_DATA_DIR = os.path.join(BASE_DIR, "profiles", "jimeng_profile")
 
 
 def _reset_jimeng_profile_crash():
