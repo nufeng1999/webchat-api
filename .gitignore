@@ -57,6 +57,7 @@ mimo_profile/
 /my_prompt_bak
 /upload
 /tmp
+profiles/
 
 .DS_Store
 Thumbs.db
