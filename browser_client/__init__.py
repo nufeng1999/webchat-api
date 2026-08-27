@@ -72,7 +72,7 @@ class BrowserClient(DoubaoMixin, QianwenMixin, DeepSeekMixin, ZaiMixin, MimoMixi
         self._xinghuo_browser = None
         self._xinghuo_page = None
         self._xinghuo_lock = asyncio.Lock()
-        self._xinghuo_user_data_dir = os.path.join(BASE_DIR, "spark_user_data")
+        self._xinghuo_user_data_dir = os.path.join(BASE_DIR, "profiles", "xinghuo_profile")
 
         # Kimi 专属
         self._kimi_pw = None

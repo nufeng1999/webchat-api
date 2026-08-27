@@ -19,7 +19,7 @@ async def login_and_save():
     from playwright.async_api import async_playwright
     from config import BASE_DIR, CONFIG
 
-    user_data_dir = os.path.join(BASE_DIR, "spark_user_data")
+    user_data_dir = os.path.join(BASE_DIR, "profiles", "xinghuo_profile")
 
     pw = await async_playwright().start()
     browser = await pw.chromium.launch_persistent_context(

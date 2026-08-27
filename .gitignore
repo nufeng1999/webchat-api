@@ -6,6 +6,9 @@ __pycache__/
 *.txt
 *.webp
 *.ps1
+*.db
+*.sqlite
+*.log
 *test*.*
 *.old.py
 _tmp_*.*
@@ -17,10 +20,12 @@ dump_*.*
 diagnose_*.*
 discover_*.*
 *backup*.*
-*.db
-*.sqlite
-*.log
 page-*.*
+probe_mimo*.py
+mimo_*.png
+mimo_*.html
+mimo_*.txt
+mimo_*.md
 .env
 
 accounts.json
@@ -50,6 +55,7 @@ zai_profile/
 mimo_profile/
 /my_prompt/backup
 /my_prompt_bak
+/upload
 /tmp
 
 .DS_Store
@@ -100,9 +106,9 @@ ret_format_prompt.md
 webchat_task.md
 test2.json
 .gitignore
+.gitignore
+.gitignore
 http_raw_sse.txt
-.gitignore
-.gitignore
 completions.json
 completions2.json
 config.example.json
@@ -116,11 +122,6 @@ ret_format_task.md
 config.py
 deepseek_storage_state.json
 deepseek_api_results.json
-probe_mimo*.py
-mimo_*.png
-mimo_*.html
-mimo_*.txt
-mimo_*.md
 tmp/zai_01_home.png
 out.json
 analyze_components.py

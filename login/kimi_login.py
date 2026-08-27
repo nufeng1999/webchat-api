@@ -7,7 +7,7 @@ from config import CONFIG, BASE_DIR
 
 logger = logging.getLogger("kimi-login")
 
-USER_DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "profiles", "kimi_profile")
+USER_DATA_DIR = os.path.join(BASE_DIR, "profiles", "kimi_profile")
 
 
 async def login_and_save(show_browser: bool = True) -> dict:

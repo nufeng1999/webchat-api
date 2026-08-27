@@ -6,7 +6,7 @@ from playwright.async_api import async_playwright
 from config import CONFIG
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-USER_DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "profiles", "mimo_profile")
+USER_DATA_DIR = os.path.join(BASE_DIR, "profiles", "mimo_profile")
 
 def _get_user_agent():
     if sys.platform.startswith("win"):
